@@ -44,6 +44,21 @@ processed stage: ``persist_state`` after ``prepared``,
 ``append_audit`` after ``state``, ``bind_receipt`` after ``audit`` and
 ``done`` after ``committed``.
 
+:func:`inspect` is a read-only reconciliation of every checkpoint
+against its state bytes, audit log and receipt index.  Its ``paths``
+map has the same four keys as :func:`commit`.  A missing checkpoint
+file yields an empty list; otherwise each checkpoint is classified as
+``recoverable``, ``committed`` or ``conflict`` from whether the main
+state's canonical bytes hash to the bound state digest (S), the valid
+audit chain contains the bound audit record (A), and no receipt (R0)
+or an exactly matching receipt (R1) is bound under the id:
+
+    prepared   recoverable iff not A and R0
+    state      recoverable iff S and R0
+    audit      recoverable iff S and A and (R0 or R1)
+    committed  committed    iff S and A and R1
+    every other combination is a conflict.
+
 :func:`commit` drives a whole commit to completion.  Its ``paths`` map
 names the ``checkpoint``, ``state``, ``audit`` and ``receipt`` files and
 its request carries the ``id``, the full merge ``state`` and one audit
@@ -76,6 +91,7 @@ AUDIT = "audit"
 ID = "id"
 STAGE = "stage"
 STATE = "state"
+STATUS = "status"
 
 ITEMS = "items"
 VERSION = "version"
@@ -99,6 +115,9 @@ _RECEIPT = "receipt"
 
 _STAGES = (PREPARED, STAGE_STATE, STAGE_AUDIT, COMMITTED)
 _STAGE_RANK = {stage: rank for rank, stage in enumerate(_STAGES)}
+
+RECOVERABLE = "recoverable"
+CONFLICT = "conflict"
 
 # Action performed once the checkpoint for a stage has been durably
 # recorded: persist state after prepared, append the audit entry after
@@ -502,16 +521,8 @@ def _state_payload(state: dict[str, Any]) -> bytes:
     return _storage._serialize(clock, records)
 
 
-def _validated_commit_inputs(
-    paths: Any, request: Any
-) -> tuple[dict[str, str], str, dict[str, Any], dict[str, str], bytes]:
-    """Validate ``paths`` and a commit ``request`` before any file access.
-
-    Returns the path map, id, the caller's state, a fresh validated event
-    dict and the canonical state bytes.  The state is checked against the
-    merge state contract and the event against the audit event contract,
-    so their type/value errors propagate unchanged in kind.
-    """
+def _validated_paths(paths: Any) -> dict[str, str]:
+    """Validate a ``paths`` map and return a fresh dict in path-key order."""
     if not isinstance(paths, dict):
         raise TypeError("paths must be a dict")
     if set(paths.keys()) != set(_PATH_KEYS):
@@ -522,6 +533,20 @@ def _validated_commit_inputs(
     for key in _PATH_KEYS:
         if not isinstance(paths[key], str):
             raise TypeError(f"paths {key} must be a str")
+    return {key: paths[key] for key in _PATH_KEYS}
+
+
+def _validated_commit_inputs(
+    paths: Any, request: Any
+) -> tuple[dict[str, str], str, dict[str, Any], dict[str, str], bytes]:
+    """Validate ``paths`` and a commit ``request`` before any file access.
+
+    Returns the path map, id, the caller's state, a fresh validated event
+    dict and the canonical state bytes.  The state is checked against the
+    merge state contract and the event against the audit event contract,
+    so their type/value errors propagate unchanged in kind.
+    """
+    path_map = _validated_paths(paths)
 
     if not isinstance(request, dict):
         raise TypeError("request must be a dict")
@@ -538,7 +563,6 @@ def _validated_commit_inputs(
     payload = _state_payload(request[STATE])
     event = _audit._validated_event(request[_EVENT])
 
-    path_map = {key: paths[key] for key in _PATH_KEYS}
     return path_map, checkpoint_id, request[STATE], event, payload
 
 
@@ -590,16 +614,169 @@ def _advance(
 
 
 def _read_state_bytes(path: str) -> bytes | None:
-    """Return the main state file bytes, or None when it is absent.
+    """Return the raw main state file bytes, or None when it is absent.
 
-    Every :class:`OSError` other than :class:`FileNotFoundError`
-    propagates unchanged.
+    Only the main file is consulted; use :func:`_load_state_bytes` for
+    main-then-backup resolution.  Every :class:`OSError` other than
+    :class:`FileNotFoundError` propagates unchanged.
     """
     try:
         with open(path, "rb") as handle:
             return handle.read()
     except FileNotFoundError:
         return None
+
+
+def _load_state_bytes(path: str) -> bytes:
+    """Return canonical state bytes from the main file or its backup.
+
+    Selects the state the same way :func:`storage.load_state` does --
+    the first of ``path`` then ``path + ".bak"`` that decodes to a
+    valid state -- and re-serialises it to canonical bytes (identical
+    for the bytes storage itself writes).  Raises
+    :class:`FileNotFoundError` when neither file exists and
+    :class:`CorruptStateError` unchanged when at least one exists but
+    neither holds a valid state; every other :class:`OSError`
+    propagates unchanged as well.
+    """
+    state = _storage.load_state(path)
+    clock, records = _storage._validated_state(state)
+    return _storage._serialize(clock, records)
+
+
+def _receipt_kind(
+    bound: dict[str, str] | None, state_digest: str, audit_digest: str
+) -> str | None:
+    """Classify the receipt bound under one id as R0/R1/neither.
+
+    Returns ``None`` for R0 (no receipt), ``"match"`` for R1 (both
+    digests match) and ``"mismatch"`` for a bound but divergent receipt.
+    """
+    if bound is None:
+        return None
+    if bound[STATE] == state_digest and bound[AUDIT] == audit_digest:
+        return "match"
+    return "mismatch"
+
+
+def _classify_status(
+    stage: str, state_ok: bool, audit_ok: bool, receipt_kind: str | None
+) -> str:
+    """Classify one checkpoint from its S/A/R evidence.
+
+    ``state_ok`` is S (the canonical main/backup state bytes hash to
+    the bound state digest); ``audit_ok`` is A (the valid audit chain
+    contains the bound audit digest); ``receipt_kind`` is ``None`` for
+    R0, ``"match"`` for R1 and ``"mismatch"`` for a divergent receipt.
+    """
+    if stage == PREPARED:
+        if not audit_ok and receipt_kind is None:
+            return RECOVERABLE
+    elif stage == STAGE_STATE:
+        if state_ok and receipt_kind is None:
+            return RECOVERABLE
+    elif stage == STAGE_AUDIT:
+        if state_ok and audit_ok and receipt_kind != "mismatch":
+            return RECOVERABLE
+    else:  # COMMITTED
+        if state_ok and audit_ok and receipt_kind == "match":
+            return COMMITTED
+    return CONFLICT
+
+
+def inspect(paths: dict[str, str]) -> list[dict[str, str]]:
+    """Read-only reconciliation of every checkpoint against its artifacts.
+
+    ``paths`` must contain exactly the str keys ``checkpoint``,
+    ``state``, ``audit`` and ``receipt``, naming the checkpoint index,
+    the main state file (its ``.bak`` is consulted the same way
+    :func:`storage.load_state` does), the audit log and the receipt
+    index.
+
+    A missing checkpoint file yields ``[]``.  Otherwise a brand-new
+    list sorted ascending by ``id`` is returned; each element is a
+    fresh dict with the fixed key order ``audit``, ``id``, ``stage``,
+    ``state``, ``status``, where the first four values are copied from
+    the checkpoint record and ``status`` is ``recoverable``,
+    ``committed`` or ``conflict``.
+
+    For each checkpoint let S mean the complete canonical state bytes
+    hash to its bound state digest, A mean the valid audit chain
+    contains a record whose hash is its bound audit digest, R0 mean no
+    receipt is bound under the id and R1 mean a receipt is bound whose
+    two digests both match.  A ``prepared`` checkpoint with ``not A
+    and R0``, a ``state`` checkpoint with ``S and R0`` and an
+    ``audit`` checkpoint with ``S and A and (R0 or R1)`` are
+    ``recoverable``; a ``committed`` checkpoint with ``S and A and
+    R1`` is ``committed``; every other combination is ``conflict``.
+
+    No file is created, replaced or modified.  When at least one of the
+    main state file and its backup exists but neither holds a valid
+    state, :class:`CorruptStateError` propagates unchanged; a corrupt
+    checkpoint, audit log or receipt index propagates its matching
+    ``Corrupt...Error`` and other filesystem errors propagate as
+    :class:`OSError`.
+    """
+    path_map = _validated_paths(paths)
+    checkpoint_path = path_map[_CHECKPOINT]
+    state_path = path_map[STATE]
+    audit_path = path_map[AUDIT]
+    receipt_path = path_map[_RECEIPT]
+
+    # A genuinely missing checkpoint index means there is nothing to
+    # inspect and yields [] without touching the other artifacts.  An
+    # index that merely exists with zero records is different: the
+    # artifact gates below still run, so e.g. a state file that exists
+    # but is corrupt raises CorruptStateError.
+    try:
+        with open(checkpoint_path, "rb") as handle:
+            raw_index = handle.read()
+    except FileNotFoundError:
+        return []
+    records = _parse_index(raw_index)
+
+    # Read the state up front.  At least one of main/backup existing
+    # without a single valid state is corruption, not a per-record
+    # conflict, for both inspect and commit.
+    canonical_state: bytes | None
+    try:
+        canonical_state = _load_state_bytes(state_path)
+    except FileNotFoundError:
+        canonical_state = None
+    state_digest_on_disk = (
+        hashlib.sha256(canonical_state).hexdigest()
+        if canonical_state is not None
+        else None
+    )
+
+    audit_records = _audit._read_all_records(audit_path)
+    audit_hashes = {record[_audit.HASH] for record in audit_records}
+    receipt_records = _receipt._read_index(receipt_path)
+    receipts_by_id = {record[ID]: record for record in receipt_records}
+
+    result: list[dict[str, str]] = []
+    for record in records:
+        stage = record[STAGE]
+        state_ok = (
+            state_digest_on_disk is not None
+            and state_digest_on_disk == record[STATE]
+        )
+        audit_ok = record[AUDIT] in audit_hashes
+        receipt_kind = _receipt_kind(
+            receipts_by_id.get(record[ID]), record[STATE], record[AUDIT]
+        )
+        status = _classify_status(stage, state_ok, audit_ok, receipt_kind)
+
+        result.append(
+            {
+                AUDIT: record[AUDIT],
+                ID: record[ID],
+                STAGE: stage,
+                STATE: record[STATE],
+                STATUS: status,
+            }
+        )
+    return result
 
 
 def commit(paths: dict[str, str], request: dict[str, Any]) -> dict[str, str]:
@@ -625,10 +802,15 @@ def commit(paths: dict[str, str], request: dict[str, Any]) -> dict[str, str]:
     -- resumes at the recorded stage and performs each remaining side
     effect at most once, so the result is identical and no effect is
     duplicated.  Every artifact is reconciled against the checkpoint
-    stage before any file is touched: a digest conflict, or a stage
-    whose state file, audit record or receipt is missing, extra or
-    mismatched, raises :class:`ValueError` and leaves the files
-    unchanged.
+    stage before any file is touched, applying the same S/A/R test
+    :func:`inspect` reports: a ``conflict`` checkpoint, a digest
+    conflict, or a stage whose state file, audit record or receipt is
+    missing, extra or mismatched, raises :class:`ValueError` and leaves
+    the files unchanged, while a ``recoverable`` checkpoint resumes its
+    remaining idempotent phases.  The state is resolved main-then-backup
+    like :func:`storage.load_state`, so at least one of the two existing
+    without a single valid state raises :class:`CorruptStateError`
+    instead of being treated as a conflict.
 
     On success a brand-new dict is returned with the key order
     ``audit``, ``id``, ``stage``, ``state`` and ``stage`` equal to
@@ -654,7 +836,10 @@ def commit(paths: dict[str, str], request: dict[str, Any]) -> dict[str, str]:
     state_digest = hashlib.sha256(payload).hexdigest()
 
     # Read every artifact up front.  All reconciliation below happens
-    # before any mutation, so a rejected commit changes nothing.
+    # before any mutation, so a rejected commit changes nothing.  The
+    # state is selected main-then-backup exactly like load_state: at
+    # least one of the two existing without a single valid state raises
+    # CorruptStateError unchanged.
     audit_records = _audit._read_all_records(audit_path)
     planned_audit_digest = _planned_audit_digest(audit_records, event)
     bound_receipt = _receipt.get(receipt_path, checkpoint_id)
@@ -662,7 +847,14 @@ def commit(paths: dict[str, str], request: dict[str, Any]) -> dict[str, str]:
     existing = next(
         (record for record in records if record[ID] == checkpoint_id), None
     )
-    state_on_disk = _read_state_bytes(state_path)
+    try:
+        state_on_disk = _load_state_bytes(state_path)
+    except FileNotFoundError:
+        state_on_disk = None
+    # The persist step materialises the main file specifically, so the
+    # save decision compares the request bytes against the raw main file
+    # (not the backup the classification above may resolve from).
+    main_state_on_disk = _read_state_bytes(state_path)
 
     need_save = False
     need_append = False
@@ -680,7 +872,7 @@ def commit(paths: dict[str, str], request: dict[str, Any]) -> dict[str, str]:
         stage = PREPARED
         # The state save is the first artifact effect; it is pending
         # unless the main file already holds the committed bytes.
-        need_save = state_on_disk != payload
+        need_save = main_state_on_disk != payload
         need_append = True
         need_receipt = True
     else:
@@ -696,6 +888,24 @@ def commit(paths: dict[str, str], request: dict[str, Any]) -> dict[str, str]:
              if item[_audit.HASH] == audit_digest),
             None,
         )
+
+        # Apply the same read-only reconciliation inspect uses.  A
+        # checkpoint the artifacts cannot recover from is a conflict and
+        # is rejected before any file is touched; a recoverable (or
+        # already committed) checkpoint falls through to the stage logic
+        # below, which additionally pins the requested event and resumes
+        # the remaining idempotent steps.
+        state_ok = state_on_disk is not None and state_on_disk == payload
+        receipt_kind = _receipt_kind(
+            bound_receipt, state_digest, audit_digest
+        )
+        if _classify_status(
+            stage, state_ok, audit_record is not None, receipt_kind
+        ) == CONFLICT:
+            raise ValueError(
+                f"checkpoint id {checkpoint_id!r} at stage {stage!r} is in "
+                "conflict with its state, audit or receipt artifacts"
+            )
 
         if stage == PREPARED:
             # The event has not been appended yet, so its record hash must
@@ -717,7 +927,7 @@ def commit(paths: dict[str, str], request: dict[str, Any]) -> dict[str, str]:
                 )
             # The save is pending unless the main file already holds the
             # committed bytes; save_state itself rotates any prior state.
-            need_save = state_on_disk != payload
+            need_save = main_state_on_disk != payload
             need_append = True
             need_receipt = True
         elif stage == STAGE_STATE:
