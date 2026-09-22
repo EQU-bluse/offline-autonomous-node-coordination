@@ -57,15 +57,13 @@ def _read_valid_state(path: str) -> dict[str, Any] | None:
 
 
 def _fsync_dir(path: str) -> None:
-    """Best-effort fsync of the directory containing ``path``."""
-    try:
-        fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
-    except OSError:
-        return
+    """Fsync the directory containing ``path`` so a rename is durable.
+
+    Any failure to open the directory or fsync it propagates as :class:`OSError`.
+    """
+    fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
     try:
         os.fsync(fd)
-    except OSError:
-        pass
     finally:
         os.close(fd)
 

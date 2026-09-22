@@ -9,4 +9,4 @@ python -m offline_coordination status
 python -m unittest discover -s tests -v
 ```
 
-The current baseline exposes only a local status command. Replication, durable domain state, conflict policies, audit trails, security boundaries, observability, and network services are intentionally left for subsequent tasks.
+The current baseline exposes only a local status command. Persistent state is available via `offline_coordination.storage` and an append-only hash-chained audit log via `offline_coordination.audit`. Replication, conflict policies, security boundaries, observability, and network services are intentionally left for subsequent tasks.
