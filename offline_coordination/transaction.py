@@ -15,16 +15,27 @@ The top-level keys are fixed in the order ``items`` then ``version`` and
 sorted ascending by ``id`` (ids are unique); each record carries the str
 keys ``audit``, ``id``, ``stage`` and ``state`` in that order.  Non-ASCII
 characters are preserved unescaped and the file ends with exactly one
-``\\n``.
+``\\n``.  Files written by this module always use that canonical key
+order; readers also accept otherwise identical compact JSON whose only
+difference is object key order, normalizing it on the next write.
 
 A missing index file stands for an empty index; an existing file that
-violates any byte, structure, order or field rule is corrupt.
+violates any byte, structure or field rule is corrupt.
 
 A brand-new id may only be recorded at the ``prepared`` stage.  Replaying
 the same id with identical digests at the same stage is idempotent and
 leaves the file bytes untouched; the stage may then advance one step at a
 time, each advance replacing the file atomically.  Changed digests, a
 stage regression or a skipped stage are rejected and never touch the file.
+
+:func:`resume` drives one recovery round: the caller restates the bound
+``id``, ``state`` and ``audit`` digests and, optionally, which stage it
+observed.  ``observed=None`` (the only option for a new id) only queries
+an existing checkpoint or writes the initial ``prepared`` one; naming
+the current stage also only queries, while naming the immediately
+following stage advances exactly once.  The return value names the next
+action for the resulting stage: ``persist_state``, ``append_audit``,
+``bind_receipt`` or ``done``.
 """
 
 from __future__ import annotations
@@ -48,12 +59,20 @@ STAGE_AUDIT = "audit"
 COMMITTED = "committed"
 
 _REQUEST_KEYS = (ID, STATE, AUDIT, STAGE)
+_RESUME_KEYS = (ID, STATE, AUDIT)
 _RECORD_KEYS = (AUDIT, ID, STAGE, STATE)
 _INDEX_KEYS = (ITEMS, VERSION)
 _INDEX_VERSION = 1
 
 _STAGES = (PREPARED, STAGE_STATE, STAGE_AUDIT, COMMITTED)
 _STAGE_RANK = {stage: rank for rank, stage in enumerate(_STAGES)}
+
+_NEXT_ACTION = {
+    PREPARED: "persist_state",
+    STAGE_STATE: "append_audit",
+    STAGE_AUDIT: "bind_receipt",
+    COMMITTED: "done",
+}
 
 _ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -63,20 +82,46 @@ class CorruptTransactionError(ValueError):
     """The checkpoint index exists but its bytes are not a valid index."""
 
 
+class _DuplicateKeyError(ValueError):
+    """Internal signal: a JSON object repeated one of its keys."""
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    obj: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in obj:
+            raise _DuplicateKeyError(key)
+        obj[key] = value
+    return obj
+
+
 def _is_digest(value: Any) -> bool:
     return isinstance(value, str) and _DIGEST_RE.fullmatch(value) is not None
 
 
-def _validated_request(request: Any) -> dict[str, str]:
-    """Validate one checkpoint request and return a fresh dict in record order."""
+def _validated_request(
+    request: Any, require_stage: bool = True
+) -> dict[str, str]:
+    """Validate a checkpoint/resume request and return a fresh dict.
+
+    With ``require_stage`` the dict carries the record keys in record
+    order (``audit``, ``id``, ``stage``, ``state``); otherwise the
+    ``stage`` key is absent and the dict is for a :func:`resume` call.
+    """
     if not isinstance(request, dict):
         raise TypeError("request must be a dict")
-    if set(request.keys()) != set(_REQUEST_KEYS):
+    required = set(_REQUEST_KEYS if require_stage else _RESUME_KEYS)
+    if set(request.keys()) != required:
+        if require_stage:
+            raise ValueError(
+                "request must contain exactly the keys 'id', 'state', 'audit' "
+                "and 'stage'"
+            )
         raise ValueError(
-            "request must contain exactly the keys 'id', 'state', 'audit' "
-            "and 'stage'"
+            "request must contain exactly the keys 'id', 'state' and 'audit'"
         )
-    for key in _REQUEST_KEYS:
+    keys = _REQUEST_KEYS if require_stage else _RESUME_KEYS
+    for key in keys:
         if not isinstance(request[key], str):
             raise TypeError(f"request {key} must be a str")
     checkpoint_id = request[ID]
@@ -86,6 +131,12 @@ def _validated_request(request: Any) -> dict[str, str]:
         raise ValueError("request state must be 64 lowercase hex characters")
     if not _is_digest(request[AUDIT]):
         raise ValueError("request audit must be 64 lowercase hex characters")
+    if not require_stage:
+        return {
+            AUDIT: request[AUDIT],
+            ID: checkpoint_id,
+            STATE: request[STATE],
+        }
     stage = request[STAGE]
     if stage not in _STAGE_RANK:
         raise ValueError(
@@ -115,8 +166,11 @@ def _parse_index(raw: bytes) -> list[dict[str, str]]:
     """Validate every byte of a checkpoint index and return its records.
 
     Raises :class:`CorruptTransactionError` for any UTF-8/JSON failure,
-    non-canonical byte encoding, wrong key set or order, bad version,
-    duplicate or unsorted ids, or a field that is not a well-formed str.
+    non-canonical byte encoding, wrong key set, bad version, duplicate
+    or unsorted ids, or a field that is not a well-formed str.  Compact
+    JSON that differs from the canonical encoding only in object key
+    order is accepted and normalized; any other byte difference (stray
+    whitespace, non-canonical escapes, duplicate keys, ...) is corrupt.
     """
     if raw == b"":
         raise CorruptTransactionError("checkpoint index is empty")
@@ -125,8 +179,8 @@ def _parse_index(raw: bytes) -> list[dict[str, str]]:
     except UnicodeDecodeError as exc:
         raise CorruptTransactionError("checkpoint index is not valid UTF-8") from exc
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
+        data = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except (_DuplicateKeyError, json.JSONDecodeError) as exc:
         raise CorruptTransactionError("checkpoint index is not valid JSON") from exc
 
     if not isinstance(data, dict):
@@ -134,10 +188,6 @@ def _parse_index(raw: bytes) -> list[dict[str, str]]:
     if set(data.keys()) != set(_INDEX_KEYS):
         raise CorruptTransactionError(
             "checkpoint index must contain exactly the keys 'items' and 'version'"
-        )
-    if list(data.keys()) != list(_INDEX_KEYS):
-        raise CorruptTransactionError(
-            "checkpoint index keys must be in the order 'items', 'version'"
         )
     version = data[VERSION]
     # bool is a subclass of int; the version must be a genuine integer.
@@ -156,10 +206,6 @@ def _parse_index(raw: bytes) -> list[dict[str, str]]:
             raise CorruptTransactionError(
                 f"{where} must contain exactly the keys 'audit', 'id', 'stage' "
                 "and 'state'"
-            )
-        if list(item.keys()) != list(_RECORD_KEYS):
-            raise CorruptTransactionError(
-                f"{where} keys must be in the order 'audit', 'id', 'stage', 'state'"
             )
         audit_digest = item[AUDIT]
         record_id = item[ID]
@@ -187,9 +233,15 @@ def _parse_index(raw: bytes) -> list[dict[str, str]]:
             "checkpoint index ids must be unique and sorted ascending"
         )
 
-    # Reject stray whitespace, non-canonical escapes, and any encoding that
-    # is not the single compact form of the validated structure.
-    if _serialize_index(records) != raw:
+    # The structure must be the single compact form of the validated data.
+    # Object key order is the one tolerated exception: re-serializing the
+    # parsed value preserves the file's key order, so compact JSON that is
+    # equivalent apart from that order round-trips to the same bytes and is
+    # accepted (normalized on the next write); stray whitespace, missing or
+    # extra trailing bytes and non-canonical escapes still mismatch and are
+    # rejected as corrupt.
+    compact = json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n"
+    if compact.encode("utf-8") != raw:
         raise CorruptTransactionError("checkpoint index is not canonically encoded")
     return records
 
@@ -307,3 +359,101 @@ def checkpoint(
         }
         for record in records
     ]
+
+
+def resume(
+    path: str,
+    request: dict[str, str],
+    observed: str | None = None,
+) -> str:
+    """Recover one commit at ``path`` and return the next action.
+
+    ``request`` must contain exactly the str keys ``id``, ``state`` and
+    ``audit`` with the same formats as :func:`checkpoint`; ``observed``
+    must be ``None`` or one of ``prepared``, ``state``, ``audit`` or
+    ``committed``.
+
+    A brand-new id is accepted only with ``observed=None``: the
+    ``prepared`` checkpoint is written and ``persist_state`` returned.
+    For an existing id the stored digests must match the request; with
+    ``observed=None`` or ``observed`` equal to the stored stage the call
+    only queries, leaves the file bytes untouched and reports the action
+    for that stage.  Naming the immediately following stage advances the
+    checkpoint exactly once (atomically, in canonical encoding); a
+    regression, a skipped stage or an illegal value raises
+    :class:`ValueError` and never touches the file.
+
+    The actions are ``persist_state``, ``append_audit``,
+    ``bind_receipt`` and ``done`` for stages ``prepared``, ``state``,
+    ``audit`` and ``committed`` respectively.
+
+    Type violations raise :class:`TypeError`; a bad key set, field
+    format or stage migration raises :class:`ValueError`; a corrupt index
+    raises :class:`CorruptTransactionError`; other filesystem errors
+    propagate as :class:`OSError`.
+    """
+    if not isinstance(path, str):
+        raise TypeError("path must be a str")
+    summary = _validated_request(request, require_stage=False)
+    if observed is not None:
+        if not isinstance(observed, str):
+            raise TypeError("observed must be a str or None")
+        if observed not in _STAGE_RANK:
+            raise ValueError(
+                "observed must be one of 'prepared', 'state', 'audit' or "
+                "'committed'"
+            )
+
+    records = _read_index(path)
+
+    for position, existing in enumerate(records):
+        if existing[ID] != summary[ID]:
+            continue
+        if (
+            existing[STATE] != summary[STATE]
+            or existing[AUDIT] != summary[AUDIT]
+        ):
+            raise ValueError(
+                f"checkpoint id {summary[ID]!r} is already bound to different "
+                "state or audit digests"
+            )
+        current = existing[STAGE]
+        if observed is None or observed == current:
+            # Pure query: the file bytes are never touched.
+            return _NEXT_ACTION[current]
+        current_rank = _STAGE_RANK[current]
+        observed_rank = _STAGE_RANK[observed]
+        if observed_rank < current_rank:
+            raise ValueError(
+                f"checkpoint id {summary[ID]!r} cannot regress from stage "
+                f"{current!r} to {observed!r}"
+            )
+        if observed_rank > current_rank + 1:
+            raise ValueError(
+                f"checkpoint id {summary[ID]!r} cannot skip from stage "
+                f"{current!r} to {observed!r}"
+            )
+        record = {
+            AUDIT: summary[AUDIT],
+            ID: summary[ID],
+            STAGE: observed,
+            STATE: summary[STATE],
+        }
+        updated = list(records)
+        updated[position] = record
+        _atomic_write(path, _serialize_index(updated))
+        return _NEXT_ACTION[observed]
+
+    if observed is not None:
+        raise ValueError(
+            "a new checkpoint id can only resume with observed=None"
+        )
+    record = {
+        AUDIT: summary[AUDIT],
+        ID: summary[ID],
+        STAGE: PREPARED,
+        STATE: summary[STATE],
+    }
+    updated = sorted(records + [record], key=lambda entry: entry[ID])
+    _atomic_write(path, _serialize_index(updated))
+    return _NEXT_ACTION[PREPARED]

@@ -4,7 +4,11 @@ import tempfile
 import unittest
 
 from offline_coordination import transaction
-from offline_coordination.transaction import CorruptTransactionError, checkpoint
+from offline_coordination.transaction import (
+    CorruptTransactionError,
+    checkpoint,
+    resume,
+)
 
 D1 = "a" * 64
 D2 = "b" * 64
@@ -15,6 +19,10 @@ RECORD_KEYS = ("audit", "id", "stage", "state")
 
 def req(rid="x", state=D1, audit=D2, stage="prepared"):
     return {"id": rid, "state": state, "audit": audit, "stage": stage}
+
+
+def rreq(rid="x", state=D1, audit=D2):
+    return {"id": rid, "state": state, "audit": audit}
 
 
 def canonical(obj):
@@ -291,19 +299,42 @@ class CheckpointCorruptionTest(unittest.TestCase):
     def test_non_canonical_unicode_escape(self) -> None:
         self.assertCorrupt(self.good.replace(b'"id":"a"', b'"id":"\\u0061"', 1))
 
-    def test_wrong_top_level_key_order(self) -> None:
+    def test_wrong_top_level_key_order_is_equivalent_compact_json(self) -> None:
         index = json.loads(self.good)
         reordered = {"version": index["version"], "items": index["items"]}
-        self.assertCorrupt(canonical(reordered) + b"\n")
+        data = canonical(reordered) + b"\n"
+        self.write(data)
+        # Key order alone never makes the index corrupt...
+        result = checkpoint(self.path)
+        self.assertEqual([item["id"] for item in result], ["a", "b"])
+        # ...and a pure query leaves the non-canonical bytes untouched.
+        self.assertEqual(self.read_raw(), data)
+        # The next write normalizes back to the canonical key order.
+        checkpoint(self.path, req(rid="b", stage="audit"))
+        self.assertEqual(self.read_raw()[:9], b'{"items":')
 
-    def test_wrong_record_key_order(self) -> None:
+    def test_wrong_record_key_order_is_equivalent_compact_json(self) -> None:
         index = json.loads(self.good)
         index["items"] = [
             {"id": item["id"], "state": item["state"],
              "audit": item["audit"], "stage": item["stage"]}
             for item in index["items"]
         ]
-        self.assertCorrupt(canonical(index) + b"\n")
+        data = canonical(index) + b"\n"
+        self.write(data)
+        result = checkpoint(self.path)
+        self.assertEqual(
+            result[0],
+            {"audit": result[0]["audit"], "id": "a",
+             "stage": "prepared", "state": result[0]["state"]},
+        )
+        for item in result:
+            self.assertEqual(tuple(item.keys()), RECORD_KEYS)
+        self.assertEqual(self.read_raw(), data)
+        checkpoint(self.path, req(rid="b", stage="audit"))
+        rewritten = json.loads(self.read_raw())
+        for item in rewritten["items"]:
+            self.assertEqual(tuple(item.keys()), RECORD_KEYS)
 
     def test_extra_top_level_key(self) -> None:
         index = json.loads(self.good)
@@ -391,6 +422,176 @@ class CheckpointCorruptionTest(unittest.TestCase):
         with self.assertRaises(CorruptTransactionError):
             checkpoint(self.path, req(rid="c"))
         self.assertEqual(self.read_raw(), bad)
+
+
+class ResumeFlowTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "checkpoints.json")
+
+    def read_raw(self) -> bytes:
+        with open(self.path, "rb") as handle:
+            return handle.read()
+
+    def test_new_id_none_writes_prepared_and_returns_persist_state(self) -> None:
+        action = resume(self.path, rreq(rid="k"))
+        self.assertEqual(action, "persist_state")
+        self.assertEqual(checkpoint(self.path)[0]["stage"], "prepared")
+
+    def test_new_id_rejects_any_observed_stage(self) -> None:
+        for observed in ("prepared", "state", "audit", "committed"):
+            with self.assertRaises(ValueError, msg=f"observed={observed}"):
+                resume(self.path, rreq(rid=f"k-{observed}"), observed)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_actions_follow_the_full_lifecycle(self) -> None:
+        self.assertEqual(resume(self.path, rreq()), "persist_state")
+        self.assertEqual(resume(self.path, rreq(), "state"), "append_audit")
+        self.assertEqual(resume(self.path, rreq(), "audit"), "bind_receipt")
+        self.assertEqual(resume(self.path, rreq(), "committed"), "done")
+        self.assertEqual(checkpoint(self.path)[0]["stage"], "committed")
+
+    def test_observed_none_only_queries_existing_id(self) -> None:
+        resume(self.path, rreq())
+        checkpoint(self.path, req(stage="state"))
+        raw = self.read_raw()
+        self.assertEqual(resume(self.path, rreq()), "append_audit")
+        self.assertEqual(self.read_raw(), raw)
+
+    def test_observed_current_stage_only_queries(self) -> None:
+        resume(self.path, rreq())
+        for stage, action in (
+            ("prepared", "persist_state"),
+            ("state", "append_audit"),
+            ("audit", "bind_receipt"),
+            ("committed", "done"),
+        ):
+            if stage != "prepared":
+                resume(self.path, rreq(), stage)
+            raw = self.read_raw()
+            self.assertEqual(
+                resume(self.path, rreq(), stage), action, msg=f"stage={stage}"
+            )
+            self.assertEqual(self.read_raw(), raw)
+
+    def test_advance_writes_canonical_file(self) -> None:
+        resume(self.path, rreq(rid="k"))
+        raw = self.read_raw()
+        self.assertEqual(
+            raw,
+            b'{"items":[{"audit":"' + D2.encode()
+            + b'","id":"k","stage":"prepared","state":"' + D1.encode()
+            + b'"}],"version":1}\n',
+        )
+        resume(self.path, rreq(rid="k"), "state")
+        self.assertIn(b'"stage":"state"', self.read_raw())
+        self.assertFalse(os.path.exists(self.path + ".tmp"))
+
+    def test_regression_rejected_and_file_untouched(self) -> None:
+        resume(self.path, rreq())
+        resume(self.path, rreq(), "state")
+        raw = self.read_raw()
+        with self.assertRaises(ValueError):
+            resume(self.path, rreq(), "prepared")
+        self.assertEqual(self.read_raw(), raw)
+
+    def test_skip_rejected_and_file_untouched(self) -> None:
+        resume(self.path, rreq())
+        raw = self.read_raw()
+        with self.assertRaises(ValueError):
+            resume(self.path, rreq(), "audit")
+        with self.assertRaises(ValueError):
+            resume(self.path, rreq(), "committed")
+        self.assertEqual(self.read_raw(), raw)
+
+    def test_illegal_observed_rejected_and_file_untouched(self) -> None:
+        resume(self.path, rreq())
+        raw = self.read_raw()
+        for bad in ("", "Prepared", "PREPARED", "commit", "done"):
+            with self.assertRaises(ValueError, msg=f"observed={bad!r}"):
+                resume(self.path, rreq(), bad)
+        self.assertEqual(self.read_raw(), raw)
+
+    def test_cannot_advance_past_committed(self) -> None:
+        resume(self.path, rreq())
+        for stage in ("state", "audit", "committed"):
+            resume(self.path, rreq(), stage)
+        raw = self.read_raw()
+        self.assertEqual(resume(self.path, rreq(), "committed"), "done")
+        self.assertEqual(self.read_raw(), raw)
+
+    def test_digest_mismatch_rejected_and_file_untouched(self) -> None:
+        resume(self.path, rreq())
+        raw = self.read_raw()
+        with self.assertRaises(ValueError):
+            resume(self.path, rreq(state=D3), "state")
+        with self.assertRaises(ValueError):
+            resume(self.path, rreq(audit=D3), None)
+        self.assertEqual(self.read_raw(), raw)
+
+    def test_query_normalizes_non_canonical_key_order_only_on_advance(self) -> None:
+        resume(self.path, rreq(rid="k"))
+        index = json.loads(self.read_raw())
+        reordered = canonical({"version": 1, "items": index["items"]}) + b"\n"
+        with open(self.path, "wb") as handle:
+            handle.write(reordered)
+        # Query leaves the reordered bytes in place.
+        self.assertEqual(resume(self.path, rreq(rid="k")), "persist_state")
+        self.assertEqual(self.read_raw(), reordered)
+        # Advance rewrites in canonical order.
+        resume(self.path, rreq(rid="k"), "state")
+        self.assertEqual(self.read_raw()[:9], b'{"items":')
+
+
+class ResumeValidationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "checkpoints.json")
+
+    def test_path_must_be_str(self) -> None:
+        with self.assertRaises(TypeError):
+            resume(1, rreq())
+        with self.assertRaises(TypeError):
+            resume(None, rreq())
+
+    def test_request_must_be_dict(self) -> None:
+        for bad in (None, [], "x", 1, True):
+            with self.assertRaises(TypeError, msg=f"request={bad!r}"):
+                resume(self.path, bad)
+
+    def test_request_fields_must_be_str(self) -> None:
+        for key in ("id", "state", "audit"):
+            with self.assertRaises(TypeError, msg=f"key={key}"):
+                resume(self.path, {**rreq(), key: 1})
+
+    def test_request_key_set_must_match_exactly(self) -> None:
+        with self.assertRaises(ValueError):
+            resume(self.path, {"id": "x", "state": D1})
+        with self.assertRaises(ValueError):
+            resume(self.path, {**rreq(), "stage": "prepared"})
+        with self.assertRaises(ValueError):
+            resume(self.path, {**rreq(), "extra": "x"})
+
+    def test_id_and_digest_formats_follow_checkpoint(self) -> None:
+        with self.assertRaises(ValueError):
+            resume(self.path, rreq(rid="a/b"))
+        with self.assertRaises(ValueError):
+            resume(self.path, rreq(state="g" * 64))
+        with self.assertRaises(ValueError):
+            resume(self.path, rreq(audit="A" * 64))
+
+    def test_observed_non_none_non_str_is_type_error(self) -> None:
+        for bad in (1, 1.0, True, [], (), b"prepared"):
+            with self.assertRaises(TypeError, msg=f"observed={bad!r}"):
+                resume(self.path, rreq(), bad)
+
+    def test_corrupt_index_raises_and_file_untouched(self) -> None:
+        with open(self.path, "wb") as handle:
+            handle.write(b"")
+        with self.assertRaises(CorruptTransactionError):
+            resume(self.path, rreq(rid="k"))
+        with open(self.path, "rb") as handle:
+            self.assertEqual(handle.read(), b"")
 
 
 if __name__ == "__main__":
