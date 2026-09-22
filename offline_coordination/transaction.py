@@ -43,14 +43,34 @@ touching the file.  The return value names the next action for the
 processed stage: ``persist_state`` after ``prepared``,
 ``append_audit`` after ``state``, ``bind_receipt`` after ``audit`` and
 ``done`` after ``committed``.
+
+:func:`commit` drives a whole commit to completion.  Its ``paths`` map
+names the ``checkpoint``, ``state``, ``audit`` and ``receipt`` files and
+its request carries the ``id``, the full merge ``state`` and one audit
+``event``.  The state digest is the SHA-256 of the canonical state bytes
+storage writes; the audit digest is the hash of the one appended audit
+record.  A first commit persists the state, appends exactly one event,
+binds a receipt for the id and both digests, and advances the checkpoint
+through the stages in order.  Replaying the same call -- after an
+interruption or once committed -- deterministically resumes at the
+recorded stage and performs every remaining side effect at most once,
+returning the same ``audit``, ``id``, ``stage`` (``committed``) and
+``state`` dict.  A digest conflict, or a checkpoint stage whose
+artifacts do not match it, raises :class:`ValueError` and leaves the
+files unchanged.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 from typing import Any
+
+from . import audit as _audit
+from . import receipt as _receipt
+from . import storage as _storage
 
 AUDIT = "audit"
 ID = "id"
@@ -67,9 +87,15 @@ COMMITTED = "committed"
 
 _REQUEST_KEYS = (ID, STATE, AUDIT, STAGE)
 _RESUME_KEYS = (ID, STATE, AUDIT)
+_COMMIT_KEYS = (ID, STATE, "event")
+_PATH_KEYS = ("checkpoint", STATE, AUDIT, "receipt")
 _RECORD_KEYS = (AUDIT, ID, STAGE, STATE)
 _INDEX_KEYS = (ITEMS, VERSION)
 _INDEX_VERSION = 1
+
+_EVENT = "event"
+_CHECKPOINT = "checkpoint"
+_RECEIPT = "receipt"
 
 _STAGES = (PREPARED, STAGE_STATE, STAGE_AUDIT, COMMITTED)
 _STAGE_RANK = {stage: rank for rank, stage in enumerate(_STAGES)}
@@ -467,3 +493,355 @@ def resume(
         processed_stage = observed
 
     return _NEXT_ACTIONS[processed_stage]
+
+
+
+def _state_payload(state: dict[str, Any]) -> bytes:
+    """The canonical storage bytes for a validated merge state."""
+    clock, records = _storage._validated_state(state)
+    return _storage._serialize(clock, records)
+
+
+def _validated_commit_inputs(
+    paths: Any, request: Any
+) -> tuple[dict[str, str], str, dict[str, Any], dict[str, str], bytes]:
+    """Validate ``paths`` and a commit ``request`` before any file access.
+
+    Returns the path map, id, the caller's state, a fresh validated event
+    dict and the canonical state bytes.  The state is checked against the
+    merge state contract and the event against the audit event contract,
+    so their type/value errors propagate unchanged in kind.
+    """
+    if not isinstance(paths, dict):
+        raise TypeError("paths must be a dict")
+    if set(paths.keys()) != set(_PATH_KEYS):
+        raise ValueError(
+            "paths must contain exactly the keys 'checkpoint', 'state', "
+            "'audit' and 'receipt'"
+        )
+    for key in _PATH_KEYS:
+        if not isinstance(paths[key], str):
+            raise TypeError(f"paths {key} must be a str")
+
+    if not isinstance(request, dict):
+        raise TypeError("request must be a dict")
+    if set(request.keys()) != set(_COMMIT_KEYS):
+        raise ValueError(
+            "request must contain exactly the keys 'id', 'state' and 'event'"
+        )
+    checkpoint_id = request[ID]
+    if not isinstance(checkpoint_id, str):
+        raise TypeError("request id must be a str")
+    if _ID_RE.fullmatch(checkpoint_id) is None:
+        raise ValueError("request id must match [A-Za-z0-9._-]{1,64}")
+
+    payload = _state_payload(request[STATE])
+    event = _audit._validated_event(request[_EVENT])
+
+    path_map = {key: paths[key] for key in _PATH_KEYS}
+    return path_map, checkpoint_id, request[STATE], event, payload
+
+
+def _planned_audit_digest(
+    audit_records: list[dict[str, Any]], event: dict[str, str]
+) -> str:
+    """Hash the audit record the next :func:`audit.append` would write.
+
+    Deterministic from the log's current tail: its seq is one past the
+    last record and its prev is the last record's hash (or the zero hash
+    for an empty log).
+    """
+    seq = len(audit_records) + 1
+    prev = audit_records[-1][_audit.HASH] if audit_records else _audit._ZERO_HASH
+    without_hash = {
+        _audit.DETAIL: event[_audit.DETAIL],
+        _audit.KIND: event[_audit.KIND],
+        _audit.PREV: prev,
+        _audit.SEQ: seq,
+        _audit.SOURCE: event[_audit.SOURCE],
+    }
+    return _audit._record_hash(without_hash)
+
+
+def _event_matches(record: dict[str, Any], event: dict[str, str]) -> bool:
+    return (
+        record[_audit.SOURCE] == event[_audit.SOURCE]
+        and record[_audit.KIND] == event[_audit.KIND]
+        and record[_audit.DETAIL] == event[_audit.DETAIL]
+    )
+
+
+def _advance(
+    path: str,
+    records: list[dict[str, str]],
+    checkpoint_id: str,
+    state_digest: str,
+    audit_digest: str,
+    stage: str,
+) -> list[dict[str, str]]:
+    """Advance (or insert at ``prepared``) the checkpoint for one stage."""
+    record = {
+        AUDIT: audit_digest,
+        ID: checkpoint_id,
+        STAGE: stage,
+        STATE: state_digest,
+    }
+    return _apply(path, records, record)
+
+
+def _read_state_bytes(path: str) -> bytes | None:
+    """Return the main state file bytes, or None when it is absent.
+
+    Every :class:`OSError` other than :class:`FileNotFoundError`
+    propagates unchanged.
+    """
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
+
+
+def commit(paths: dict[str, str], request: dict[str, Any]) -> dict[str, str]:
+    """Run one replayable commit across storage, audit, receipt and checkpoint.
+
+    ``paths`` must contain exactly the str keys ``checkpoint``, ``state``,
+    ``audit`` and ``receipt``.  ``request`` must contain exactly the keys
+    ``id`` (same format as :func:`checkpoint`), ``state`` (a state obeying
+    the :mod:`~offline_coordination.merge` state contract) and ``event``
+    (an event obeying the :mod:`~offline_coordination.audit` event
+    contract).
+
+    The state digest is the lowercase-hex SHA-256 of the complete
+    canonical state bytes (including the trailing ``\\n``) that
+    :mod:`~offline_coordination.storage` persists; the audit digest is
+    the hash of the single audit record appended for this commit.  A
+    first commit saves the state, appends exactly one audit event, binds
+    a receipt carrying the id and both digests, and advances the
+    checkpoint through ``prepared``, ``state``, ``audit`` and
+    ``committed`` in that order.
+
+    Replaying the same arguments -- or re-entering after an interruption
+    -- resumes at the recorded stage and performs each remaining side
+    effect at most once, so the result is identical and no effect is
+    duplicated.  Every artifact is reconciled against the checkpoint
+    stage before any file is touched: a digest conflict, or a stage
+    whose state file, audit record or receipt is missing, extra or
+    mismatched, raises :class:`ValueError` and leaves the files
+    unchanged.
+
+    On success a brand-new dict is returned with the key order
+    ``audit``, ``id``, ``stage``, ``state`` and ``stage`` equal to
+    ``committed``.  Type violations raise :class:`TypeError`; bad key
+    sets, formats, state/event values, digest conflicts and stage/
+    artifact mismatches raise :class:`ValueError`;
+    :class:`CorruptStateError`, :class:`CorruptAuditError`,
+    :class:`CorruptReceiptError`, :class:`CorruptTransactionError` and
+    :class:`OSError` propagate unchanged.
+    """
+    (
+        path_map,
+        checkpoint_id,
+        state,
+        event,
+        payload,
+    ) = _validated_commit_inputs(paths, request)
+    checkpoint_path = path_map[_CHECKPOINT]
+    state_path = path_map[STATE]
+    audit_path = path_map[AUDIT]
+    receipt_path = path_map[_RECEIPT]
+
+    state_digest = hashlib.sha256(payload).hexdigest()
+
+    # Read every artifact up front.  All reconciliation below happens
+    # before any mutation, so a rejected commit changes nothing.
+    audit_records = _audit._read_all_records(audit_path)
+    planned_audit_digest = _planned_audit_digest(audit_records, event)
+    bound_receipt = _receipt.get(receipt_path, checkpoint_id)
+    records = _read_index(checkpoint_path)
+    existing = next(
+        (record for record in records if record[ID] == checkpoint_id), None
+    )
+    state_on_disk = _read_state_bytes(state_path)
+
+    need_save = False
+    need_append = False
+    need_receipt = False
+
+    if existing is None:
+        # An id absent from the checkpoint index cannot have produced any
+        # artifact of its own yet; a receipt bound under it is a conflict.
+        if bound_receipt is not None:
+            raise ValueError(
+                f"receipt id {checkpoint_id!r} is already bound but no "
+                "checkpoint exists for it"
+            )
+        audit_digest = planned_audit_digest
+        stage = PREPARED
+        # The state save is the first artifact effect; it is pending
+        # unless the main file already holds the committed bytes.
+        need_save = state_on_disk != payload
+        need_append = True
+        need_receipt = True
+    else:
+        if existing[STATE] != state_digest:
+            raise ValueError(
+                f"checkpoint id {checkpoint_id!r} is already bound to a "
+                "different state digest"
+            )
+        audit_digest = existing[AUDIT]
+        stage = existing[STAGE]
+        audit_record = next(
+            (item for item in audit_records
+             if item[_audit.HASH] == audit_digest),
+            None,
+        )
+
+        if stage == PREPARED:
+            # The event has not been appended yet, so its record hash must
+            # still be derivable from the current log tail.
+            if audit_digest != planned_audit_digest:
+                raise ValueError(
+                    f"checkpoint id {checkpoint_id!r} is already bound to a "
+                    "different audit digest"
+                )
+            if audit_record is not None:
+                raise ValueError(
+                    f"checkpoint id {checkpoint_id!r} is at stage 'prepared' "
+                    "but its audit record is already present"
+                )
+            if bound_receipt is not None:
+                raise ValueError(
+                    f"checkpoint id {checkpoint_id!r} is at stage 'prepared' "
+                    "but a receipt is already bound"
+                )
+            # The save is pending unless the main file already holds the
+            # committed bytes; save_state itself rotates any prior state.
+            need_save = state_on_disk != payload
+            need_append = True
+            need_receipt = True
+        elif stage == STAGE_STATE:
+            if state_on_disk != payload:
+                raise ValueError(
+                    f"checkpoint id {checkpoint_id!r} is past stage "
+                    "'prepared' but its state file is missing or mismatched"
+                )
+            if bound_receipt is not None:
+                raise ValueError(
+                    f"checkpoint id {checkpoint_id!r} is at stage 'state' but "
+                    "a receipt is already bound"
+                )
+            if audit_record is None:
+                # The append may still be pending; the log tail must still
+                # derive the bound record for this event.
+                if audit_digest != planned_audit_digest:
+                    raise ValueError(
+                        f"checkpoint id {checkpoint_id!r} is at stage 'state' "
+                        "but its audit record is missing"
+                    )
+                need_append = True
+            elif not _event_matches(audit_record, event):
+                raise ValueError(
+                    f"checkpoint id {checkpoint_id!r} audit record does not "
+                    "match its committed event"
+                )
+            need_receipt = True
+        elif stage == STAGE_AUDIT:
+            if state_on_disk != payload:
+                raise ValueError(
+                    f"checkpoint id {checkpoint_id!r} is past stage "
+                    "'prepared' but its state file is missing or mismatched"
+                )
+            if audit_record is None:
+                raise ValueError(
+                    f"checkpoint id {checkpoint_id!r} is past stage 'state' "
+                    "but its audit record is missing"
+                )
+            if not _event_matches(audit_record, event):
+                raise ValueError(
+                    f"checkpoint id {checkpoint_id!r} audit record does not "
+                    "match its committed event"
+                )
+            if bound_receipt is None:
+                need_receipt = True
+            elif (
+                bound_receipt[STATE] != state_digest
+                or bound_receipt[AUDIT] != audit_digest
+            ):
+                raise ValueError(
+                    f"checkpoint id {checkpoint_id!r} receipt is bound to "
+                    "different state or audit digests"
+                )
+        else:  # COMMITTED
+            if state_on_disk != payload:
+                raise ValueError(
+                    f"checkpoint id {checkpoint_id!r} is past stage "
+                    "'prepared' but its state file is missing or mismatched"
+                )
+            if audit_record is None:
+                raise ValueError(
+                    f"checkpoint id {checkpoint_id!r} is past stage 'state' "
+                    "but its audit record is missing"
+                )
+            if not _event_matches(audit_record, event):
+                raise ValueError(
+                    f"checkpoint id {checkpoint_id!r} audit record does not "
+                    "match its committed event"
+                )
+            if bound_receipt is None:
+                raise ValueError(
+                    f"checkpoint id {checkpoint_id!r} is committed but its "
+                    "receipt is missing"
+                )
+            if (
+                bound_receipt[STATE] != state_digest
+                or bound_receipt[AUDIT] != audit_digest
+            ):
+                raise ValueError(
+                    f"checkpoint id {checkpoint_id!r} receipt is bound to "
+                    "different state or audit digests"
+                )
+
+    # Reconciliation succeeded; perform each remaining effect at most
+    # once and advance the checkpoint after every durable step.
+    if existing is None:
+        records = _advance(
+            checkpoint_path, records, checkpoint_id,
+            state_digest, audit_digest, PREPARED,
+        )
+
+    if stage == PREPARED:
+        if need_save:
+            _storage.save_state(state_path, state)
+        records = _advance(
+            checkpoint_path, records, checkpoint_id,
+            state_digest, audit_digest, STAGE_STATE,
+        )
+        stage = STAGE_STATE
+
+    if stage == STAGE_STATE:
+        if need_append:
+            _audit.append(audit_path, event)
+        records = _advance(
+            checkpoint_path, records, checkpoint_id,
+            state_digest, audit_digest, STAGE_AUDIT,
+        )
+        stage = STAGE_AUDIT
+
+    if stage == STAGE_AUDIT:
+        if need_receipt:
+            _receipt.put(
+                receipt_path,
+                {AUDIT: audit_digest, ID: checkpoint_id, STATE: state_digest},
+            )
+        _advance(
+            checkpoint_path, records, checkpoint_id,
+            state_digest, audit_digest, COMMITTED,
+        )
+
+    return {
+        AUDIT: audit_digest,
+        ID: checkpoint_id,
+        STAGE: COMMITTED,
+        STATE: state_digest,
+    }
