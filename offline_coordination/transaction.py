@@ -58,6 +58,16 @@ returning the same ``audit``, ``id``, ``stage`` (``committed``) and
 ``state`` dict.  A digest conflict, or a checkpoint stage whose
 artifacts do not match it, raises :class:`ValueError` and leaves the
 files unchanged.
+
+:func:`inspect` is a strictly read-only counterpart taking only the
+``paths`` map.  A missing checkpoint index yields an empty list; every
+existing checkpoint is reported with its ``audit``, ``id``, ``stage``
+and ``state`` values plus a ``status`` of ``recoverable``,
+``committed`` or ``conflict`` derived from the state bytes, the audit
+chain and any bound receipt.  Neither :func:`inspect` nor
+:func:`commit` ever treats an existing-but-unreadable state as a mere
+conflict: when at least one of the main and backup state files exists
+but neither holds a valid state, :class:`CorruptStateError` propagates.
 """
 
 from __future__ import annotations
@@ -76,6 +86,7 @@ AUDIT = "audit"
 ID = "id"
 STAGE = "stage"
 STATE = "state"
+STATUS = "status"
 
 ITEMS = "items"
 VERSION = "version"
@@ -99,6 +110,10 @@ _RECEIPT = "receipt"
 
 _STAGES = (PREPARED, STAGE_STATE, STAGE_AUDIT, COMMITTED)
 _STAGE_RANK = {stage: rank for rank, stage in enumerate(_STAGES)}
+
+# Statuses reported by inspect for a checkpoint against its artifacts.
+RECOVERABLE = "recoverable"
+CONFLICT = "conflict"
 
 # Action performed once the checkpoint for a stage has been durably
 # recorded: persist state after prepared, append the audit entry after
@@ -502,16 +517,8 @@ def _state_payload(state: dict[str, Any]) -> bytes:
     return _storage._serialize(clock, records)
 
 
-def _validated_commit_inputs(
-    paths: Any, request: Any
-) -> tuple[dict[str, str], str, dict[str, Any], dict[str, str], bytes]:
-    """Validate ``paths`` and a commit ``request`` before any file access.
-
-    Returns the path map, id, the caller's state, a fresh validated event
-    dict and the canonical state bytes.  The state is checked against the
-    merge state contract and the event against the audit event contract,
-    so their type/value errors propagate unchanged in kind.
-    """
+def _validated_paths(paths: Any) -> dict[str, str]:
+    """Validate the ``checkpoint``/``state``/``audit``/``receipt`` path map."""
     if not isinstance(paths, dict):
         raise TypeError("paths must be a dict")
     if set(paths.keys()) != set(_PATH_KEYS):
@@ -522,7 +529,20 @@ def _validated_commit_inputs(
     for key in _PATH_KEYS:
         if not isinstance(paths[key], str):
             raise TypeError(f"paths {key} must be a str")
+    return {key: paths[key] for key in _PATH_KEYS}
 
+
+def _validated_commit_inputs(
+    paths: Any, request: Any
+) -> tuple[dict[str, str], str, dict[str, Any], dict[str, str], bytes]:
+    """Validate ``paths`` and a commit ``request`` before any file access.
+
+    Returns the path map, id, the caller's state, a fresh validated event
+    dict and the canonical state bytes.  The state is checked against the
+    merge state contract and the event against the audit event contract,
+    so their type/value errors propagate unchanged in kind.
+    """
+    path_map = _validated_paths(paths)
     if not isinstance(request, dict):
         raise TypeError("request must be a dict")
     if set(request.keys()) != set(_COMMIT_KEYS):
@@ -538,7 +558,6 @@ def _validated_commit_inputs(
     payload = _state_payload(request[STATE])
     event = _audit._validated_event(request[_EVENT])
 
-    path_map = {key: paths[key] for key in _PATH_KEYS}
     return path_map, checkpoint_id, request[STATE], event, payload
 
 
@@ -589,8 +608,28 @@ def _advance(
     return _apply(path, records, record)
 
 
+def _main_state_canonical_bytes(path: str) -> bytes | None:
+    """Canonical complete bytes of the main state file, or ``None``.
+
+    Only the main file is consulted: ``None`` is returned when it is
+    missing or when its bytes do not decode to a valid state.  No
+    exception other than a non-:class:`FileNotFoundError`
+    :class:`OSError` escapes.
+    """
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        return None
+    try:
+        state = _storage._decode_state(raw)
+    except _storage._DECODE_FAILURES:
+        return None
+    return _state_payload(state)
+
+
 def _read_state_bytes(path: str) -> bytes | None:
-    """Return the main state file bytes, or None when it is absent.
+    """Return the raw main state file bytes, or None when it is absent.
 
     Every :class:`OSError` other than :class:`FileNotFoundError`
     propagates unchanged.
@@ -600,6 +639,135 @@ def _read_state_bytes(path: str) -> bytes | None:
             return handle.read()
     except FileNotFoundError:
         return None
+
+
+def _assert_state_loadable(path: str) -> None:
+    """Raise unless the state is absent or a valid state survives.
+
+    Mirrors :func:`storage.load_state`: when at least one of the main and
+    backup files exists but neither holds a valid state,
+    :class:`CorruptStateError` propagates unchanged; when neither file
+    exists nothing happens.  Every other :class:`OSError` propagates
+    unchanged as well.
+    """
+    try:
+        _storage.load_state(path)
+    except FileNotFoundError:
+        return
+
+
+def _inspect_status(
+    stage: str,
+    state_matches: bool,
+    audit_ok: bool,
+    receipt: dict[str, str] | None,
+    state_digest: str,
+    audit_digest: str,
+) -> str:
+    """Classify one checkpoint from its stage and the S/A/R0/R1 facts.
+
+    ``S`` is ``state_matches`` (the main state file's canonical bytes hash
+    to the state digest), ``A`` is ``audit_ok`` (a valid audit chain
+    carries the audit digest), ``R0`` means no receipt is bound under the
+    id and ``R1`` means that receipt binds exactly both digests.
+    ``prepared`` with ``not A and R0``, ``state`` with ``S and R0`` and
+    ``audit`` with ``S and A and (R0 or R1)`` are recoverable;
+    ``committed`` with ``S and A and R1`` is committed; everything else
+    is a conflict.
+    """
+    r0 = receipt is None
+    r1 = (
+        receipt is not None
+        and receipt[STATE] == state_digest
+        and receipt[AUDIT] == audit_digest
+    )
+    if stage == PREPARED:
+        if not audit_ok and r0:
+            return RECOVERABLE
+    elif stage == STAGE_STATE:
+        if state_matches and r0:
+            return RECOVERABLE
+    elif stage == STAGE_AUDIT:
+        if state_matches and audit_ok and (r0 or r1):
+            return RECOVERABLE
+    else:  # COMMITTED
+        if state_matches and audit_ok and r1:
+            return COMMITTED
+    return CONFLICT
+
+
+def inspect(paths: dict[str, str]) -> list[dict[str, str]]:
+    """Read-only inspection of every checkpoint against its bound artifacts.
+
+    ``paths`` must contain exactly the str keys ``checkpoint``, ``state``,
+    ``audit`` and ``receipt``, naming the checkpoint index, the main state
+    file (its ``path + ".bak"`` backup is consulted for corruption
+    detection, exactly as :func:`storage.load_state` does), the audit log
+    and the receipt index.
+
+    A missing checkpoint index yields ``[]`` (no other artifact is read in
+    that case).  Otherwise one fresh dict per checkpoint is returned sorted
+    ascending by ``id`` with the fixed key order ``audit``, ``id``,
+    ``stage``, ``state``, ``status``; the first four values are copied from
+    the checkpoint and ``status`` is one of ``recoverable``, ``committed``
+    or ``conflict``.
+
+    Let ``S`` mean the main state file holds a complete valid state whose
+    canonical bytes hash to the state digest, ``A`` mean a valid audit
+    chain contains a record whose hash is the audit digest, ``R0`` mean no
+    receipt is bound under the id and ``R1`` mean that receipt binds
+    exactly both digests.  A ``prepared`` checkpoint with ``not A and R0``,
+    a ``state`` checkpoint with ``S and R0`` and an ``audit`` checkpoint
+    with ``S and A and (R0 or R1)`` are ``recoverable``; a ``committed``
+    checkpoint with ``S and A and R1`` is ``committed``; every other
+    combination is ``conflict``.
+
+    No file is created or modified.  Type violations raise
+    :class:`TypeError` and a bad path key set raises :class:`ValueError`;
+    when at least one of the state main/backup files exists but neither
+    holds a valid state, :class:`CorruptStateError` propagates unchanged,
+    as do :class:`CorruptAuditError`, :class:`CorruptReceiptError`,
+    :class:`CorruptTransactionError` and :class:`OSError`.
+    """
+    path_map = _validated_paths(paths)
+
+    records = _read_index(path_map[_CHECKPOINT])
+    if not records:
+        return []
+
+    audit_records = _audit._read_all_records(path_map[AUDIT])
+    receipts_by_id = {
+        receipt[ID]: receipt for receipt in _receipt._read_index(path_map[_RECEIPT])
+    }
+    main_state_bytes = _main_state_canonical_bytes(path_map[STATE])
+    _assert_state_loadable(path_map[STATE])
+
+    audit_hashes = {record[_audit.HASH] for record in audit_records}
+
+    items: list[dict[str, str]] = []
+    for record in records:
+        state_digest = record[STATE]
+        audit_digest = record[AUDIT]
+        state_matches = (
+            main_state_bytes is not None
+            and hashlib.sha256(main_state_bytes).hexdigest() == state_digest
+        )
+        audit_ok = audit_digest in audit_hashes
+        receipt = receipts_by_id.get(record[ID])
+        status = _inspect_status(
+            record[STAGE], state_matches, audit_ok, receipt,
+            state_digest, audit_digest,
+        )
+        items.append(
+            {
+                AUDIT: audit_digest,
+                ID: record[ID],
+                STAGE: record[STAGE],
+                STATE: state_digest,
+                STATUS: status,
+            }
+        )
+    return items
 
 
 def commit(paths: dict[str, str], request: dict[str, Any]) -> dict[str, str]:
@@ -663,6 +831,10 @@ def commit(paths: dict[str, str], request: dict[str, Any]) -> dict[str, str]:
         (record for record in records if record[ID] == checkpoint_id), None
     )
     state_on_disk = _read_state_bytes(state_path)
+    # When a state file exists but neither the main file nor the backup
+    # holds a valid state the situation is unrecoverable, not a digest
+    # conflict: CorruptStateError propagates before any reconciliation.
+    _assert_state_loadable(state_path)
 
     need_save = False
     need_append = False
