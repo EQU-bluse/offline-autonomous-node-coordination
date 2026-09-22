@@ -57,15 +57,10 @@ def _read_valid_state(path: str) -> dict[str, Any] | None:
 
 
 def _fsync_dir(path: str) -> None:
-    """Best-effort fsync of the directory containing ``path``."""
-    try:
-        fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
-    except OSError:
-        return
+    """fsync the directory containing ``path``; OSErrors propagate."""
+    fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
     try:
         os.fsync(fd)
-    except OSError:
-        pass
     finally:
         os.close(fd)
 
@@ -78,7 +73,9 @@ def save_state(path: str, state: dict[str, Any]) -> None:
     the filesystem, so a rejected state leaves the existing files untouched.
     On success the main file holds the new state and the backup holds the
     previous most recent complete state (if there was one).  A crash at any
-    point leaves at least one of the main and backup files readable.
+    point leaves at least one of the main and backup files readable.  After
+    the main replacement the parent directory is fsynced; a failure to open
+    or fsync it propagates as an :class:`OSError`.
     """
     if not isinstance(path, str):
         raise TypeError("path must be a str")
