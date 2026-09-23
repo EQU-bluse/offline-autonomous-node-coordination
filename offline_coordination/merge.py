@@ -145,6 +145,86 @@ def _resolve_record(left: list[Any], right: list[Any]) -> list[Any]:
     return left if _record_sort_key(left) >= _record_sort_key(right) else right
 
 
+def _remote_need(
+    remote_record: list[Any], local_clock: dict[str, int]
+) -> dict[str, list[int]]:
+    """Clock components the local state is missing before this record applies.
+
+    The prerequisite vector is the remote record clock with its own writer
+    component decremented by one.  Each component where the local outer clock
+    is behind contributes the closed interval ``[local + 1, prerequisite]``.
+    """
+    _, _, remote_clock, writer = remote_record
+    need: dict[str, list[int]] = {}
+    for node in sorted(set(local_clock) | set(remote_clock)):
+        prerequisite = remote_clock.get(node, 0) - (1 if node == writer else 0)
+        local_count = local_clock.get(node, 0)
+        if local_count < prerequisite:
+            need[node] = [local_count + 1, prerequisite]
+    return need
+
+
+def preview_changes(local: dict[str, Any], remote: dict[str, Any]) -> dict[str, Any]:
+    """Preview per-key decisions implied by merging ``remote`` into ``local``.
+
+    The state contract is the same as for :func:`merge_states`.  Inputs are
+    never modified and every call returns brand-new, deeply independent
+    objects.
+
+    The result is ``{"items": items, "version": 1}`` with one item per key of
+    ``remote["records"]`` in ascending key order.  Each item has the key order
+    ``decision, key, need, winner``:
+
+    * ``need`` lists the outer-clock components missing locally for the
+      remote record to be causally ready (its clock with the writer component
+      decremented by one), nodes ascending, values as closed
+      ``[start, end]`` intervals (missing components count as 0).
+    * When ``need`` is non-empty, ``decision`` is ``"missing"`` and
+      ``winner`` is ``None``.
+    * Otherwise the decision is, in order: ``"apply"``/``"remote"`` when the
+      local record is absent or the remote record dominates it,
+      ``"duplicate"``/``"equal"`` for equal records, ``"stale"``/``"local"``
+      when the local record dominates, and ``"conflict"`` with the
+      :func:`merge_states` tie-break winner (``"remote"`` or ``"local"``) for
+      concurrent records.
+
+    Type violations raise :class:`TypeError`; all other constraint violations
+    raise :class:`ValueError`.
+    """
+    local_clock, local_records = _validated_state(local)
+    _, remote_records = _validated_state(remote)
+
+    items: list[dict[str, Any]] = []
+    for key in sorted(remote_records):
+        remote_record = remote_records[key]
+        local_record = local_records.get(key)
+        need = _remote_need(remote_record, local_clock)
+
+        if need:
+            decision, winner = "missing", None
+        elif local_record is None:
+            decision, winner = "apply", "remote"
+        elif local_record == remote_record:
+            decision, winner = "duplicate", "equal"
+        elif _dominates(remote_record[2], local_record[2]):
+            decision, winner = "apply", "remote"
+        elif _dominates(local_record[2], remote_record[2]):
+            decision, winner = "stale", "local"
+        else:
+            # Concurrent updates: the same tuple arbitration as merge_states.
+            if _record_sort_key(remote_record) >= _record_sort_key(local_record):
+                winner = "remote"
+            else:
+                winner = "local"
+            decision = "conflict"
+
+        items.append(
+            {"decision": decision, "key": key, "need": need, "winner": winner}
+        )
+
+    return {"items": items, "version": 1}
+
+
 def merge_states(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     """Merge two states and return a brand-new state without mutating inputs.
 
