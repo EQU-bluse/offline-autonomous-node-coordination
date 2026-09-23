@@ -8,12 +8,13 @@ whitespace) terminated by exactly one ``\\n``::
 The top-level keys are fixed in the order ``after``, ``complete``,
 ``next``, ``records``, ``version`` and ``version`` is always the integer
 1.  ``after`` echoes the request's ``after`` argument.  ``records`` holds
-up to ``limit`` audit records whose ``seq`` is greater than ``after``, in
-audit order, each preserving the audit record key order
-``detail, hash, kind, prev, seq, source`` and its original values.
+up to ``limit`` (at most 1000) audit records whose ``seq`` is greater
+than ``after``, in audit order, each preserving the audit record key
+order ``detail, hash, kind, prev, seq, source`` and its original values.
 ``next`` is the seq of the last record in the batch, or ``after`` itself
 when the batch is empty; ``complete`` is true when no record follows the
-batch.  Batches are generated solely through :func:`audit.read`, so the
+batch, and an empty ``records`` list is only valid when ``complete`` is
+true.  Batches are generated solely through :func:`audit.read`, so the
 audit log is never modified and :class:`~offline_coordination.audit.
 CorruptAuditError` and :class:`OSError` propagate unchanged.
 
@@ -29,6 +30,16 @@ only the contiguous suffix past ``L`` is appended, linked to the local
 last hash.  ``need`` is then ``None``, ``next`` is ``max(L, batch.next)``
 and ``status`` is ``"applied"`` when records were appended, else
 ``"duplicate"``.  Any failure leaves the log untouched.
+
+Batch records are checked only against the byte contract: canonical
+encoding, key order, the seq/prev/hash chain and the stored values.
+Value-domain rules enforced by :func:`audit.append` on event input (the
+kind enum, non-empty string fields) are *not* re-enforced here, so every
+log :func:`audit.read` accepts round-trips through
+:func:`export_batch`/:func:`import_batch`.  The append itself is atomic:
+when the write, flush or fsync step raises :class:`OSError` the error
+propagates unchanged and the log is left byte-identical to its pre-call
+state (still missing when it was missing).
 """
 
 from __future__ import annotations
@@ -61,7 +72,6 @@ _RECORD_KEYS = (
     audit.SEQ,
     audit.SOURCE,
 )
-_STRING_FIELDS = (audit.DETAIL, audit.KIND, audit.PREV, audit.SOURCE, audit.HASH)
 _BATCH_VERSION = 1
 _MIN_LIMIT = 1
 _MAX_LIMIT = 1000
@@ -151,6 +161,10 @@ def _parse_batch(batch: bytes) -> dict:
     records = data[RECORDS]
     if not isinstance(records, list):
         raise _invalid_batch("records must be a list")
+    if len(records) > _MAX_LIMIT:
+        raise _invalid_batch("records must contain at most 1000 items")
+    if not records and not data[COMPLETE]:
+        raise _invalid_batch("empty records require complete to be true")
 
     expected_seq = data[AFTER]
     expected_prev = audit._ZERO_HASH if data[AFTER] == 0 else None
@@ -160,15 +174,10 @@ def _parse_batch(batch: bytes) -> dict:
                 f"record {index} must have exactly the keys "
                 "'detail', 'hash', 'kind', 'prev', 'seq', 'source' in order"
             )
-        for field in _STRING_FIELDS:
-            if not isinstance(record[field], str):
-                raise _invalid_batch(f"record {index} {field} must be a str")
-        if record[audit.DETAIL] == "" or record[audit.SOURCE] == "":
-            raise _invalid_batch(f"record {index} detail and source must be non-empty")
-        if record[audit.KIND] not in audit._KINDS:
-            raise _invalid_batch(
-                f"record {index} kind must be one of 'local', 'merge' or 'restore'"
-            )
+        # Only the byte contract is enforced here: key order, the
+        # seq/prev/hash chain and the stored values.  Value-domain rules
+        # (non-empty fields, the kind enum) belong to audit.append's event
+        # input, so records from any log audit.read accepts stay importable.
         prev = record[audit.PREV]
         digest = record[audit.HASH]
         if expected_prev is not None:
@@ -176,7 +185,7 @@ def _parse_batch(batch: bytes) -> dict:
                 raise _invalid_batch(
                     f"record {index} prev does not match the previous record hash"
                 )
-        elif not _HEX64.fullmatch(prev):
+        elif not isinstance(prev, str) or not _HEX64.fullmatch(prev):
             # The first record's prev refers to the exporter's log and
             # cannot be checked against local state; require hash shape.
             raise _invalid_batch(f"record {index} prev must be 64 lowercase hex chars")
@@ -210,6 +219,26 @@ def _parse_batch(batch: bytes) -> dict:
     return data
 
 
+def _restore_log(path: str, existed: bool, size: int) -> None:
+    """Best-effort rollback of a failed append.
+
+    Append-mode writes only ever extend the file, so truncating back to
+    the pre-call size restores the exact prior bytes; a file the failed
+    call newly created is unlinked again.  Rollback errors are swallowed
+    so the original :class:`OSError` propagates unchanged.
+    """
+    try:
+        if existed:
+            with open(path, "r+b") as handle:
+                handle.truncate(size)
+                handle.flush()
+                os.fsync(handle.fileno())
+        else:
+            os.unlink(path)
+    except OSError:
+        pass
+
+
 def import_batch(path: str, batch: bytes) -> dict:
     """Validate a replication batch and append its suffix to the local log.
 
@@ -218,8 +247,9 @@ def import_batch(path: str, batch: bytes) -> dict:
     contract violation raises :class:`ValueError`.  The local log is read
     solely through :func:`audit.read`, and a corrupt log or filesystem
     error propagates as :class:`~offline_coordination.audit.
-    CorruptAuditError` or :class:`OSError`.  Nothing is written on any
-    failure.
+    CorruptAuditError` or :class:`OSError`.  Any failure leaves the log
+    byte-identical to its pre-call state (still missing when it was
+    missing).
     """
     if not isinstance(path, str):
         raise TypeError("path must be a str")
@@ -268,16 +298,21 @@ def import_batch(path: str, batch: bytes) -> dict:
         for record in suffix
     )
     existed = os.path.exists(path)
-    with open(path, "ab") as handle:
-        handle.write(lines)
-        handle.flush()
-        os.fsync(handle.fileno())
-
-    if not existed:
-        fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+    original_size = os.path.getsize(path) if existed else 0
+    dir_fd: int | None = None
+    try:
+        with open(path, "ab") as handle:
+            handle.write(lines)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if not existed:
+            dir_fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+            os.fsync(dir_fd)
+    except OSError:
+        _restore_log(path, existed, original_size)
+        raise
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
 
     return {NEED: None, NEXT: max(last_seq, data[NEXT]), STATUS: STATUS_APPLIED}

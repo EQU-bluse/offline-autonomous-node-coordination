@@ -250,12 +250,12 @@ class ImportBatchTest(unittest.TestCase):
         result = import_batch(self.dst, export_batch(self.src, after=3))
         self.assertEqual(result, {"need": None, "next": 3, "status": "duplicate"})
 
-    def test_empty_batch_behind_local_tip_is_duplicate(self) -> None:
+    def test_empty_batch_with_complete_false_is_rejected(self) -> None:
         self.seed(self.src, 3)
         import_batch(self.dst, export_batch(self.src))
         batch = b'{"after":1,"complete":false,"next":1,"records":[],"version":1}\n'
-        result = import_batch(self.dst, batch)
-        self.assertEqual(result, {"need": None, "next": 3, "status": "duplicate"})
+        with self.assertRaises(ValueError):
+            import_batch(self.dst, batch)
 
     def test_conflicting_shared_record_raises_and_keeps_log(self) -> None:
         self.seed(self.src, 3)
@@ -316,6 +316,127 @@ class ImportBatchTest(unittest.TestCase):
         with mock.patch("offline_coordination.audit.read", side_effect=OSError):
             with self.assertRaises(OSError):
                 import_batch(self.dst, batch)
+
+
+def write_raw_log(path: str, events: list) -> None:
+    """Write a hash-chained log whose values may lie outside the
+    audit.append event input domain but which audit.read still accepts."""
+    prev = "0" * 64
+    lines = []
+    for index, event_fields in enumerate(events, start=1):
+        record = {
+            "detail": event_fields["detail"],
+            "kind": event_fields["kind"],
+            "prev": prev,
+            "seq": index,
+            "source": event_fields["source"],
+        }
+        record["hash"] = audit._record_hash(record)
+        prev = record["hash"]
+        lines.append(canonical({key: record[key] for key in KEYS}))
+    with open(path, "wb") as handle:
+        handle.write(b"".join(line + b"\n" for line in lines))
+
+
+class ImportBatchCompatibilityTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.src = os.path.join(self.dir, "src.jsonl")
+        self.dst = os.path.join(self.dir, "dst.jsonl")
+
+    def test_out_of_domain_values_round_trip(self) -> None:
+        events = [
+            {"source": "", "kind": "odd", "detail": ""},
+            {"source": "node-a", "kind": "local", "detail": "plain"},
+            {"source": "n", "kind": "restore", "detail": "雪man ☃"},
+        ]
+        write_raw_log(self.src, events)
+        # The source log is readable, so its export must be importable.
+        self.assertEqual(len(audit.read(self.src)), 3)
+        result = import_batch(self.dst, export_batch(self.src))
+        self.assertEqual(result, {"need": None, "next": 3, "status": "applied"})
+        self.assertEqual(audit.read(self.dst), audit.read(self.src))
+
+    def test_out_of_domain_overlap_matches_and_dedupes(self) -> None:
+        events = [
+            {"source": "", "kind": "odd", "detail": ""},
+            {"source": "x", "kind": "merge", "detail": "two"},
+        ]
+        write_raw_log(self.src, events)
+        import_batch(self.dst, export_batch(self.src, after=0, limit=1))
+        append_more = [
+            {"source": "", "kind": "odd", "detail": ""},
+            {"source": "x", "kind": "merge", "detail": "two"},
+            {"source": "y", "kind": "weird", "detail": "three"},
+        ]
+        write_raw_log(self.src, append_more)
+        result = import_batch(self.dst, export_batch(self.src))
+        self.assertEqual(result, {"need": None, "next": 3, "status": "applied"})
+        self.assertEqual(audit.read(self.dst), audit.read(self.src))
+        again = import_batch(self.dst, export_batch(self.src))
+        self.assertEqual(again, {"need": None, "next": 3, "status": "duplicate"})
+
+
+class ImportBatchAtomicityTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.src = os.path.join(self.dir, "src.jsonl")
+        self.dst = os.path.join(self.dir, "dst.jsonl")
+
+    def seed(self, path: str, n: int) -> None:
+        for i in range(n):
+            append(path, {"source": "node-a", "kind": "local", "detail": f"event {i}"})
+
+    def test_fsync_failure_keeps_existing_log_bytes(self) -> None:
+        self.seed(self.src, 4)
+        self.seed(self.dst, 2)
+        with open(self.dst, "rb") as handle:
+            before = handle.read()
+        batch = export_batch(self.src, after=2)
+        with mock.patch("os.fsync", side_effect=OSError("disk gone")):
+            with self.assertRaises(OSError):
+                import_batch(self.dst, batch)
+        with open(self.dst, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_flush_failure_keeps_missing_path_missing(self) -> None:
+        self.seed(self.src, 2)
+        batch = export_batch(self.src)
+        with mock.patch("os.fsync", side_effect=OSError("disk gone")):
+            with self.assertRaises(OSError):
+                import_batch(self.dst, batch)
+        self.assertFalse(os.path.exists(self.dst))
+
+    def test_write_failure_keeps_existing_log_bytes(self) -> None:
+        self.seed(self.src, 4)
+        self.seed(self.dst, 2)
+        with open(self.dst, "rb") as handle:
+            before = handle.read()
+        batch = export_batch(self.src, after=2)
+        real_open = open
+
+        class FailingFile:
+            def __init__(self, *args, **kwargs):
+                self._handle = real_open(*args, **kwargs)
+
+            def write(self, data):
+                raise OSError("write failed")
+
+            def __getattr__(self, name):
+                return getattr(self._handle, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._handle.close()
+                return False
+
+        with mock.patch("builtins.open", side_effect=lambda *a, **k: FailingFile(*a, **k)):
+            with self.assertRaises(OSError):
+                import_batch(self.dst, batch)
+        with open(self.dst, "rb") as handle:
+            self.assertEqual(handle.read(), before)
 
 
 class ImportBatchValidationTest(unittest.TestCase):
@@ -458,6 +579,34 @@ class ImportBatchValidationTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             import_batch(self.path, canonical(data) + b"\n")
+
+    def test_records_over_1000_rejected_before_local_read(self) -> None:
+        batch = canonical(
+            {"after": 0, "complete": True, "next": 1001,
+             "records": [{}] * 1001, "version": 1}
+        ) + b"\n"
+        with mock.patch("offline_coordination.audit.read") as patched:
+            with self.assertRaises(ValueError):
+                import_batch(self.path, batch)
+        patched.assert_not_called()
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_empty_records_require_complete_true(self) -> None:
+        batch = b'{"after":0,"complete":false,"next":0,"records":[],"version":1}\n'
+        with mock.patch("offline_coordination.audit.read") as patched:
+            with self.assertRaises(ValueError):
+                import_batch(self.path, batch)
+        patched.assert_not_called()
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_out_of_domain_record_values_accepted(self) -> None:
+        src = os.path.join(self.dir, "src.jsonl")
+        write_raw_log(src, [{"source": "", "kind": "odd", "detail": ""}])
+        batch = export_batch(src)
+        with mock.patch("offline_coordination.audit.read", wraps=audit.read) as patched:
+            result = import_batch(self.path, batch)
+        self.assertEqual(result["status"], "applied")
+        patched.assert_called_with(self.path)
 
     def test_validation_runs_before_local_read(self) -> None:
         with mock.patch("offline_coordination.audit.read") as patched:
