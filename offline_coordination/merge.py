@@ -183,3 +183,83 @@ def merge_states(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
         merged_records[key] = [value, deleted, dict(record_clock), writer]
 
     return {CLOCK: merged_clock, RECORDS: merged_records}
+
+
+def preview_changes(local: dict[str, Any], remote: dict[str, Any]) -> dict[str, Any]:
+    """Preview the per-key decisions of merging ``remote`` into ``local``.
+
+    ``local`` and ``remote`` follow the same state contract as
+    :func:`merge_states` (and are validated the same way). Inputs are never
+    mutated and the result is a brand-new structure.
+
+    One item is emitted for every key in ``remote``'s records, ordered by
+    ascending key. For each key, ``P`` is the remote record's clock with its
+    writer's component decremented by one (the clock one tick before the
+    remote write). ``need`` maps every node, in ascending order, for which
+    the local outer clock is behind ``P`` (missing components count as 0)
+    to the closed interval ``[local_component + 1, P_component]``.
+
+    Decisions:
+
+    * ``need`` non-empty -> ``("missing", None)``.
+    * No local record -> ``("apply", "remote")``.
+    * Identical records -> ``("duplicate", "equal")``.
+    * Remote dominates local -> ``("apply", "remote")``.
+    * Local dominates remote -> ``("stale", "local")``.
+    * Concurrent -> ``("conflict", winner)`` where ``winner`` is the side
+      picked by :func:`merge_states`' tuple arbitration.
+
+    The result is ``{"items": [...], "version": 1}``; each item is
+    ``{"decision", "key", "need", "winner"}`` and non-missing items carry an
+    empty ``need`` dict.
+
+    Type violations raise :class:`TypeError`; all other constraint violations
+    raise :class:`ValueError`.
+    """
+    local_clock, local_records = _validated_state(local)
+    _, remote_records = _validated_state(remote)
+
+    items: list[dict[str, Any]] = []
+    for key in sorted(remote_records):
+        remote_record = remote_records[key]
+        local_record = local_records.get(key)
+        _, _, remote_clock, remote_writer = remote_record
+
+        # Prerequisite clock: one tick before the remote writer's write.
+        prerequisite = dict(remote_clock)
+        prerequisite[remote_writer] = prerequisite[remote_writer] - 1
+
+        need: dict[str, list[int]] = {}
+        for node in sorted(prerequisite):
+            required = prerequisite[node]
+            current = local_clock.get(node, 0)
+            if current < required:
+                need[node] = [current + 1, required]
+
+        if need:
+            decision: str
+            winner: str | None
+            decision, winner = "missing", None
+        elif local_record is None:
+            decision, winner = "apply", "remote"
+        elif local_record == remote_record:
+            decision, winner = "duplicate", "equal"
+        elif _dominates(remote_clock, local_record[2]):
+            decision, winner = "apply", "remote"
+        elif _dominates(local_record[2], remote_clock):
+            decision, winner = "stale", "local"
+        else:
+            # Concurrent updates: same tuple arbitration as merge_states,
+            # where local plays the left side and remote the right side.
+            decision = "conflict"
+            winner = (
+                "local"
+                if _record_sort_key(local_record) >= _record_sort_key(remote_record)
+                else "remote"
+            )
+
+        items.append(
+            {"decision": decision, "key": key, "need": need, "winner": winner}
+        )
+
+    return {"items": items, "version": 1}
