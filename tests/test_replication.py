@@ -621,3 +621,646 @@ class ImportBatchValidationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# apply_remote: persistent remote-state application
+# ---------------------------------------------------------------------------
+
+from offline_coordination import replication  # noqa: E402
+from offline_coordination import merge as _merge  # noqa: E402
+
+APPLY_RESULT_KEYS = ("items", "receipt", "status")
+ITEM_KEYS = ("key", "decision", "need")
+
+
+def state(clock=None, records=None):
+    return {"clock": dict(clock or {}), "records": dict(records or {})}
+
+
+def record(value, deleted, clock, writer):
+    return [value, deleted, dict(clock), writer]
+
+
+def request(rid="r1", source="node-a", base=None, remote=None):
+    return {
+        "id": rid,
+        "source": source,
+        "base": state() if base is None else base,
+        "remote": state() if remote is None else remote,
+    }
+
+
+def read_ledger(path):
+    with open(path, "rb") as handle:
+        return json.loads(handle.read())
+
+
+def ledger_raw(path):
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+class ApplyRemoteBasicTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+
+    def test_applies_to_missing_ledger_taking_base_as_current(self) -> None:
+        remote = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        result = replication.apply_remote(self.path, request(remote=remote))
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(tuple(result.keys()), APPLY_RESULT_KEYS)
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(tuple(result["items"][0].keys()), ITEM_KEYS)
+        self.assertEqual(result["items"][0],
+                         {"key": "k", "decision": "apply", "need": None})
+        self.assertIsNotNone(result["receipt"])
+
+    def test_state_and_clock_persisted(self) -> None:
+        remote = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        replication.apply_remote(self.path, request(remote=remote))
+        ledger = read_ledger(self.path)
+        self.assertEqual(ledger["version"], 1)
+        self.assertEqual(ledger["state"],
+                         {"clock": {"a": 1},
+                          "records": {"k": ["v", False, {"a": 1}, "a"]}})
+
+    def test_ledger_is_canonical_compact_json_with_one_lf(self) -> None:
+        remote = state({"a": 1}, {"k": record("☃", False, {"a": 1}, "a")})
+        replication.apply_remote(self.path, request(remote=remote))
+        raw = ledger_raw(self.path)
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertFalse(raw.endswith(b"\n\n"))
+        decoded = json.loads(raw)
+        self.assertEqual(
+            raw,
+            json.dumps(decoded, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")).encode("utf-8") + b"\n",
+        )
+        self.assertEqual(tuple(decoded.keys()), ("audit", "requests", "state", "version"))
+        self.assertIn("☃".encode("utf-8"), raw)
+        self.assertNotIn(b"\\u", raw)
+        self.assertEqual(
+            tuple(decoded["audit"][0].keys()),
+            ("after", "before", "id", "seq", "source"),
+        )
+
+    def test_outer_clock_raised_per_node_from_applied_records(self) -> None:
+        # Two records by different writers apply from an empty ledger in one
+        # request; the outer clock advances on both nodes.
+        remote = state(
+            {"a": 1, "b": 1},
+            {
+                "ak": record("v", False, {"a": 1}, "a"),
+                "bk": record("w", False, {"b": 1}, "b"),
+            },
+        )
+        replication.apply_remote(self.path, request(remote=remote))
+        self.assertEqual(read_ledger(self.path)["state"]["clock"], {"a": 1, "b": 1})
+
+    def test_items_sorted_by_remote_key(self) -> None:
+        remote = state(
+            {"a": 1},
+            {
+                "z": record("z", False, {"a": 1}, "a"),
+                "a": record("a", False, {"a": 1}, "a"),
+                "m": record("m", False, {"a": 1}, "a"),
+            },
+        )
+        result = replication.apply_remote(self.path, request(remote=remote))
+        self.assertEqual([item["key"] for item in result["items"]], ["a", "m", "z"])
+        self.assertTrue(all(item["decision"] == "apply" for item in result["items"]))
+
+    def test_receipt_carries_id_source_digests_and_seq(self) -> None:
+        remote = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        result = replication.apply_remote(
+            self.path, request(rid="r-1", source="node-b", remote=remote)
+        )
+        receipt = result["receipt"]
+        self.assertEqual(tuple(receipt.keys()),
+                         ("id", "source", "before", "after", "seq"))
+        self.assertEqual(receipt["id"], "r-1")
+        self.assertEqual(receipt["source"], "node-b")
+        self.assertEqual(receipt["seq"], 1)
+        self.assertNotEqual(receipt["before"], receipt["after"])
+        self.assertRegex(receipt["before"], r"[0-9a-f]{64}")
+        self.assertRegex(receipt["after"], r"[0-9a-f]{64}")
+
+    def test_remote_tombstone_applied(self) -> None:
+        remote = state({"a": 1}, {"k": record("", True, {"a": 1}, "a")})
+        result = replication.apply_remote(self.path, request(remote=remote))
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(read_ledger(self.path)["state"]["records"]["k"],
+                         ["", True, {"a": 1}, "a"])
+
+
+class ApplyRemoteChainTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+
+    def apply(self, rid, base, remote, source="s"):
+        return replication.apply_remote(
+            self.path, request(rid=rid, source=source, base=base, remote=remote)
+        )
+
+    def test_seqs_contiguous_and_entries_chain(self) -> None:
+        s0 = state()
+        s1 = state({"a": 1}, {"k": record("v1", False, {"a": 1}, "a")})
+        s2 = state({"a": 2}, {"k": record("v2", False, {"a": 2}, "a")})
+        s3 = state({"a": 2, "b": 1},
+                   {"k": record("v2", False, {"a": 2}, "a"),
+                    "g": record("g", False, {"b": 1}, "b")})
+        self.apply("r1", s0, s1)
+        self.apply("r2", s1, s2)
+        r3 = self.apply("r3", s2, s3)
+        ledger = read_ledger(self.path)
+        entries = ledger["audit"]
+        self.assertEqual([entry["seq"] for entry in entries], [1, 2, 3])
+        self.assertEqual(entries[1]["before"], entries[0]["after"])
+        self.assertEqual(entries[2]["before"], entries[1]["after"])
+        import hashlib
+        state_digest = hashlib.sha256(replication._state_bytes(s3)).hexdigest()
+        self.assertEqual(entries[-1]["after"], state_digest)
+        self.assertEqual(r3["receipt"]["seq"], 3)
+        self.assertEqual(set(ledger["requests"]), {"r1", "r2", "r3"})
+
+    def test_requests_bound_to_digests_are_stable(self) -> None:
+        s1 = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        self.apply("r1", state(), s1)
+        ledger = read_ledger(self.path)
+        self.assertEqual(
+            ledger["requests"]["r1"],
+            replication._request_digest("r1", "s", state(), s1),
+        )
+
+
+class ApplyRemoteReplayTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+        self.s1 = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        self.req = request(remote=self.s1)
+        self.first = replication.apply_remote(self.path, self.req)
+
+    def test_same_id_same_request_is_duplicate_with_unchanged_bytes(self) -> None:
+        before = ledger_raw(self.path)
+        again = replication.apply_remote(self.path, self.req)
+        self.assertEqual(again["status"], "duplicate")
+        self.assertEqual(again["items"], [])
+        self.assertEqual(again["receipt"], self.first["receipt"])
+        self.assertEqual(ledger_raw(self.path), before)
+
+    def test_replay_finds_its_own_entry_after_later_applies(self) -> None:
+        s2 = state({"a": 2}, {"k": record("w", False, {"a": 2}, "a")})
+        replication.apply_remote(self.path, request(rid="r2", base=self.s1, remote=s2))
+        again = replication.apply_remote(self.path, self.req)
+        self.assertEqual(again["status"], "duplicate")
+        self.assertEqual(again["receipt"], self.first["receipt"])
+
+    def test_same_id_different_remote_raises_and_keeps_bytes(self) -> None:
+        changed = request(
+            remote=state({"a": 2}, {"k": record("w", False, {"a": 2}, "a")})
+        )
+        before = ledger_raw(self.path)
+        with self.assertRaises(ValueError):
+            replication.apply_remote(self.path, changed)
+        self.assertEqual(ledger_raw(self.path), before)
+
+    def test_same_id_different_source_raises(self) -> None:
+        changed = dict(self.req, source="other-node")
+        with self.assertRaises(ValueError):
+            replication.apply_remote(self.path, changed)
+
+    def test_same_id_different_base_raises(self) -> None:
+        changed = dict(self.req, base=state({"a": 1}))
+        with self.assertRaises(ValueError):
+            replication.apply_remote(self.path, changed)
+
+
+class ApplyRemoteStaleGateTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+        self.s1 = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        replication.apply_remote(self.path, request(rid="r1", remote=self.s1))
+
+    def test_unknown_id_with_wrong_base_is_stale_and_writes_nothing(self) -> None:
+        before = ledger_raw(self.path)
+        remote = state({"a": 1}, {"z": record("q", False, {"a": 1}, "a")})
+        result = replication.apply_remote(
+            self.path, request(rid="r2", base=state(), remote=remote)
+        )
+        self.assertEqual(result["status"], "stale")
+        self.assertEqual(result["items"], [])
+        self.assertIsNone(result["receipt"])
+        self.assertEqual(ledger_raw(self.path), before)
+
+    def test_unknown_id_matching_base_proceeds_past_gate(self) -> None:
+        remote = state({"a": 2}, {"k": record("w", False, {"a": 2}, "a")})
+        result = replication.apply_remote(
+            self.path, request(rid="r2", base=self.s1, remote=remote)
+        )
+        self.assertEqual(result["status"], "applied")
+
+    def test_stale_gate_uses_canonical_state_equivalence(self) -> None:
+        # A zero-valued clock component serialises identically either way.
+        base = state({"a": 1, "z": 0}, {"k": record("v", False, {"a": 1}, "a")})
+        # Stored state has no z component; canonical bytes still differ, so
+        # this is stale -- the comparison is exact canonical bytes.
+        remote = state({"a": 2}, {"k": record("w", False, {"a": 2}, "a")})
+        result = replication.apply_remote(
+            self.path, request(rid="r3", base=base, remote=remote)
+        )
+        self.assertEqual(result["status"], "stale")
+
+
+class ApplyRemoteDecisionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+
+    def seed(self, seed_state):
+        replication.apply_remote(
+            self.path, request(rid="seed", base=state(), remote=seed_state)
+        )
+
+    def apply_against(self, seed_state, remote, rid="r"):
+        return replication.apply_remote(
+            self.path, request(rid=rid, base=seed_state, remote=remote)
+        )
+
+    def test_remote_dominates_is_apply(self) -> None:
+        s = state({"a": 1}, {"k": record("old", False, {"a": 1}, "a")})
+        self.seed(s)
+        nxt = state({"a": 2}, {"k": record("new", False, {"a": 2}, "a")})
+        result = self.apply_against(s, nxt)
+        self.assertEqual(result["items"][0]["decision"], "apply")
+        self.assertEqual(result["status"], "applied")
+
+    def test_equal_record_is_duplicate_and_writes_nothing(self) -> None:
+        s = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        self.seed(s)
+        before = ledger_raw(self.path)
+        result = self.apply_against(s, s, rid="d1")
+        self.assertEqual(result["status"], "duplicate")
+        self.assertEqual(result["items"][0]["decision"], "duplicate")
+        self.assertIsNone(result["receipt"])
+        self.assertEqual(ledger_raw(self.path), before)
+
+    def test_local_dominates_is_stale(self) -> None:
+        current = state({"a": 2}, {"k": record("new", False, {"a": 2}, "a")})
+        self.seed(current)
+        older = state({"a": 2}, {"k": record("old", False, {"a": 1}, "a")})
+        result = self.apply_against(current, older, rid="s1")
+        self.assertEqual(result["items"][0]["decision"], "stale")
+        self.assertEqual(result["status"], "stale")
+        self.assertIsNone(result["receipt"])
+
+    def test_concurrent_records_conflict_and_do_not_commit(self) -> None:
+        current = state({"a": 1, "b": 1},
+                        {"k": record("x", False, {"a": 1}, "a"),
+                         "bk": record("z", False, {"b": 1}, "b")})
+        self.seed(current)
+        other = state({"a": 1, "b": 1},
+                      {"k": record("y", False, {"b": 1}, "b"),
+                       "bk": record("z", False, {"b": 1}, "b")})
+        before = ledger_raw(self.path)
+        result = self.apply_against(current, other, rid="c1")
+        decisions = {item["key"]: item["decision"] for item in result["items"]}
+        self.assertEqual(decisions, {"bk": "duplicate", "k": "conflict"})
+        self.assertEqual(result["status"], "conflict")
+        self.assertIsNone(result["receipt"])
+        self.assertEqual(ledger_raw(self.path), before)
+
+    def test_apply_and_duplicate_together_commit(self) -> None:
+        current = state({"a": 1},
+                        {"k": record("x", False, {"a": 1}, "a"),
+                         "g": record("g0", False, {"a": 1}, "a")})
+        self.seed(current)
+        nxt = state({"a": 2},
+                    {"k": record("x", False, {"a": 1}, "a"),
+                     "g": record("g1", False, {"a": 2}, "a")})
+        result = self.apply_against(current, nxt, rid="mix")
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(
+            [(i["key"], i["decision"]) for i in result["items"]],
+            [("g", "apply"), ("k", "duplicate")],
+        )
+        stored = read_ledger(self.path)["state"]["records"]
+        self.assertEqual(stored["g"], ["g1", False, {"a": 2}, "a"])
+        self.assertEqual(stored["k"], ["x", False, {"a": 1}, "a"])
+
+    def test_conflict_plus_apply_does_not_commit(self) -> None:
+        current = state({"a": 1},
+                        {"k": record("x", False, {"a": 1}, "a"),
+                         "g": record("g0", False, {"a": 1}, "a")})
+        self.seed(current)
+        nxt = state({"a": 2, "b": 1},
+                    {"k": record("y", False, {"b": 1}, "b"),
+                     "g": record("g1", False, {"a": 2}, "a")})
+        before = ledger_raw(self.path)
+        result = self.apply_against(current, nxt, rid="cx")
+        self.assertEqual(result["status"], "conflict")
+        self.assertEqual(ledger_raw(self.path), before)
+
+    def test_stale_plus_apply_does_not_commit(self) -> None:
+        s1 = state({"a": 1},
+                   {"k": record("new", False, {"a": 1}, "a"),
+                    "g": record("g0", False, {"a": 1}, "a")})
+        replication.apply_remote(
+            self.path, request(rid="p1", base=state(), remote=s1)
+        )
+        current = state({"a": 2},
+                        {"k": record("new", False, {"a": 2}, "a"),
+                         "g": record("g0", False, {"a": 1}, "a")})
+        replication.apply_remote(
+            self.path, request(rid="p2", base=s1, remote=current)
+        )
+        nxt = state({"a": 3},
+                    {"k": record("old", False, {"a": 1}, "a"),
+                     "g": record("g1", False, {"a": 3}, "a")})
+        before = ledger_raw(self.path)
+        result = replication.apply_remote(
+            self.path, request(rid="sx", base=current, remote=nxt)
+        )
+        self.assertEqual(result["status"], "stale")
+        self.assertEqual(ledger_raw(self.path), before)
+
+    def test_missing_takes_precedence_over_conflict(self) -> None:
+        current = state({"a": 1}, {"k": record("x", False, {"a": 1}, "a")})
+        self.seed(current)
+        nxt = state({"a": 1, "b": 2},
+                    {"k": record("y", False, {"b": 1}, "b"),
+                     "g": record("g", False, {"b": 2}, "b")})
+        before = ledger_raw(self.path)
+        result = self.apply_against(current, nxt, rid="mx")
+        self.assertEqual(result["status"], "missing")
+        self.assertEqual(ledger_raw(self.path), before)
+
+    def test_empty_remote_records_is_duplicate_and_creates_nothing(self) -> None:
+        path = os.path.join(self.dir, "fresh.json")
+        result = replication.apply_remote(
+            path, request(rid="e0", base=state(), remote=state())
+        )
+        self.assertEqual(result["status"], "duplicate")
+        self.assertEqual(result["items"], [])
+        self.assertIsNone(result["receipt"])
+        self.assertFalse(os.path.exists(path))
+
+
+class ApplyRemoteMissingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+
+    def seed(self, seed_state):
+        replication.apply_remote(
+            self.path, request(rid="seed", base=state(), remote=seed_state)
+        )
+
+    def test_writer_component_decremented_by_one_is_prerequisite(self) -> None:
+        # Local outer clock a:2; record clock {a:3} written by a needs only
+        # a:2 first, which is present, so it applies.
+        current = state({"a": 2}, {"k": record("v2", False, {"a": 2}, "a")})
+        self.seed(current)
+        ready = state({"a": 3}, {"g": record("g", False, {"a": 3}, "a")})
+        result = replication.apply_remote(
+            self.path, request(rid="ok", base=current, remote=ready)
+        )
+        self.assertEqual(result["status"], "applied")
+
+    def test_missing_interval_single_node(self) -> None:
+        result = replication.apply_remote(
+            self.path,
+            request(remote=state({"a": 3}, {"k": record("v", False, {"a": 3}, "a")})),
+        )
+        self.assertEqual(result["status"], "missing")
+        item = result["items"][0]
+        self.assertEqual(item["decision"], "missing")
+        self.assertEqual(item["need"], {"a": [1, 2]})
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_missing_intervals_multiple_nodes_sorted(self) -> None:
+        current = state({"a": 2}, {"x": record("v", False, {"a": 2}, "a")})
+        self.seed(current)
+        remote = state(
+            {"a": 5, "b": 3},
+            {"y": record("w", False, {"a": 5, "b": 3}, "b")},
+        )
+        result = replication.apply_remote(
+            self.path, request(rid="m", base=current, remote=remote)
+        )
+        self.assertEqual(result["status"], "missing")
+        self.assertEqual(
+            result["items"][0]["need"], {"a": [3, 5], "b": [1, 2]}
+        )
+
+    def test_need_is_none_for_non_missing_items(self) -> None:
+        current = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        self.seed(current)
+        nxt = state({"a": 2}, {"k": record("w", False, {"a": 2}, "a")})
+        result = replication.apply_remote(
+            self.path, request(rid="n", base=current, remote=nxt)
+        )
+        self.assertIsNone(result["items"][0]["need"])
+
+
+class ApplyRemoteLedgerCorruptionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+        self.s1 = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        replication.apply_remote(self.path, request(remote=self.s1))
+        self.good = ledger_raw(self.path)
+
+    def corrupt(self, raw):
+        path = os.path.join(self.dir, "corrupt.json")
+        with open(path, "wb") as handle:
+            handle.write(raw)
+        return path
+
+    def reject(self, raw):
+        path = self.corrupt(raw)
+        with self.assertRaises(ValueError):
+            replication.apply_remote(
+                path, request(rid="x", base=self.s1, remote=self.s1)
+            )
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), raw)
+
+    def test_missing_trailing_newline(self) -> None:
+        self.reject(self.good[:-1])
+
+    def test_double_trailing_newline(self) -> None:
+        self.reject(self.good + b"\n")
+
+    def test_bad_version(self) -> None:
+        self.reject(self.good.replace(b'"version":1', b'"version":2'))
+
+    def test_wrong_top_level_key_set(self) -> None:
+        data = json.loads(self.good)
+        del data["requests"]
+        raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        self.reject(raw)
+
+    def test_invalid_state_is_value_error(self) -> None:
+        self.reject(self.good.replace(b'"clock":{"a":1}', b'"clock":{"a":2}'))
+
+    def test_state_type_fault_reports_as_value_error(self) -> None:
+        data = json.loads(self.good)
+        data["state"]["clock"]["a"] = True
+        raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        self.reject(raw)
+
+    def test_non_canonical_encoding(self) -> None:
+        self.reject(self.good.replace(b'{"audit"', b'{ "audit"', 1))
+
+    def test_bad_request_digest(self) -> None:
+        self.reject(self.good.replace(b'"requests":{"r1":"',
+                                      b'"requests":{"r1":"0', 1))
+
+    def test_request_without_audit_entry(self) -> None:
+        data = json.loads(self.good)
+        data["requests"]["extra"] = "f" * 64
+        raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        self.reject(raw)
+
+    def test_audit_entry_without_request_binding(self) -> None:
+        data = json.loads(self.good)
+        data["audit"][0]["id"] = "renamed"
+        raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        self.reject(raw)
+
+    def test_broken_audit_chain(self) -> None:
+        s2 = state({"a": 2}, {"k": record("w", False, {"a": 2}, "a")})
+        replication.apply_remote(
+            self.path, request(rid="r2", base=self.s1, remote=s2)
+        )
+        data = json.loads(ledger_raw(self.path))
+        data["audit"][1]["before"] = "f" * 64
+        raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        self.reject(raw)
+
+    def test_tail_after_must_hash_state(self) -> None:
+        self.reject(self.good.replace(b'"k":["v"', b'"k":["w"', 1))
+
+    def test_bad_seq(self) -> None:
+        data = json.loads(self.good)
+        data["audit"][0]["seq"] = 2
+        raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        self.reject(raw)
+
+    def test_requests_not_an_object(self) -> None:
+        data = json.loads(self.good)
+        data["requests"] = []
+        raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        self.reject(raw)
+
+    def test_empty_file_is_invalid(self) -> None:
+        self.reject(b"")
+
+    def test_garbage_is_invalid(self) -> None:
+        self.reject(b"not json\n")
+
+
+class ApplyRemoteValidationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+
+    def call(self, request_obj):
+        return replication.apply_remote(self.path, request_obj)
+
+    def test_path_must_be_str(self) -> None:
+        with self.assertRaises(TypeError):
+            replication.apply_remote(1, request())
+
+    def test_request_must_be_dict(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call([])
+        with self.assertRaises(TypeError):
+            self.call(None)
+
+    def test_request_key_set_must_match(self) -> None:
+        good = request()
+        with self.assertRaises(ValueError):
+            self.call({"id": "r", "source": "s", "base": state()})
+        extra = dict(good, extra=1)
+        with self.assertRaises(ValueError):
+            self.call(extra)
+
+    def test_id_must_be_nonempty_str(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(request(rid=1))
+        with self.assertRaises(TypeError):
+            self.call(request(rid=True))
+        with self.assertRaises(ValueError):
+            self.call(request(rid=""))
+
+    def test_source_must_be_nonempty_str(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(request(source=1))
+        with self.assertRaises(ValueError):
+            self.call(request(source=""))
+
+    def test_states_must_obey_merge_contract(self) -> None:
+        bad_clock = {"clock": {"a": -1}, "records": {}}
+        with self.assertRaises(ValueError):
+            self.call(request(base=bad_clock))
+        bool_clock = {"clock": {"a": True}, "records": {}}
+        with self.assertRaises(TypeError):
+            self.call(request(remote=bool_clock))
+        bad_record = state({"a": 1},
+                           {"k": record("v", True, {"a": 1}, "a")})
+        with self.assertRaises(ValueError):
+            self.call(request(remote=bad_record))
+
+    def test_input_validation_runs_before_filesystem(self) -> None:
+        with mock.patch("builtins.open") as patched:
+            with self.assertRaises(TypeError):
+                replication.apply_remote(1, request())
+            with self.assertRaises(ValueError):
+                self.call(request(rid=""))
+        patched.assert_not_called()
+
+
+class ApplyRemoteAtomicityTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+        self.s1 = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        replication.apply_remote(self.path, request(remote=self.s1))
+
+    def test_fsync_failure_keeps_missing_path_missing(self) -> None:
+        fresh = os.path.join(self.dir, "fresh.json")
+        with mock.patch("os.fsync", side_effect=OSError("disk gone")):
+            with self.assertRaises(OSError):
+                replication.apply_remote(
+                    fresh, request(remote=self.s1)
+                )
+        self.assertFalse(os.path.exists(fresh))
+        self.assertFalse(os.path.exists(fresh + ".tmp"))
+
+    def test_fsync_failure_preserves_existing_bytes(self) -> None:
+        before = ledger_raw(self.path)
+        nxt = state({"a": 2}, {"k": record("w", False, {"a": 2}, "a")})
+        with mock.patch("os.fsync", side_effect=OSError("disk gone")):
+            with self.assertRaises(OSError):
+                replication.apply_remote(
+                    self.path, request(rid="r2", base=self.s1, remote=nxt)
+                )
+        self.assertEqual(ledger_raw(self.path), before)
+        self.assertFalse(os.path.exists(self.path + ".tmp"))
+
+    def test_replace_failure_preserves_existing_bytes(self) -> None:
+        before = ledger_raw(self.path)
+        nxt = state({"a": 2}, {"k": record("w", False, {"a": 2}, "a")})
+        with mock.patch("os.replace", side_effect=OSError("rename failed")):
+            with self.assertRaises(OSError):
+                replication.apply_remote(
+                    self.path, request(rid="r3", base=self.s1, remote=nxt)
+                )
+        self.assertEqual(ledger_raw(self.path), before)
+        self.assertFalse(os.path.exists(self.path + ".tmp"))
