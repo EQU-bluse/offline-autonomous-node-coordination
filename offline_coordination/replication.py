@@ -187,6 +187,23 @@ bindings are unchanged, ``unresolved`` is empty and ``planDigest`` is the
 lowercase hex SHA-256 of the complete source plan bytes.  Resolution is
 deterministic, mirrors under a left/right swap with matching decisions,
 and never touches the filesystem or the inputs.
+
+:func:`commit_resolution` is the write entry point that lands a manual
+resolution in the ledger.  It takes the ledger path, the canonical
+resolution bytes, the original plan bytes, both proofs and the landing
+material -- the final ``state`` plus ``requests`` binding every accepted
+entry id to its request digest.  Both proofs are verified offline and
+the plan and resolution are checked against the freshly regenerated
+manual plan (:class:`StalePlanError` otherwise, without touching the
+ledger); the ledger itself must still sit at the resolution's common
+boundary (:class:`StaleLedgerError`, a :class:`ValueError`).  A fully
+identical replay is recognized before that staleness check and returns
+``duplicate``; a resolution accepting nothing returns ``unchanged`` and
+writes nothing.  Otherwise the final state, the request bindings and
+the contiguous accepted entries -- rejected entries never enter the
+audit -- are written in one fail-safe replacement, returning
+``applied``.  The result carries only ``next``, ``resolutionDigest``
+and ``status``.
 """
 
 from __future__ import annotations
@@ -2374,3 +2391,483 @@ def resolve_merge(plan: bytes, left: bytes, right: bytes, decisions: list) -> by
         "version": RESOLVE_VERSION,
     }
     return _proof_compact(result) + b"\n"
+
+
+# --- Landing a manual merge resolution in the ledger -------------------------
+
+RESOLUTION_DIGEST = "resolutionDigest"
+STATUS_UNCHANGED = "unchanged"
+
+_PLAN_DIGEST = "planDigest"
+_RESOLUTION_TOP_KEYS = frozenset((
+    "common",
+    "left",
+    _PLAN_DIGEST,
+    "relation",
+    "right",
+    "steps",
+    "unresolved",
+    VERSION,
+))
+_RESOLUTION_ACCEPT_REASONS = (
+    REASON_EXTENSION,
+    REASON_SELECTED,
+    REASON_MANUAL_ACCEPTED,
+)
+_RESOLUTION_REJECT_REASONS = (REASON_REJECTED, REASON_MANUAL_REJECTED)
+_MATERIAL_KEYS = frozenset((STATE_KEY, REQUESTS))
+
+
+class StaleLedgerError(ValueError):
+    """The ledger tip no longer matches the resolution's common boundary."""
+
+
+def _resolution_invalid(message: str) -> InvalidResolutionError:
+    return InvalidResolutionError(f"invalid merge resolution: {message}")
+
+
+def _reject_duplicate_resolution_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate resolution keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _resolution_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _validated_resolution_entry(entry: object, where: str) -> None:
+    """Structural check of one resolution step's carried audit entry."""
+    if not isinstance(entry, dict):
+        raise _resolution_invalid(f"{where} entry must be a JSON object")
+    keys = set(entry.keys())
+    if keys != _LEDGER_ENTRY_KEY_SET and keys != _LEDGER_ENTRY_AUTHED_SET:
+        raise _resolution_invalid(
+            f"{where} entry must contain exactly the keys 'after', 'before', "
+            "'id', 'seq' and 'source' with optional 'auth'"
+        )
+    if not _is_digest(entry[BEFORE]):
+        raise _resolution_invalid(
+            f"{where} entry before must be 64 lowercase hex chars"
+        )
+    if not _is_digest(entry[AFTER]):
+        raise _resolution_invalid(
+            f"{where} entry after must be 64 lowercase hex chars"
+        )
+    if not isinstance(entry[ID], str) or entry[ID] == "":
+        raise _resolution_invalid(f"{where} entry id must be a non-empty str")
+    if not isinstance(entry[SOURCE], str) or entry[SOURCE] == "":
+        raise _resolution_invalid(f"{where} entry source must be a non-empty str")
+    if isinstance(entry["seq"], bool) or not isinstance(entry["seq"], int):
+        raise _resolution_invalid(f"{where} entry seq must be an int")
+    if AUTH in entry:
+        auth = entry[AUTH]
+        if not isinstance(auth, dict) or set(auth.keys()) != _LEDGER_AUTH_KEYS:
+            raise _resolution_invalid(
+                f"{where} entry auth must contain exactly the keys "
+                "'keyVersion' and 'node'"
+            )
+        if not isinstance(auth[NODE], str) or auth[NODE] == "":
+            raise _resolution_invalid(
+                f"{where} entry auth node must be a non-empty str"
+            )
+        if (
+            isinstance(auth[KEY_VERSION], bool)
+            or not isinstance(auth[KEY_VERSION], int)
+            or auth[KEY_VERSION] <= 0
+        ):
+            raise _resolution_invalid(
+                f"{where} entry auth keyVersion must be a positive non-bool int"
+            )
+
+
+def _parse_resolution(raw: bytes) -> dict:
+    """Validate resolution bytes against the version-1 resolution contract.
+
+    Only the structural contract is enforced here: canonical encoding,
+    unique keys, the fixed key sets, the integer version 1 and the value
+    domains of every field.  Whether the resolution binds the manual plan
+    for the given proofs is decided separately by
+    :func:`commit_resolution`.
+    """
+    if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+        raise _resolution_invalid("must be a single JSON object ending in one LF")
+    try:
+        text = raw[:-1].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _resolution_invalid("is not valid UTF-8") from exc
+    try:
+        # The pairs hook raises directly on duplicate object keys, so a
+        # ValueError raised here means that contract fault, not bad JSON.
+        data = json.loads(text, object_pairs_hook=_reject_duplicate_resolution_keys)
+    except json.JSONDecodeError as exc:
+        raise _resolution_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise _resolution_invalid("must be a JSON object")
+    if set(data.keys()) != _RESOLUTION_TOP_KEYS:
+        raise _resolution_invalid(
+            "top-level object must contain exactly the keys 'common', "
+            "'left', 'planDigest', 'relation', 'right', 'steps', "
+            "'unresolved' and 'version'"
+        )
+    version = data[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise _resolution_invalid("version must be an int")
+    if version != RESOLVE_VERSION:
+        raise _resolution_invalid("version must be the integer 1")
+
+    if not _is_digest(data[_PLAN_DIGEST]):
+        raise _resolution_invalid("planDigest must be 64 lowercase hex characters")
+    relation = data["relation"]
+    if not isinstance(relation, str) or relation not in _PLAN_RELATIONS:
+        raise _resolution_invalid("relation must be a known proof relation")
+
+    common = data["common"]
+    if not isinstance(common, dict) or set(common.keys()) != _PLAN_COMMON_KEYS:
+        raise _resolution_invalid(
+            "common must contain exactly the keys 'after' and 'seq'"
+        )
+    if not _is_digest(common[COMMON_AFTER]):
+        raise _resolution_invalid("common after must be 64 lowercase hex characters")
+    if isinstance(common[COMMON_SEQ], bool) or not isinstance(common[COMMON_SEQ], int):
+        raise _resolution_invalid("common seq must be an int")
+
+    for side_key in (_SIDE_LEFT, _SIDE_RIGHT):
+        side = data[side_key]
+        if not isinstance(side, dict) or set(side.keys()) != _PLAN_SIDE_KEYS:
+            raise _resolution_invalid(
+                f"{side_key} must contain exactly the keys 'digest', "
+                "'endSeq' and 'startSeq'"
+            )
+        if not _is_digest(side[PROOF_DIGEST]):
+            raise _resolution_invalid(
+                f"{side_key} digest must be 64 lowercase hex characters"
+            )
+        for seq_key in (PROOF_START_SEQ, PROOF_END_SEQ):
+            if isinstance(side[seq_key], bool) or not isinstance(side[seq_key], int):
+                raise _resolution_invalid(f"{side_key} {seq_key} must be an int")
+
+    unresolved = data["unresolved"]
+    if not isinstance(unresolved, list):
+        raise _resolution_invalid("unresolved must be an array")
+    if unresolved:
+        raise _resolution_invalid("unresolved must be empty in a final resolution")
+
+    steps = data["steps"]
+    if not isinstance(steps, list):
+        raise _resolution_invalid("steps must be an array")
+    for position, step in enumerate(steps):
+        where = f"step {position}"
+        if not isinstance(step, dict) or set(step.keys()) != _PLAN_STEP_KEYS:
+            raise _resolution_invalid(
+                f"{where} must contain exactly the keys 'action', 'entry', "
+                "'reason' and 'side'"
+            )
+        if step["side"] not in _PLAN_SIDES:
+            raise _resolution_invalid(f"{where} side must be 'left' or 'right'")
+        action = step["action"]
+        reason = step["reason"]
+        if action == RESOLVE_ACTION_ACCEPT:
+            if reason not in _RESOLUTION_ACCEPT_REASONS:
+                raise _resolution_invalid(
+                    f"{where} reason is not a valid accept reason"
+                )
+        elif action == RESOLVE_ACTION_REJECT:
+            if reason not in _RESOLUTION_REJECT_REASONS:
+                raise _resolution_invalid(
+                    f"{where} reason is not a valid reject reason"
+                )
+        else:
+            raise _resolution_invalid(
+                f"{where} action must be 'accept' or 'reject'"
+            )
+        _validated_resolution_entry(step["entry"], where)
+
+    # The bytes must be the single canonical compact form with sorted keys
+    # and exactly one trailing newline.
+    if _proof_compact(data) + b"\n" != raw:
+        raise _resolution_invalid("encoding is not the canonical compact form")
+    return data
+
+
+def _validated_commit_material(material: object) -> tuple[dict, dict[str, str]]:
+    """Validate the landing material into (final state, request bindings).
+
+    Type faults raise :class:`TypeError`; a bad key set, a malformed
+    request digest or an invalid state value raises :class:`ValueError`.
+    The state comes back as a fresh copy obeying the merge state contract.
+    """
+    if not isinstance(material, dict):
+        raise TypeError("material must be a dict")
+    if set(material.keys()) != _MATERIAL_KEYS:
+        raise ValueError(
+            "material must contain exactly the keys 'state' and 'requests'"
+        )
+    clock, records = merge._validated_state(material[STATE_KEY])
+    state = {merge.CLOCK: clock, merge.RECORDS: records}
+
+    raw_requests = material[REQUESTS]
+    if not isinstance(raw_requests, dict):
+        raise TypeError("material requests must be a dict")
+    requests: dict[str, str] = {}
+    for bound_id, bound_digest in raw_requests.items():
+        if not isinstance(bound_id, str):
+            raise TypeError("material requests keys must be str")
+        if bound_id == "":
+            raise ValueError("material requests keys must be non-empty")
+        if not isinstance(bound_digest, str):
+            raise TypeError("material requests values must be str")
+        if not _is_digest(bound_digest):
+            raise ValueError(
+                "material requests values must be 64 lowercase hex characters"
+            )
+        requests[bound_id] = bound_digest
+    return state, requests
+
+
+def _assert_resolution_binds_plan(
+    parsed_resolution: dict, parsed_plan: dict, plan: bytes
+) -> None:
+    """Require the resolution to bind the manual plan byte-for-byte.
+
+    The ``planDigest`` must hash the complete plan bytes, the boundary,
+    relation and side summaries must equal the plan's, and every step
+    must carry the plan step's entry and side -- relabelled
+    ``accept``/``reject`` with the fixed manual reasons for a manual plan
+    step, identical to the plan step otherwise.  Any deviation raises
+    :class:`StalePlanError`.
+    """
+    if parsed_resolution[_PLAN_DIGEST] != hashlib.sha256(plan).hexdigest():
+        raise StalePlanError("resolution planDigest does not match the plan")
+    for key in ("common", "left", "relation", "right"):
+        if parsed_resolution[key] != parsed_plan[key]:
+            raise StalePlanError(
+                f"resolution {key} does not match the manual plan"
+            )
+    plan_steps = parsed_plan["steps"]
+    resolution_steps = parsed_resolution["steps"]
+    if len(resolution_steps) != len(plan_steps):
+        raise StalePlanError("resolution steps do not match the manual plan")
+    for resolution_step, plan_step in zip(resolution_steps, plan_steps):
+        if (
+            resolution_step["side"] != plan_step["side"]
+            or resolution_step["entry"] != plan_step["entry"]
+        ):
+            raise StalePlanError("resolution steps do not match the manual plan")
+        if plan_step["action"] == ACTION_MANUAL:
+            if (resolution_step["action"], resolution_step["reason"]) not in (
+                (RESOLVE_ACTION_ACCEPT, REASON_MANUAL_ACCEPTED),
+                (RESOLVE_ACTION_REJECT, REASON_MANUAL_REJECTED),
+            ):
+                raise StalePlanError(
+                    "resolution steps do not match the manual plan"
+                )
+        elif (
+            resolution_step["action"] != plan_step["action"]
+            or resolution_step["reason"] != plan_step["reason"]
+        ):
+            raise StalePlanError("resolution steps do not match the manual plan")
+
+
+def _commit_result(next_seq: int, resolution_digest: str, status: str) -> dict:
+    """The commit_resolution result, keys in lexicographic order."""
+    return {NEXT: next_seq, RESOLUTION_DIGEST: resolution_digest, STATUS: status}
+
+
+def commit_resolution(
+    path: str,
+    resolution: bytes,
+    plan: bytes,
+    left: bytes,
+    right: bytes,
+    material: dict,
+) -> dict:
+    """Land one manual merge resolution in the ledger at ``path``.
+
+    ``resolution`` must be the canonical bytes produced by
+    :func:`resolve_merge` for the manual ``plan`` of exactly the ``left``
+    and ``right`` proofs.  ``material`` must be a dict with exactly the
+    keys ``state`` -- the final state, obeying the
+    :mod:`~offline_coordination.merge` contract -- and ``requests``,
+    binding every accepted entry id to its 64-character lowercase hex
+    request digest.
+
+    Every input is validated before the ledger is touched: a non-str
+    ``path``, non-bytes canonical arguments or ill-typed material fields
+    raise :class:`TypeError`; material structure, digest or state value
+    faults raise :class:`ValueError`; both proofs are independently
+    verified against the exact :func:`verify_proof` contract
+    (:class:`InvalidProofError`); the plan structure is checked
+    (:class:`InvalidPlanError`) and so is the resolution structure
+    (:class:`InvalidResolutionError`).  The plan must be byte-for-byte
+    the manual plan regenerated from the proofs and the resolution must
+    bind that plan -- ``planDigest``, boundary, relation, side summaries
+    and steps -- otherwise :class:`StalePlanError` is raised without
+    reading or writing the ledger.  The accepted entries must chain
+    contiguously from the common boundary
+    (:class:`InvalidResolutionError`), the material ``requests`` must
+    bind exactly the accepted ids and the final state must hash to the
+    last accepted entry's ``after`` (:class:`ValueError`).
+
+    A missing ledger raises :class:`FileNotFoundError` and a corrupt one
+    :class:`ValueError`.  Replaying a fully identical resolution -- every
+    accepted entry already sits at its resolution position with the same
+    request binding -- is recognized before the staleness check and
+    returns ``duplicate`` without touching the ledger.  Otherwise the
+    ledger tip's seq and state digest must equal the resolution's common
+    boundary: a ledger that moved on, holds only some of the accepted
+    entries, binds a conflicting digest or carries a changed ``auth``
+    binding raises :class:`StaleLedgerError` (a :class:`ValueError`) and
+    nothing is written.  A resolution with no accepted entries returns
+    ``unchanged`` with the ledger bytes untouched (its ``requests`` must
+    be empty).  Otherwise the final state, the request bindings and the
+    contiguous accepted entries -- rejected entries never enter the
+    audit, carried entries and ``auth`` bindings stay unchanged -- are
+    written in one fail-safe replacement and the status is ``applied``;
+    an :class:`OSError` at any write, flush, file-sync, replace or
+    directory-sync step propagates unchanged with the pre-call bytes
+    restored.
+
+    The result is a fresh dict with the keys ``next`` (the last accepted
+    seq, or the common boundary seq when nothing is applied),
+    ``resolutionDigest`` (the lowercase hex SHA-256 of the complete
+    resolution bytes) and ``status``, in lexicographic key order.
+    """
+    # Type faults precede every other check: all argument types and the
+    # material are validated before any proof, plan or resolution bytes
+    # are parsed, so a malformed input never masks a TypeError.
+    if not isinstance(path, str):
+        raise TypeError("path must be a str")
+    if not isinstance(resolution, bytes):
+        raise TypeError("resolution must be bytes")
+    if not isinstance(plan, bytes):
+        raise TypeError("plan must be bytes")
+    if not isinstance(left, bytes):
+        raise TypeError("left proof must be bytes")
+    if not isinstance(right, bytes):
+        raise TypeError("right proof must be bytes")
+    final_state, material_requests = _validated_commit_material(material)
+
+    # Offline verification: both proofs independently, then the plan and
+    # resolution structures -- all before the ledger is ever touched.
+    _parse_proof(left)
+    _parse_proof(right)
+    parsed_plan = _parse_plan(plan)
+    parsed_resolution = _parse_resolution(resolution)
+
+    # The plan must be byte-for-byte the manual plan freshly regenerated
+    # for these very proofs, and the resolution must bind that plan.  A
+    # plan that no longer regenerates at all is equally stale.  None of
+    # this reads or writes the ledger.
+    try:
+        expected_plan = plan_merge(left, right, POLICY_MANUAL)
+    except ValueError as exc:
+        raise StalePlanError(
+            "plan does not match a manual plan for these proofs"
+        ) from exc
+    if plan != expected_plan:
+        raise StalePlanError(
+            "plan does not match the manual plan regenerated from these proofs"
+        )
+    _assert_resolution_binds_plan(parsed_resolution, parsed_plan, plan)
+
+    # Only the contiguous accept items are committed; rejected entries
+    # never enter the audit.  The accepted entries must chain
+    # contiguously from the common boundary, one unbroken seq and
+    # before/after digest chain with distinct request ids.
+    common = parsed_resolution["common"]
+    accepted = [
+        step["entry"]
+        for step in parsed_resolution["steps"]
+        if step["action"] == RESOLVE_ACTION_ACCEPT
+    ]
+    expected_seq = common[COMMON_SEQ] + 1
+    expected_before = common[COMMON_AFTER]
+    accepted_ids: set[str] = set()
+    for entry in accepted:
+        if entry["seq"] != expected_seq or entry[BEFORE] != expected_before:
+            raise InvalidResolutionError(
+                "accepted entries do not chain contiguously from the "
+                "common boundary"
+            )
+        if entry[ID] in accepted_ids:
+            raise InvalidResolutionError("accepted entries repeat a request id")
+        accepted_ids.add(entry[ID])
+        expected_seq += 1
+        expected_before = entry[AFTER]
+
+    # The material must match the resolution: one request binding per
+    # accepted id (none at all when nothing is accepted) and a final
+    # state hashing to the last accepted entry's after -- the common
+    # boundary itself when no entry is accepted.
+    if set(material_requests) != accepted_ids:
+        raise ValueError(
+            "material requests must bind exactly the accepted entry ids"
+        )
+    expected_after = accepted[-1][AFTER] if accepted else common[COMMON_AFTER]
+    if _digest(_state_bytes(final_state)) != expected_after:
+        raise ValueError(
+            "material state does not hash to the last accepted entry's after"
+        )
+
+    # Only now is the ledger read: a missing ledger propagates
+    # FileNotFoundError, a corrupt one ValueError, and any other read
+    # failure propagates as OSError.
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    stored_state, stored_requests, stored_entries = _parse_ledger(raw)
+
+    resolution_digest = hashlib.sha256(resolution).hexdigest()
+    common_seq = common[COMMON_SEQ]
+
+    # A fully identical replay is recognized before the staleness check:
+    # every accepted entry already sits at its resolution position with
+    # the same request binding, so the verdict comes from the saved
+    # artifacts alone and the ledger is never modified.
+    if accepted:
+        final_seq = accepted[-1]["seq"]
+        if (
+            len(stored_entries) >= final_seq
+            and stored_entries[common_seq:final_seq] == accepted
+            and all(
+                stored_requests.get(entry[ID]) == material_requests[entry[ID]]
+                for entry in accepted
+            )
+        ):
+            return _commit_result(final_seq, resolution_digest, STATUS_DUPLICATE)
+
+    # The ledger tip must still be the resolution's common boundary: a
+    # ledger that moved on, holds only some of the accepted entries or
+    # carries them with conflicting digests or changed auth bindings is
+    # stale, and nothing is written.
+    last_seq = stored_entries[-1]["seq"] if stored_entries else 0
+    if (
+        last_seq != common_seq
+        or _digest(_state_bytes(stored_state)) != common[COMMON_AFTER]
+    ):
+        raise StaleLedgerError(
+            "ledger tip does not match the resolution's common boundary"
+        )
+
+    # Nothing to commit: the resolution accepts no entries, so the
+    # ledger bytes stay untouched.
+    if not accepted:
+        return _commit_result(common_seq, resolution_digest, STATUS_UNCHANGED)
+
+    # An accepted id already bound before the boundary can never be
+    # committed again without corrupting the ledger's id uniqueness.
+    for entry in accepted:
+        if entry[ID] in stored_requests:
+            raise StaleLedgerError(
+                f"accepted id {entry[ID]!r} is already bound in the ledger"
+            )
+
+    # One fail-safe replacement writes the final state, the request
+    # bindings and the accepted entries; an OSError at any step
+    # propagates unchanged with the pre-call bytes restored.
+    new_entries = stored_entries + accepted
+    new_requests = dict(stored_requests)
+    new_requests.update(material_requests)
+    _atomic_write(path, _serialize_ledger(final_state, new_requests, new_entries))
+    return _commit_result(accepted[-1]["seq"], resolution_digest, STATUS_APPLIED)
