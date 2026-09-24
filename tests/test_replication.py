@@ -1568,3 +1568,521 @@ class ApplyRemoteNoWritesOnRejectionTest(unittest.TestCase):
         applied = replication.apply_remote(self.path, request(remote=s1))
         self.assertEqual(applied["status"], "applied")
         self.assertEqual(self.artifacts(), [os.path.basename(self.path)])
+
+
+# ---------------------------------------------------------------------------
+# apply_signed_remote: authenticated remote-state application
+# ---------------------------------------------------------------------------
+
+import hashlib  # noqa: E402
+import hmac  # noqa: E402
+
+from offline_coordination.replication import AuthenticationError  # noqa: E402
+
+SECRET_A = "a" * 64
+SECRET_B = "b" * 64
+NOW = 50
+
+
+def sign(secret, node, key_version, request_obj):
+    payload = json.dumps(
+        {"keyVersion": key_version, "node": node, "request": request_obj},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hmac.new(
+        bytes.fromhex(secret), payload, hashlib.sha256
+    ).hexdigest()
+
+
+def key_entry(version=1, secret=SECRET_A, not_before=0, not_after=100,
+              revoked=False):
+    return {
+        "version": version,
+        "secret": secret,
+        "notBefore": not_before,
+        "notAfter": not_after,
+        "revoked": revoked,
+    }
+
+
+def keyring(*entries, node="node-a"):
+    return {node: list(entries)}
+
+
+def signed_envelope(request_obj, node="node-a", key_version=1,
+                    secret=SECRET_A):
+    return {
+        "node": node,
+        "keyVersion": key_version,
+        "request": request_obj,
+        "signature": sign(secret, node, key_version, request_obj),
+    }
+
+
+class ApplySignedRemoteBasicTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+        self.remote = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        self.req = request(source="node-a", remote=self.remote)
+
+    def apply(self, req=None, ring=None, **envelope_overrides):
+        env = signed_envelope(req if req is not None else self.req)
+        env.update(envelope_overrides)
+        return replication.apply_signed_remote(
+            self.path, ring if ring is not None else keyring(key_entry()), env,
+            NOW,
+        )
+
+    def test_applies_and_records_auth_on_audit_entry(self) -> None:
+        result = self.apply()
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(tuple(result.keys()), APPLY_RESULT_KEYS)
+        self.assertIsNotNone(result["receipt"])
+        ledger = read_ledger(self.path)
+        self.assertEqual(ledger["audit"][0]["auth"],
+                         {"keyVersion": 1, "node": "node-a"})
+        self.assertEqual(
+            tuple(ledger["audit"][0].keys()),
+            ("after", "auth", "before", "id", "seq", "source"),
+        )
+        self.assertEqual(ledger["state"]["records"]["k"],
+                         ["v", False, {"a": 1}, "a"])
+
+    def test_ledger_stays_canonical_with_auth_entries(self) -> None:
+        self.apply()
+        raw = ledger_raw(self.path)
+        decoded = json.loads(raw)
+        self.assertEqual(
+            raw,
+            json.dumps(decoded, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")).encode("utf-8") + b"\n",
+        )
+
+    def test_unicode_request_signs_and_applies(self) -> None:
+        remote = state({"a": 1}, {"k": record("雪 ☃", False, {"a": 1}, "a")})
+        result = self.apply(req=request(source="node-a", remote=remote))
+        self.assertEqual(result["status"], "applied")
+        self.assertIn("雪 ☃".encode("utf-8"), ledger_raw(self.path))
+
+    def test_validity_bounds_are_inclusive(self) -> None:
+        ring = keyring(key_entry(not_before=10, not_after=20))
+        for moment in (10, 20):
+            path = os.path.join(self.dir, f"m{moment}.json")
+            env = signed_envelope(request(source="node-a", remote=self.remote))
+            result = replication.apply_signed_remote(path, ring, env, moment)
+            self.assertEqual(result["status"], "applied")
+
+    def test_exact_key_version_selected_without_fallback(self) -> None:
+        ring = keyring(key_entry(version=1, secret=SECRET_A),
+                       key_entry(version=2, secret=SECRET_B))
+        env = signed_envelope(self.req, key_version=2, secret=SECRET_B)
+        result = replication.apply_signed_remote(self.path, ring, env, NOW)
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(read_ledger(self.path)["audit"][0]["auth"],
+                         {"keyVersion": 2, "node": "node-a"})
+
+    def test_replay_with_still_valid_key_is_duplicate(self) -> None:
+        self.apply()
+        before = ledger_raw(self.path)
+        again = self.apply()
+        self.assertEqual(again["status"], "duplicate")
+        self.assertIsNone(again["receipt"])
+        self.assertEqual(ledger_raw(self.path), before)
+
+
+class ApplySignedRemoteAuthTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+        self.remote = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        self.req = request(source="node-a", remote=self.remote)
+        self.ring = keyring(key_entry(not_before=10, not_after=90))
+
+    def apply(self, ring=None, env=None, moment=NOW):
+        return replication.apply_signed_remote(
+            self.path,
+            ring if ring is not None else self.ring,
+            env if env is not None else signed_envelope(self.req),
+            moment,
+        )
+
+    def test_authentication_error_is_a_value_error(self) -> None:
+        self.assertTrue(issubclass(AuthenticationError, ValueError))
+        with self.assertRaises(ValueError):
+            self.apply(env=signed_envelope(self.req, node="ghost"))
+
+    def test_unknown_node_rejected(self) -> None:
+        with self.assertRaises(AuthenticationError):
+            self.apply(env=signed_envelope(self.req, node="ghost"))
+
+    def test_unknown_key_version_rejected(self) -> None:
+        env = signed_envelope(self.req, key_version=2)
+        with self.assertRaises(AuthenticationError):
+            self.apply(env=env)
+
+    def test_revoked_key_rejected(self) -> None:
+        ring = keyring(key_entry(not_before=10, not_after=90, revoked=True))
+        with self.assertRaises(AuthenticationError):
+            self.apply(ring=ring)
+
+    def test_not_yet_valid_key_rejected(self) -> None:
+        with self.assertRaises(AuthenticationError):
+            self.apply(moment=9)
+
+    def test_expired_key_rejected(self) -> None:
+        with self.assertRaises(AuthenticationError):
+            self.apply(moment=91)
+
+    def test_source_node_mismatch_rejected(self) -> None:
+        req = request(source="node-b", remote=self.remote)
+        env = signed_envelope(req)  # envelope node stays node-a
+        with self.assertRaises(AuthenticationError):
+            self.apply(env=env)
+
+    def test_signature_mismatch_rejected(self) -> None:
+        env = signed_envelope(self.req, secret=SECRET_B)
+        with self.assertRaises(AuthenticationError):
+            self.apply(env=env)
+
+    def test_tampered_request_rejected(self) -> None:
+        env = signed_envelope(self.req)
+        env["request"] = request(rid="other", source="node-a",
+                                 remote=self.remote)
+        with self.assertRaises(AuthenticationError):
+            self.apply(env=env)
+
+    def test_wrong_version_secret_combination_rejected(self) -> None:
+        # Signing with version 2's secret while claiming version 1 must not
+        # fall back to any other key.
+        ring = keyring(key_entry(version=1, secret=SECRET_A, not_before=10,
+                                 not_after=90),
+                       key_entry(version=2, secret=SECRET_B, not_before=10,
+                                 not_after=90))
+        env = signed_envelope(self.req, key_version=1, secret=SECRET_B)
+        with self.assertRaises(AuthenticationError):
+            self.apply(ring=ring, env=env)
+
+    def test_auth_failure_creates_no_file(self) -> None:
+        with self.assertRaises(AuthenticationError):
+            self.apply(env=signed_envelope(self.req, node="ghost"))
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_verification_precedes_ledger_read(self) -> None:
+        # A corrupt ledger is a ValueError, but the authentication failure
+        # must win: verification happens before any ledger read.
+        with open(self.path, "wb") as handle:
+            handle.write(b"not json\n")
+        with self.assertRaises(AuthenticationError):
+            self.apply(env=signed_envelope(self.req, node="ghost"))
+        self.assertEqual(ledger_raw(self.path), b"not json\n")
+
+    def test_auth_failure_performs_no_filesystem_reads(self) -> None:
+        with mock.patch("builtins.open") as patched:
+            with self.assertRaises(AuthenticationError):
+                self.apply(env=signed_envelope(self.req, node="ghost"))
+        patched.assert_not_called()
+
+    def test_replay_rejected_after_revocation(self) -> None:
+        self.apply()
+        revoked_ring = keyring(
+            key_entry(not_before=10, not_after=90, revoked=True)
+        )
+        with self.assertRaises(AuthenticationError):
+            self.apply(ring=revoked_ring)
+
+    def test_replay_rejected_after_expiry(self) -> None:
+        self.apply()
+        with self.assertRaises(AuthenticationError):
+            self.apply(moment=91)
+
+    def test_replay_accepted_with_rotated_keyring(self) -> None:
+        # Rotation that keeps the used credential valid does not break the
+        # historical binding.
+        self.apply()
+        rotated = keyring(key_entry(not_before=10, not_after=90),
+                          key_entry(version=2, secret=SECRET_B))
+        again = self.apply(ring=rotated)
+        self.assertEqual(again["status"], "duplicate")
+
+
+class ApplySignedRemoteValidationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+        self.remote = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        self.req = request(source="node-a", remote=self.remote)
+        self.env = signed_envelope(self.req)
+        self.ring = keyring(key_entry())
+
+    def call(self, path=None, ring=None, env=None, moment=NOW):
+        return replication.apply_signed_remote(
+            path if path is not None else self.path,
+            ring if ring is not None else self.ring,
+            env if env is not None else self.env,
+            moment,
+        )
+
+    def test_path_must_be_str(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(path=1)
+
+    def test_moment_must_be_non_negative_int(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(moment=True)
+        with self.assertRaises(TypeError):
+            self.call(moment=1.0)
+        with self.assertRaises(TypeError):
+            self.call(moment="50")
+        with self.assertRaises(ValueError):
+            self.call(moment=-1)
+
+    def test_keyring_must_be_dict_with_str_nodes(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(ring=[])
+        with self.assertRaises(TypeError):
+            self.call(ring={1: [key_entry()]})
+        with self.assertRaises(ValueError):
+            self.call(ring={"": [key_entry()]})
+
+    def test_keyring_entries_must_be_list_of_dicts(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(ring={"node-a": {}})
+        with self.assertRaises(TypeError):
+            self.call(ring={"node-a": ["x"]})
+
+    def test_keyring_entry_key_set(self) -> None:
+        entry = key_entry()
+        del entry["revoked"]
+        with self.assertRaises(ValueError):
+            self.call(ring=keyring(entry))
+        extra = dict(key_entry(), extra=1)
+        with self.assertRaises(ValueError):
+            self.call(ring=keyring(extra))
+
+    def test_keyring_version_rules(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(ring=keyring(key_entry(version=True)))
+        with self.assertRaises(TypeError):
+            self.call(ring=keyring(key_entry(version=1.0)))
+        with self.assertRaises(ValueError):
+            self.call(ring=keyring(key_entry(version=0)))
+        with self.assertRaises(ValueError):
+            self.call(ring=keyring(key_entry(version=-2)))
+        with self.assertRaises(ValueError):
+            self.call(ring=keyring(key_entry(version=1),
+                                   key_entry(version=1,
+                                             secret=SECRET_B)))
+
+    def test_keyring_secret_format(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(ring=keyring(key_entry(secret=1)))
+        with self.assertRaises(ValueError):
+            self.call(ring=keyring(key_entry(secret="A" * 64)))
+        with self.assertRaises(ValueError):
+            self.call(ring=keyring(key_entry(secret="a" * 63)))
+        with self.assertRaises(ValueError):
+            self.call(ring=keyring(key_entry(secret="g" * 64)))
+
+    def test_keyring_validity_period_rules(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(ring=keyring(key_entry(not_before=True)))
+        with self.assertRaises(TypeError):
+            self.call(ring=keyring(key_entry(not_after="9")))
+        with self.assertRaises(ValueError):
+            self.call(ring=keyring(key_entry(not_before=-1)))
+        with self.assertRaises(ValueError):
+            self.call(ring=keyring(key_entry(not_before=10, not_after=9)))
+
+    def test_keyring_revoked_must_be_bool(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(ring=keyring(key_entry(revoked=0)))
+
+    def test_envelope_must_be_dict_with_exact_keys(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(env=[])
+        env = signed_envelope(self.req)
+        del env["signature"]
+        with self.assertRaises(ValueError):
+            self.call(env=env)
+        with self.assertRaises(ValueError):
+            self.call(env=dict(signed_envelope(self.req), extra=1))
+
+    def test_envelope_node_rules(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(env=dict(self.env, node=1))
+        with self.assertRaises(ValueError):
+            self.call(env=dict(self.env, node=""))
+
+    def test_envelope_key_version_rules(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(env=dict(self.env, keyVersion=True))
+        with self.assertRaises(TypeError):
+            self.call(env=dict(self.env, keyVersion="1"))
+        with self.assertRaises(ValueError):
+            self.call(env=dict(self.env, keyVersion=0))
+
+    def test_envelope_signature_format(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(env=dict(self.env, signature=1))
+        with self.assertRaises(ValueError):
+            self.call(env=dict(self.env, signature="F" * 64))
+        with self.assertRaises(ValueError):
+            self.call(env=dict(self.env, signature="f" * 63))
+
+    def test_request_contract_is_enforced(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(env=dict(self.env, request=[]))
+        bad = dict(self.env)
+        bad["request"] = {"id": "r", "source": "node-a", "base": state()}
+        with self.assertRaises(ValueError):
+            self.call(env=bad)
+
+    def test_validation_creates_no_files(self) -> None:
+        with self.assertRaises(TypeError):
+            self.call(ring=[])
+        with self.assertRaises(ValueError):
+            self.call(env=dict(self.env, keyVersion=0))
+        with self.assertRaises(ValueError):
+            self.call(moment=-1)
+        self.assertEqual(os.listdir(self.dir), [])
+
+
+class ApplySignedRemoteLedgerCompatTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+        self.s1 = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        self.s2 = state({"a": 2}, {"k": record("w", False, {"a": 2}, "a")})
+        self.ring = keyring(key_entry())
+
+    def signed(self, req, **overrides):
+        env = signed_envelope(req)
+        env.update(overrides)
+        return env
+
+    def test_unsigned_then_signed_commit(self) -> None:
+        replication.apply_remote(
+            self.path, request(rid="r1", source="node-a", remote=self.s1)
+        )
+        result = replication.apply_signed_remote(
+            self.path, self.ring,
+            self.signed(request(rid="r2", source="node-a", base=self.s1,
+                                remote=self.s2)),
+            NOW,
+        )
+        self.assertEqual(result["status"], "applied")
+        entries = read_ledger(self.path)["audit"]
+        self.assertNotIn("auth", entries[0])
+        self.assertEqual(entries[1]["auth"],
+                         {"keyVersion": 1, "node": "node-a"})
+        self.assertEqual(entries[1]["before"], entries[0]["after"])
+
+    def test_signed_then_unsigned_commit_and_replay(self) -> None:
+        req = request(rid="r1", source="node-a", remote=self.s1)
+        replication.apply_signed_remote(
+            self.path, self.ring, self.signed(req), NOW
+        )
+        # The unsigned entry point reads the auth-carrying ledger fine and
+        # serves the replay from the saved binding.
+        again = replication.apply_remote(self.path, req)
+        self.assertEqual(again["status"], "duplicate")
+        result = replication.apply_remote(
+            self.path, request(rid="r2", source="node-a", base=self.s1,
+                               remote=self.s2)
+        )
+        self.assertEqual(result["status"], "applied")
+        entries = read_ledger(self.path)["audit"]
+        self.assertEqual(entries[0]["auth"],
+                         {"keyVersion": 1, "node": "node-a"})
+        self.assertNotIn("auth", entries[1])
+
+    def test_corrupt_auth_entry_rejected(self) -> None:
+        replication.apply_signed_remote(
+            self.path, self.ring,
+            self.signed(request(rid="r1", source="node-a", remote=self.s1)),
+            NOW,
+        )
+        good = ledger_raw(self.path)
+        variants = []
+        data = json.loads(good)
+        data["audit"][0]["auth"] = {"node": "node-a"}
+        variants.append(data)
+        data = json.loads(good)
+        data["audit"][0]["auth"]["keyVersion"] = 0
+        variants.append(data)
+        data = json.loads(good)
+        data["audit"][0]["auth"]["keyVersion"] = True
+        variants.append(data)
+        data = json.loads(good)
+        data["audit"][0]["auth"]["node"] = ""
+        variants.append(data)
+        for index, variant in enumerate(variants):
+            path = os.path.join(self.dir, f"bad{index}.json")
+            raw = json.dumps(variant, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8") + b"\n"
+            with open(path, "wb") as handle:
+                handle.write(raw)
+            with self.assertRaises(ValueError):
+                replication.apply_remote(
+                    path, request(rid="x", source="node-a", base=self.s1,
+                                  remote=self.s2)
+                )
+            self.assertEqual(ledger_raw(path), raw)
+
+
+class ApplySignedRemoteAtomicityTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+        self.s1 = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        self.s2 = state({"a": 2}, {"k": record("w", False, {"a": 2}, "a")})
+        self.ring = keyring(key_entry())
+        replication.apply_signed_remote(
+            self.path, self.ring,
+            signed_envelope(request(rid="r1", source="node-a",
+                                    remote=self.s1)),
+            NOW,
+        )
+        self.before = ledger_raw(self.path)
+
+    def advance(self, path=None):
+        return replication.apply_signed_remote(
+            path if path is not None else self.path,
+            self.ring,
+            signed_envelope(request(rid="r2", source="node-a", base=self.s1,
+                                    remote=self.s2)),
+            NOW,
+        )
+
+    def test_fsync_failure_preserves_existing_bytes(self) -> None:
+        with mock.patch("os.fsync", side_effect=OSError("disk gone")):
+            with self.assertRaises(OSError):
+                self.advance()
+        self.assertEqual(ledger_raw(self.path), self.before)
+        self.assertFalse(os.path.exists(self.path + ".tmp"))
+        self.assertFalse(os.path.exists(self.path + ".old"))
+
+    def test_replace_failure_keeps_missing_path_missing(self) -> None:
+        fresh = os.path.join(self.dir, "fresh.json")
+        with mock.patch("os.replace", side_effect=OSError("rename failed")):
+            with self.assertRaises(OSError):
+                self.advance(path=fresh)
+        self.assertFalse(os.path.exists(fresh))
+        self.assertFalse(os.path.exists(fresh + ".tmp"))
+
+    def test_commit_retries_cleanly_after_failure(self) -> None:
+        with mock.patch("os.fsync", side_effect=OSError("disk gone")):
+            with self.assertRaises(OSError):
+                self.advance()
+        result = self.advance()
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(read_ledger(self.path)["audit"][1]["auth"],
+                         {"keyVersion": 1, "node": "node-a"})
+
+
+if __name__ == "__main__":
+    unittest.main()

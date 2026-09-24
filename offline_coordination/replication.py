@@ -65,11 +65,37 @@ A bound ``id`` presented with a different request raises
 write, flush, file sync, replacement and directory sync all lie inside
 its boundary, and an :class:`OSError` at any stage propagates unchanged
 with the file system restored to its pre-call state.
+
+:func:`apply_signed_remote` adds an offline-verifiable authentication
+boundary in front of the same application flow.  It receives the ledger
+path, a keyring, an envelope and the current moment.  The envelope
+carries exactly ``node``, ``keyVersion``, ``request`` and ``signature``;
+the request follows the :func:`apply_remote` contract and its ``source``
+must equal the envelope's ``node``.  The keyring maps node names to
+credential entries, each holding exactly ``version`` (a positive integer,
+unique per node), ``secret`` (64 lowercase hex characters decoding to the
+32-byte HMAC key), ``notBefore``/``notAfter`` (non-negative integers
+bounding the validity period, both bounds inclusive) and ``revoked``.
+The signed payload is the canonical compact UTF-8 JSON encoding of
+``node``, ``keyVersion`` and ``request`` with every object key
+recursively sorted lexicographically and non-ASCII preserved; the
+signature is the lowercase hex HMAC-SHA256 computed with the selected key
+and compared in constant time.  Keys are selected by exact node and
+version with no fallback: unknown credentials, a revoked, not-yet-valid
+or expired key, a source/node identity mismatch and a signature mismatch
+all raise :class:`AuthenticationError` (a :class:`ValueError`) before the
+ledger is ever read, so a failed verification creates no file.  Replays
+are authenticated against the *current* keyring, so a later revocation or
+expiry cannot be bypassed through a historical request binding.  Audit
+entries committed through :func:`apply_signed_remote` record the verified
+credentials under ``auth``; entries without ``auth`` remain readable and
+:func:`apply_remote` keeps its public behaviour and ledger format.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -356,9 +382,12 @@ RECEIPT = "receipt"
 STALE = "stale"
 
 AUDIT = "audit"
+AUTH = "auth"
 BASE = "base"
 BEFORE = "before"
 ID = "id"
+KEY_VERSION = "keyVersion"
+NODE = "node"
 REMOTE = "remote"
 REQUESTS = "requests"
 SOURCE = "source"
@@ -368,6 +397,8 @@ LEDGER_VERSION = 1
 _LEDGER_TOP_KEYS = (AUDIT, REQUESTS, STATE_KEY, "version")
 _LEDGER_ENTRY_KEY_ORDER = (AFTER, BEFORE, ID, "seq", SOURCE)
 _LEDGER_ENTRY_KEY_SET = frozenset(_LEDGER_ENTRY_KEY_ORDER)
+_LEDGER_ENTRY_AUTHED_SET = _LEDGER_ENTRY_KEY_SET | {AUTH}
+_LEDGER_AUTH_KEYS = frozenset((KEY_VERSION, NODE))
 _REQUEST_KEYS = (ID, SOURCE, BASE, REMOTE)
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -435,15 +466,20 @@ def _request_digest(request_id: str, source: str, base: dict, remote: dict) -> s
     return _digest(payload)
 
 
+def _serialize_entry(entry: dict) -> dict:
+    """One audit entry as stored: the fixed keys plus ``auth`` when present."""
+    out = {key: entry[key] for key in _LEDGER_ENTRY_KEY_ORDER}
+    if AUTH in entry:
+        out[AUTH] = {KEY_VERSION: entry[AUTH][KEY_VERSION], NODE: entry[AUTH][NODE]}
+    return out
+
+
 def _serialize_ledger(
     state: dict, requests: dict[str, str], entries: list[dict]
 ) -> bytes:
     """Canonical ledger bytes: compact JSON, sorted keys, one trailing LF."""
     ledger = {
-        AUDIT: [
-            {key: entry[key] for key in _LEDGER_ENTRY_KEY_ORDER}
-            for entry in entries
-        ],
+        AUDIT: [_serialize_entry(entry) for entry in entries],
         REQUESTS: dict(requests),
         STATE_KEY: {
             merge.CLOCK: state[merge.CLOCK],
@@ -519,10 +555,12 @@ def _parse_ledger(raw: bytes) -> tuple[dict, dict[str, str], list[dict]]:
     for position, entry in enumerate(raw_entries):
         if not isinstance(entry, dict):
             raise _ledger_invalid(f"audit entry {position} must be an object")
-        if set(entry.keys()) != _LEDGER_ENTRY_KEY_SET:
+        entry_keys = set(entry.keys())
+        if entry_keys != _LEDGER_ENTRY_KEY_SET and entry_keys != _LEDGER_ENTRY_AUTHED_SET:
             raise _ledger_invalid(
                 f"audit entry {position} must contain exactly the keys "
-                "'after', 'before', 'id', 'seq' and 'source'"
+                "'after', 'before', 'id', 'seq' and 'source' with "
+                "optional 'auth'"
             )
         after_digest = entry[AFTER]
         before_digest = entry[BEFORE]
@@ -543,6 +581,33 @@ def _parse_ledger(raw: bytes) -> tuple[dict, dict[str, str], list[dict]]:
             raise _ledger_invalid(
                 f"audit entry {position} source must be a non-empty str"
             )
+        parsed_auth = None
+        if AUTH in entry:
+            # Entries committed through apply_signed_remote carry the
+            # credentials they were verified against; entries written by
+            # plain apply_remote have none and stay readable.
+            auth = entry[AUTH]
+            if not isinstance(auth, dict) or set(auth.keys()) != _LEDGER_AUTH_KEYS:
+                raise _ledger_invalid(
+                    f"audit entry {position} auth must contain exactly the "
+                    "keys 'keyVersion' and 'node'"
+                )
+            auth_node = auth[NODE]
+            auth_version = auth[KEY_VERSION]
+            if not isinstance(auth_node, str) or auth_node == "":
+                raise _ledger_invalid(
+                    f"audit entry {position} auth node must be a non-empty str"
+                )
+            if (
+                isinstance(auth_version, bool)
+                or not isinstance(auth_version, int)
+                or auth_version <= 0
+            ):
+                raise _ledger_invalid(
+                    f"audit entry {position} auth keyVersion must be a "
+                    "positive int"
+                )
+            parsed_auth = {KEY_VERSION: auth_version, NODE: auth_node}
         if isinstance(seq, bool) or not isinstance(seq, int):
             raise _ledger_invalid(f"audit entry {position} seq must be an int")
         if seq != expected_seq:
@@ -561,15 +626,16 @@ def _parse_ledger(raw: bytes) -> tuple[dict, dict[str, str], list[dict]]:
             raise _ledger_invalid(
                 f"audit entry {position} before does not chain to the previous after"
             )
-        entries.append(
-            {
-                AFTER: after_digest,
-                BEFORE: before_digest,
-                ID: entry_id,
-                "seq": seq,
-                SOURCE: entry_source,
-            }
-        )
+        parsed_entry = {
+            AFTER: after_digest,
+            BEFORE: before_digest,
+            ID: entry_id,
+            "seq": seq,
+            SOURCE: entry_source,
+        }
+        if parsed_auth is not None:
+            parsed_entry[AUTH] = parsed_auth
+        entries.append(parsed_entry)
         seen_ids.add(entry_id)
         expected_seq += 1
         expected_before = after_digest
@@ -799,6 +865,16 @@ def apply_remote(path: str, request: dict) -> dict:
     recognizable file or temporary artifact left behind), and the rollback
     syncs the directory itself.
     """
+    return _apply(path, request, None)
+
+
+def _apply(path: str, request: dict, auth: dict | None) -> dict:
+    """Shared body of :func:`apply_remote` and :func:`apply_signed_remote`.
+
+    ``auth`` is ``None`` for an unsigned application; otherwise it holds
+    the verified ``node``/``keyVersion`` pair to record on the committed
+    audit entry.
+    """
     if not isinstance(path, str):
         raise TypeError("path must be a str")
 
@@ -860,15 +936,16 @@ def apply_remote(path: str, request: dict) -> dict:
 
     after_digest = _digest(_state_bytes(new_state))
     seq = len(entries) + 1
-    new_entries = entries + [
-        {
-            AFTER: after_digest,
-            BEFORE: before_digest,
-            ID: request_id,
-            "seq": seq,
-            SOURCE: source,
-        }
-    ]
+    new_entry = {
+        AFTER: after_digest,
+        BEFORE: before_digest,
+        ID: request_id,
+        "seq": seq,
+        SOURCE: source,
+    }
+    if auth is not None:
+        new_entry[AUTH] = {KEY_VERSION: auth[KEY_VERSION], NODE: auth[NODE]}
+    new_entries = entries + [new_entry]
     new_requests = dict(requests)
     new_requests[request_id] = _request_digest(request_id, source, base, remote)
 
@@ -885,3 +962,227 @@ def apply_remote(path: str, request: dict) -> dict:
         },
         STATUS: STATUS_APPLIED,
     }
+
+
+# --- Authenticated remote-state application (signed envelopes) --------------
+
+REQUEST = "request"
+REVOKED = "revoked"
+SECRET = "secret"
+SIGNATURE = "signature"
+NOT_BEFORE = "notBefore"
+NOT_AFTER = "notAfter"
+
+_ENVELOPE_KEYS = frozenset((NODE, KEY_VERSION, REQUEST, SIGNATURE))
+_KEYRING_ENTRY_KEYS = frozenset((VERSION, SECRET, NOT_BEFORE, NOT_AFTER, REVOKED))
+
+
+class AuthenticationError(ValueError):
+    """A signed replication envelope failed authentication."""
+
+
+def _validated_keyring(keyring: object) -> dict[str, list[dict]]:
+    """Validate a keyring into a fresh ``{node: [entry]}`` mapping.
+
+    Type faults raise :class:`TypeError`; key sets, ranges, duplicate
+    versions, secret formats and validity periods raise
+    :class:`ValueError`.
+    """
+    if not isinstance(keyring, dict):
+        raise TypeError("keyring must be a dict")
+    result: dict[str, list[dict]] = {}
+    for node, entries in keyring.items():
+        if not isinstance(node, str):
+            raise TypeError("keyring node names must be str")
+        if node == "":
+            raise ValueError("keyring node names must be non-empty")
+        if not isinstance(entries, list):
+            raise TypeError(f"keyring entries for node {node!r} must be a list")
+        validated: list[dict] = []
+        seen_versions: set[int] = set()
+        for position, entry in enumerate(entries):
+            where = f"keyring entry {position} for node {node!r}"
+            if not isinstance(entry, dict):
+                raise TypeError(f"{where} must be a dict")
+            if set(entry.keys()) != _KEYRING_ENTRY_KEYS:
+                raise ValueError(
+                    f"{where} must contain exactly the keys 'version', "
+                    "'secret', 'notBefore', 'notAfter' and 'revoked'"
+                )
+            version = entry[VERSION]
+            if isinstance(version, bool) or not isinstance(version, int):
+                raise TypeError(f"{where} version must be an int")
+            if version <= 0:
+                raise ValueError(f"{where} version must be positive")
+            if version in seen_versions:
+                raise ValueError(
+                    f"{where} repeats key version {version} for node {node!r}"
+                )
+            seen_versions.add(version)
+            secret = entry[SECRET]
+            if not isinstance(secret, str):
+                raise TypeError(f"{where} secret must be a str")
+            if _HEX64.fullmatch(secret) is None:
+                raise ValueError(
+                    f"{where} secret must be 64 lowercase hex characters"
+                )
+            bounds: dict[str, int] = {}
+            for bound_key in (NOT_BEFORE, NOT_AFTER):
+                bound = entry[bound_key]
+                if isinstance(bound, bool) or not isinstance(bound, int):
+                    raise TypeError(f"{where} {bound_key} must be an int")
+                if bound < 0:
+                    raise ValueError(f"{where} {bound_key} must be non-negative")
+                bounds[bound_key] = bound
+            if bounds[NOT_BEFORE] > bounds[NOT_AFTER]:
+                raise ValueError(
+                    f"{where} notBefore must not exceed notAfter"
+                )
+            revoked = entry[REVOKED]
+            if not isinstance(revoked, bool):
+                raise TypeError(f"{where} revoked must be a bool")
+            validated.append(
+                {
+                    VERSION: version,
+                    SECRET: secret,
+                    NOT_BEFORE: bounds[NOT_BEFORE],
+                    NOT_AFTER: bounds[NOT_AFTER],
+                    REVOKED: revoked,
+                }
+            )
+        result[node] = validated
+    return result
+
+
+def _validated_envelope(envelope: object) -> tuple[str, int, object, str]:
+    """Validate an envelope into (node, key_version, request, signature)."""
+    if not isinstance(envelope, dict):
+        raise TypeError("envelope must be a dict")
+    if set(envelope.keys()) != _ENVELOPE_KEYS:
+        raise ValueError(
+            "envelope must contain exactly the keys 'node', 'keyVersion', "
+            "'request' and 'signature'"
+        )
+    node = envelope[NODE]
+    if not isinstance(node, str):
+        raise TypeError("envelope node must be a str")
+    if node == "":
+        raise ValueError("envelope node must be non-empty")
+    key_version = envelope[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("envelope keyVersion must be an int")
+    if key_version <= 0:
+        raise ValueError("envelope keyVersion must be positive")
+    signature = envelope[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("envelope signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
+        raise ValueError(
+            "envelope signature must be 64 lowercase hex characters"
+        )
+    return node, key_version, envelope[REQUEST], signature
+
+
+def _signed_payload(node: str, key_version: int, request: object) -> bytes:
+    """The signed bytes: canonical compact JSON of node/keyVersion/request."""
+    ordered = {KEY_VERSION: key_version, NODE: node, REQUEST: request}
+    return json.dumps(
+        ordered, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _authenticate(
+    keyring: dict[str, list[dict]],
+    node: str,
+    key_version: int,
+    request: object,
+    source: str,
+    signature: str,
+    moment: int,
+) -> None:
+    """Verify the envelope against the current keyring.
+
+    The key is selected by exact node and version with no fallback and
+    must be usable *now*: unknown credentials, a revoked, not-yet-valid or
+    expired key, a request source other than the envelope node and a
+    signature mismatch all raise :class:`AuthenticationError`.
+    """
+    entry = None
+    for candidate in keyring.get(node, ()):
+        if candidate[VERSION] == key_version:
+            entry = candidate
+            break
+    if entry is None:
+        raise AuthenticationError(
+            f"no credentials for node {node!r} and key version {key_version}"
+        )
+    if entry[REVOKED]:
+        raise AuthenticationError(
+            f"credentials for node {node!r} key version {key_version} "
+            "are revoked"
+        )
+    if moment < entry[NOT_BEFORE]:
+        raise AuthenticationError(
+            f"credentials for node {node!r} key version {key_version} "
+            "are not yet valid"
+        )
+    if moment > entry[NOT_AFTER]:
+        raise AuthenticationError(
+            f"credentials for node {node!r} key version {key_version} "
+            "have expired"
+        )
+    if source != node:
+        raise AuthenticationError(
+            f"request source {source!r} does not match envelope node {node!r}"
+        )
+    expected = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _signed_payload(node, key_version, request),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise AuthenticationError("signature does not match the envelope")
+
+
+def apply_signed_remote(
+    path: str, keyring: dict, envelope: dict, moment: int
+) -> dict:
+    """Verify a signed envelope, then apply it like :func:`apply_remote`.
+
+    ``keyring`` maps node names to credential entries (see the module
+    docstring), ``envelope`` carries exactly ``node``, ``keyVersion``,
+    ``request`` and ``signature``, and ``moment`` is the current time as a
+    non-negative integer.  The request inside the envelope follows the
+    :func:`apply_remote` contract and its ``source`` must equal the
+    envelope's ``node``.
+
+    Authentication runs before the ledger is ever read, so a failed
+    verification raises :class:`AuthenticationError` (a
+    :class:`ValueError`) without creating or modifying any file; replays
+    are authenticated against the current keyring, so a key revoked or
+    expired since the original commit rejects the replay instead of
+    serving the historical binding.  A verified envelope is applied by the
+    exact :func:`apply_remote` flow with the same result shape; a commit
+    additionally records the verified ``node`` and ``keyVersion`` under
+    ``auth`` in the new audit entry.
+
+    Type violations in any argument or field raise :class:`TypeError`;
+    key sets, ranges, duplicate key versions, secret/signature formats
+    and validity periods raise :class:`ValueError`.  Ledger corruption
+    raises :class:`ValueError`, and a write, flush, sync or replacement
+    failure propagates unchanged as :class:`OSError` with the file system
+    restored to its pre-call state.
+    """
+    if not isinstance(path, str):
+        raise TypeError("path must be a str")
+    validated_keyring = _validated_keyring(keyring)
+    node, key_version, request, signature = _validated_envelope(envelope)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+    _, source, _, _ = _validated_apply_request(request)
+    _authenticate(
+        validated_keyring, node, key_version, request, source, signature, moment
+    )
+    return _apply(path, request, {KEY_VERSION: key_version, NODE: node})
