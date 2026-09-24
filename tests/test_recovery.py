@@ -225,7 +225,8 @@ class CleanStatusTest(RecoveryCase):
         self.assert_only_ledger = [os.path.basename(path)]
         self.assertEqual(os.listdir(self.dir), ["ledger.json"])
         self.assertEqual(
-            recover_ledger(path), {"digest": None, "status": "clean"}
+            recover_ledger(path),
+            {"digest": digest_of(read_bytes(path)), "status": "clean"},
         )
 
     def test_result_is_a_fresh_dict_per_call(self):
@@ -253,7 +254,7 @@ class PreparedCrashTest(RecoveryCase):
         self.assertTrue(any(".old." in name for name in names))
         self.assertTrue(any(".txn." in name for name in names))
         result = recover_ledger(path)
-        self.assertEqual(result, {"digest": None, "status": "clean"})
+        self.assertEqual(result, {"digest": digest_of(old), "status": "clean"})
         # Without an intent nothing is scanned or removed.
         self.assertEqual(read_bytes(path), old)
         self.assertGreater(len(os.listdir(os.path.dirname(path))), 1)
@@ -271,7 +272,7 @@ class PreparedCrashTest(RecoveryCase):
         self.assertEqual(read_bytes(path), old)
         self.assert_only_ledger_remains(path)
         self.assertEqual(
-            recover_ledger(path), {"digest": None, "status": "clean"}
+            recover_ledger(path), {"digest": digest_of(old), "status": "clean"}
         )
 
     def test_crash_after_replacement_restores_old_bytes(self):
@@ -286,7 +287,7 @@ class PreparedCrashTest(RecoveryCase):
         self.assertEqual(read_bytes(path), old)
         self.assert_only_ledger_remains(path)
         self.assertEqual(
-            recover_ledger(path), {"digest": None, "status": "clean"}
+            recover_ledger(path), {"digest": digest_of(old), "status": "clean"}
         )
 
     def test_crash_after_intent_persisted_on_missing_ledger(self):
@@ -322,7 +323,7 @@ class InstalledCrashTest(RecoveryCase):
         self.assertEqual(read_bytes(path), new)
         self.assert_only_ledger_remains(path)
         self.assertEqual(
-            recover_ledger(path), {"digest": None, "status": "clean"}
+            recover_ledger(path), {"digest": digest_of(new), "status": "clean"}
         )
 
     def test_crash_during_cleanup_completes(self):
@@ -543,7 +544,7 @@ class RecoveryOSErrorTest(RecoveryCase):
             result, {"digest": digest_of(old), "status": "rolled-back"}
         )
         self.assertEqual(
-            recover_ledger(path), {"digest": None, "status": "clean"}
+            recover_ledger(path), {"digest": digest_of(old), "status": "clean"}
         )
 
     def test_restore_replace_failure_keeps_intent_and_artifacts(self):
@@ -591,7 +592,7 @@ class AutoRecoveryTest(RecoveryCase):
         self.assertEqual(read_bytes(path), new)
         self.assertFalse(os.path.exists(path + ".txn"))
         self.assertEqual(
-            recover_ledger(path), {"digest": None, "status": "clean"}
+            recover_ledger(path), {"digest": digest_of(new), "status": "clean"}
         )
 
     def test_apply_remote_completes_confirmed_commit_then_replays(self):
@@ -602,7 +603,7 @@ class AutoRecoveryTest(RecoveryCase):
         self.assertEqual(result["status"], "duplicate")
         self.assertEqual(read_bytes(path), new)
         self.assertEqual(
-            recover_ledger(path), {"digest": None, "status": "clean"}
+            recover_ledger(path), {"digest": digest_of(new), "status": "clean"}
         )
 
     def test_apply_signed_remote_recovers_interrupted_commit(self):
@@ -625,7 +626,8 @@ class AutoRecoveryTest(RecoveryCase):
             entries[-1]["auth"], {"keyVersion": 1, "node": "node-b"}
         )
         self.assertEqual(
-            recover_ledger(path), {"digest": None, "status": "clean"}
+            recover_ledger(path),
+            {"digest": digest_of(read_bytes(path)), "status": "clean"},
         )
 
     def test_commit_resolution_recovers_interrupted_commit(self):
@@ -675,7 +677,8 @@ class AutoRecoveryTest(RecoveryCase):
         self.assertEqual(result["status"], "applied")
         self.assertEqual(result["next"], 4)
         self.assertEqual(
-            recover_ledger(target), {"digest": None, "status": "clean"}
+            recover_ledger(target),
+            {"digest": digest_of(read_bytes(target)), "status": "clean"},
         )
         replay = R.commit_resolution(target, **args)
         self.assertEqual(replay["status"], "duplicate")
