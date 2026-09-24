@@ -68,7 +68,7 @@ def make_ticket(paths, nonce="nonce-1", secret=SECRET, issuer=ISSUER,
     signature = hmac.new(
         bytes.fromhex(secret), compact(payload), hashlib.sha256
     ).hexdigest()
-    return compact({"payload": payload, "signature": signature}) + b"\n"
+    return compact({"payload": payload, "signature": signature})
 
 
 def read_bytes(path):

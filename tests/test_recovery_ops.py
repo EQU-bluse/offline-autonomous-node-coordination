@@ -477,7 +477,7 @@ class RecoveryCommandTest(BatchCase):
             handle.write(compact(keyring))
         ticket_path = os.path.join(self.dir, f"ticket-{nonce}.json")
         with open(ticket_path, "wb") as handle:
-            handle.write(compact({"payload": payload, "signature": signature}) + b"\n")
+            handle.write(compact({"payload": payload, "signature": signature}))
         audit_path = os.path.join(self.dir, f"audit-{nonce}.jsonl")
         return (
             "--keyring", keyring_path,
