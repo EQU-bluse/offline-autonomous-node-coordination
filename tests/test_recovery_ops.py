@@ -6,6 +6,7 @@ digest of :func:`recover_ledger`.
 """
 
 import hashlib
+import hmac
 import json
 import os
 import subprocess
@@ -443,6 +444,48 @@ class RecoveryCommandTest(BatchCase):
             text=True,
         )
 
+    def write_materials(self, paths, nonce="nonce-1"):
+        """Write a keyring and a matching ticket, returning CLI options."""
+        secret = "ab" * 32
+        keyring = {
+            "issuer-a": [
+                {
+                    "version": 1,
+                    "secret": secret,
+                    "notBefore": 0,
+                    "notAfter": 10 ** 9,
+                    "revoked": False,
+                }
+            ]
+        }
+        payload = {
+            "issuer": "issuer-a",
+            "keyVersion": 1,
+            "nonce": nonce,
+            "notBefore": 0,
+            "notAfter": 10 ** 9,
+            "paths": list(paths),
+        }
+        compact = lambda obj: json.dumps(
+            obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        signature = hmac.new(
+            bytes.fromhex(secret), compact(payload), hashlib.sha256
+        ).hexdigest()
+        keyring_path = os.path.join(self.dir, f"keyring-{nonce}.json")
+        with open(keyring_path, "wb") as handle:
+            handle.write(compact(keyring))
+        ticket_path = os.path.join(self.dir, f"ticket-{nonce}.json")
+        with open(ticket_path, "wb") as handle:
+            handle.write(compact({"payload": payload, "signature": signature}) + b"\n")
+        audit_path = os.path.join(self.dir, f"audit-{nonce}.jsonl")
+        return (
+            "--keyring", keyring_path,
+            "--ticket", ticket_path,
+            "--moment", "7",
+            "--audit", audit_path,
+        )
+
     def test_check_outputs_one_sorted_compact_json_line(self):
         path = self.committed_ledger()
         result = self.run_cli("recovery", "check", path)
@@ -472,22 +515,31 @@ class RecoveryCommandTest(BatchCase):
 
     def test_run_recovers_and_exits_zero(self):
         prepared, old, _new = self.crash_state("m", "before-install")
-        result = self.run_cli("recovery", "run", prepared)
-        self.assertEqual(result.returncode, 0)
+        materials = self.write_materials([prepared])
+        result = self.run_cli("recovery", "run", prepared, *materials)
+        self.assertEqual(result.returncode, 0, result.stderr)
         (item,) = json.loads(result.stdout)
         self.assertEqual(item["status"], "rolled-back")
         self.assertEqual(item["digest"], digest_of(old))
+
+    def test_run_without_materials_exits_two(self):
+        prepared, _old, _new = self.crash_state("m2", "before-install")
+        result = self.run_cli("recovery", "run", prepared)
+        self.assertEqual(result.returncode, 2)
 
     def test_blocked_ledger_exits_one(self):
         path, _old, _new = self.crash_state("n", "before-install")
         with open(path + ".txn", "wb") as handle:
             handle.write(b"not json\n")
-        for action in ("check", "run"):
-            with self.subTest(action=action):
-                result = self.run_cli("recovery", action, path)
-                self.assertEqual(result.returncode, 1)
-                (item,) = json.loads(result.stdout)
-                self.assertEqual(item["error"], "corrupt")
+        result = self.run_cli("recovery", "check", path)
+        self.assertEqual(result.returncode, 1)
+        (item,) = json.loads(result.stdout)
+        self.assertEqual(item["error"], "corrupt")
+        materials = self.write_materials([path])
+        result = self.run_cli("recovery", "run", path, *materials)
+        self.assertEqual(result.returncode, 1)
+        (item,) = json.loads(result.stdout)
+        self.assertEqual(item["error"], "corrupt")
 
     def test_argument_errors_exit_two(self):
         for argv in (
