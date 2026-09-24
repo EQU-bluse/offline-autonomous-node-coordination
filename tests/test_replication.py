@@ -629,6 +629,7 @@ if __name__ == "__main__":
 
 from offline_coordination import replication  # noqa: E402
 from offline_coordination import merge as _merge  # noqa: E402
+from offline_coordination import storage  # noqa: E402
 
 APPLY_RESULT_KEYS = ("items", "receipt", "status")
 ITEM_KEYS = ("key", "decision", "need")
@@ -800,24 +801,88 @@ class ApplyRemoteReplayTest(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = tempfile.mkdtemp()
         self.path = os.path.join(self.dir, "ledger.json")
-        self.s1 = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        # Two records under keys that are not submission-order sorted, so a
+        # replay must re-sort them by remote record key.
+        self.s1 = state(
+            {"a": 1, "b": 1},
+            {
+                "k": record("v", False, {"a": 1}, "a"),
+                "g": record("w", False, {"b": 1}, "b"),
+            },
+        )
         self.req = request(remote=self.s1)
         self.first = replication.apply_remote(self.path, self.req)
 
-    def test_same_id_same_request_is_duplicate_with_unchanged_bytes(self) -> None:
+    def replay_items(self):
+        return [
+            {"key": "g", "decision": "duplicate", "need": {}},
+            {"key": "k", "decision": "duplicate", "need": {}},
+        ]
+
+    def test_immediate_replay_is_duplicate_with_items_and_no_receipt(self) -> None:
         before = ledger_raw(self.path)
         again = replication.apply_remote(self.path, self.req)
         self.assertEqual(again["status"], "duplicate")
-        self.assertEqual(again["items"], [])
-        self.assertEqual(again["receipt"], self.first["receipt"])
+        self.assertEqual(tuple(again.keys()), APPLY_RESULT_KEYS)
+        # Items follow the remote records in stable key order and only
+        # state that each record is already duplicate.
+        self.assertEqual(again["items"], self.replay_items())
+        self.assertEqual(
+            [item["key"] for item in again["items"]],
+            sorted(self.req["remote"]["records"]),
+        )
+        for item in again["items"]:
+            self.assertEqual(tuple(item.keys()), ITEM_KEYS)
+            self.assertEqual(item["need"], {})
+        # A replay never mints a receipt.
+        self.assertIsNone(again["receipt"])
         self.assertEqual(ledger_raw(self.path), before)
 
-    def test_replay_finds_its_own_entry_after_later_applies(self) -> None:
-        s2 = state({"a": 2}, {"k": record("w", False, {"a": 2}, "a")})
-        replication.apply_remote(self.path, request(rid="r2", base=self.s1, remote=s2))
-        again = replication.apply_remote(self.path, self.req)
+    def test_immediate_replay_performs_no_write_operations(self) -> None:
+        with mock.patch("os.replace") as replaced, \
+                mock.patch("os.fsync") as fsynced, \
+                mock.patch("os.link") as linked, \
+                mock.patch("os.unlink") as unlinked:
+            again = replication.apply_remote(self.path, self.req)
         self.assertEqual(again["status"], "duplicate")
-        self.assertEqual(again["receipt"], self.first["receipt"])
+        replaced.assert_not_called()
+        fsynced.assert_not_called()
+        linked.assert_not_called()
+        unlinked.assert_not_called()
+
+    def test_replay_after_later_commits_still_duplicate_from_binding(self) -> None:
+        # Advance the ledger past r1: k now holds w@a:2, which dominates
+        # the k record (v@a:1) the replayed request carries, and the outer
+        # clock has moved past g's prerequisite.  Judged against current
+        # state the records would be stale/missing; the saved request
+        # binding must make the replay an unchanged duplicate instead.
+        s2 = state(
+            {"a": 2, "b": 1},
+            {
+                "k": record("w", False, {"a": 2}, "a"),
+                "g": record("w", False, {"b": 1}, "b"),
+            },
+        )
+        before_r2 = replication.apply_remote(self.path, self.req)
+
+        second = replication.apply_remote(
+            self.path, request(rid="r2", base=self.s1, remote=s2)
+        )
+        self.assertEqual(second["status"], "applied")
+        before = ledger_raw(self.path)
+
+        immediate = replication.apply_remote(self.path, self.req)
+        again = replication.apply_remote(self.path, self.req)
+        self.assertEqual(immediate, again)
+        # The replay object is identical whether taken before or after the
+        # intervening commit.
+        self.assertEqual(immediate, before_r2)
+        self.assertEqual(again["status"], "duplicate")
+        self.assertEqual(again["items"], self.replay_items())
+        self.assertTrue(all(item["decision"] == "duplicate" for item in again["items"]))
+        self.assertTrue(all(item["need"] == {} for item in again["items"]))
+        self.assertIsNone(again["receipt"])
+        self.assertEqual(ledger_raw(self.path), before)
 
     def test_same_id_different_remote_raises_and_keeps_bytes(self) -> None:
         changed = request(
@@ -827,6 +892,10 @@ class ApplyRemoteReplayTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             replication.apply_remote(self.path, changed)
         self.assertEqual(ledger_raw(self.path), before)
+        # A rejected differing request must not poison the true replay.
+        self.assertEqual(
+            replication.apply_remote(self.path, self.req)["status"], "duplicate"
+        )
 
     def test_same_id_different_source_raises(self) -> None:
         changed = dict(self.req, source="other-node")
@@ -1164,6 +1233,15 @@ class ApplyRemoteLedgerCorruptionTest(unittest.TestCase):
     def test_garbage_is_invalid(self) -> None:
         self.reject(b"not json\n")
 
+    def test_replay_still_requires_a_decodable_ledger(self) -> None:
+        # A duplicate verdict is read from the saved binding, so a ledger
+        # that can no longer be decoded is a ValueError (not a replay) and
+        # is left untouched.
+        path = self.corrupt(b"not json\n")
+        with self.assertRaises(ValueError):
+            replication.apply_remote(path, request(remote=self.s1))
+        self.assertEqual(ledger_raw(path), b"not json\n")
+
 
 class ApplyRemoteValidationTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -1231,8 +1309,207 @@ class ApplyRemoteAtomicityTest(unittest.TestCase):
         self.dir = tempfile.mkdtemp()
         self.path = os.path.join(self.dir, "ledger.json")
         self.s1 = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        self.s2 = state({"a": 2}, {"k": record("w", False, {"a": 2}, "a")})
         replication.apply_remote(self.path, request(remote=self.s1))
+        self.before = ledger_raw(self.path)
 
+    def advance(self, path, rid="r2"):
+        return replication.apply_remote(
+            path, request(rid=rid, base=self.s1, remote=self.s2)
+        )
+
+    def assert_no_artifacts(self, path) -> None:
+        self.assertFalse(os.path.exists(path + ".tmp"))
+        self.assertFalse(os.path.exists(path + ".old"))
+
+    def failing_open(self, failing_attr: str, exc: OSError):
+        real_open = open
+
+        class FailingFile:
+            def __init__(self, *args, **kwargs):
+                self._handle = real_open(*args, **kwargs)
+
+            def write(self, data):
+                if failing_attr == "write":
+                    raise exc
+                return self._handle.write(data)
+
+            def flush(self):
+                if failing_attr == "flush":
+                    raise exc
+                return self._handle.flush()
+
+            def __getattr__(self, name):
+                return getattr(self._handle, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self._handle.close()
+                return False
+
+        return mock.patch(
+            "builtins.open",
+            side_effect=lambda *a, **k: FailingFile(*a, **k),
+        )
+
+    def failure_injectors(self, exc: OSError):
+        # name -> context manager factory simulating an OSError at one
+        # specific stage of the commit boundary.
+        return [
+            ("write", lambda: self.failing_open("write", exc)),
+            ("flush", lambda: self.failing_open("flush", exc)),
+            ("file fsync", lambda: mock.patch("os.fsync", side_effect=exc)),
+            ("link", lambda: mock.patch("os.link", side_effect=exc)),
+            ("replace", lambda: mock.patch("os.replace", side_effect=exc)),
+            ("dir open", lambda: mock.patch("os.open", side_effect=exc)),
+            ("dir fsync",
+             lambda: mock.patch("offline_coordination.storage._fsync_dir",
+                                side_effect=exc)),
+        ]
+
+    def seed_ledger(self, name):
+        path = os.path.join(self.dir, f"ledger-{name}.json")
+        replication.apply_remote(path, request(remote=self.s1))
+        return path, ledger_raw(path)
+
+    def test_every_failure_stage_preserves_existing_ledger_bytes(self) -> None:
+        for name, make_patch in self.failure_injectors(OSError("disk gone")):
+            tag = name.replace(" ", "-")
+            with self.subTest(stage=name):
+                path, before = self.seed_ledger(tag)
+                with make_patch():
+                    with self.assertRaises(OSError):
+                        replication.apply_remote(
+                            path, request(rid="r2", base=self.s1, remote=self.s2)
+                        )
+                self.assertEqual(
+                    ledger_raw(path), before,
+                    msg=f"ledger bytes changed after failure at {name}",
+                )
+                self.assert_no_artifacts(path)
+                # The failed transaction commits cleanly on retry: the id
+                # was never bound and the predecessor stayed readable.
+                result = replication.apply_remote(
+                    path, request(rid="r2", base=self.s1, remote=self.s2)
+                )
+                self.assertEqual(result["status"], "applied")
+                self.assertTrue(
+                    replication.apply_remote(
+                        path, request(rid="r2", base=self.s1, remote=self.s2)
+                    )["status"]
+                    == "duplicate"
+                )
+
+    def test_every_failure_stage_keeps_missing_ledger_missing(self) -> None:
+        # The link stage only exists when a predecessor is retained; a
+        # missing ledger goes write -> install -> sync instead.
+        for name, make_patch in self.failure_injectors(OSError("disk gone")):
+            if name == "link":
+                continue
+            fresh = os.path.join(self.dir, f"fresh-{name.replace(' ', '-')}.json")
+            with self.subTest(stage=name):
+                with make_patch():
+                    with self.assertRaises(OSError):
+                        replication.apply_remote(
+                            fresh, request(remote=self.s1)
+                        )
+                self.assertFalse(os.path.exists(fresh))
+                self.assert_no_artifacts(fresh)
+                # No recognizable ledger or artifact may influence retry.
+                result = replication.apply_remote(
+                    fresh, request(remote=self.s1)
+                )
+                self.assertEqual(result["status"], "applied")
+                self.assertEqual(
+                    read_ledger(fresh)["state"],
+                    {"clock": {"a": 1},
+                     "records": {"k": ["v", False, {"a": 1}, "a"]}},
+                )
+
+    def test_original_exception_propagates_unchanged(self) -> None:
+        sentinel = OSError("the one true error")
+        for name, make_patch in self.failure_injectors(sentinel):
+            with self.subTest(stage=name):
+                with make_patch():
+                    with self.assertRaises(OSError) as caught:
+                        self.advance(
+                            self.path, rid="e-" + name.replace(" ", "-")
+                        )
+                self.assertIs(caught.exception, sentinel)
+
+    def test_dir_fsync_failure_after_install_restores_predecessor(self) -> None:
+        # This is the window the old implementation got wrong: the new
+        # bytes had already replaced the ledger when the directory sync
+        # failed.  Rollback must publish the predecessor back.
+        inode_before = os.stat(self.path).st_ino
+        with mock.patch(
+            "offline_coordination.storage._fsync_dir",
+            side_effect=OSError("dir sync failed"),
+        ):
+            with self.assertRaises(OSError):
+                self.advance(self.path)
+        self.assertEqual(ledger_raw(self.path), self.before)
+        self.assertEqual(os.stat(self.path).st_ino, inode_before)
+        self.assert_no_artifacts(self.path)
+
+    def test_recovery_itself_syncs_the_directory(self) -> None:
+        for existed in (True, False):
+            with self.subTest(existed=existed):
+                path = self.path if existed else os.path.join(self.dir, "m.json")
+                with mock.patch(
+                    "offline_coordination.storage._fsync_dir",
+                    side_effect=[OSError("first sync fails"), None],
+                ) as synced:
+                    with self.assertRaises(OSError):
+                        self.advance(path, rid="d")
+                # One sync attempt for the commit, one more for the rollback.
+                self.assertGreaterEqual(synced.call_count, 2)
+                if existed:
+                    self.assertEqual(ledger_raw(path), self.before)
+                else:
+                    self.assertFalse(os.path.exists(path))
+                self.assert_no_artifacts(path)
+
+    def test_success_leaves_no_artifacts_and_syncs(self) -> None:
+        with mock.patch(
+            "offline_coordination.storage._fsync_dir",
+            wraps=storage._fsync_dir,
+        ) as synced:
+            result = self.advance(self.path)
+        self.assertEqual(result["status"], "applied")
+        self.assert_no_artifacts(self.path)
+        synced.assert_called()
+
+    def test_stale_old_artifact_from_interrupted_call_is_swept(self) -> None:
+        # Simulate garbage left by a killed process at both internal names.
+        with open(self.path + ".old", "wb") as handle:
+            handle.write(b"stale predecessor link\n")
+        with open(self.path + ".tmp", "wb") as handle:
+            handle.write(b"stale temporary file\n")
+        result = self.advance(self.path)
+        self.assertEqual(result["status"], "applied")
+        self.assert_no_artifacts(self.path)
+        # The current ledger is still a perfectly valid ledger.
+        self.assertEqual(
+            replication.apply_remote(
+                self.path, request(rid="r2", base=self.s1, remote=self.s2)
+            )["status"],
+            "duplicate",
+        )
+
+    def test_stale_artifacts_swept_on_missing_path_too(self) -> None:
+        fresh = os.path.join(self.dir, "fresh.json")
+        with open(fresh + ".old", "wb") as handle:
+            handle.write(b"x")
+        with open(fresh + ".tmp", "wb") as handle:
+            handle.write(b"y")
+        result = replication.apply_remote(fresh, request(remote=self.s1))
+        self.assertEqual(result["status"], "applied")
+        self.assert_no_artifacts(fresh)
+
+    # The two scenarios the previous test suite pinned, kept verbatim.
     def test_fsync_failure_keeps_missing_path_missing(self) -> None:
         fresh = os.path.join(self.dir, "fresh.json")
         with mock.patch("os.fsync", side_effect=OSError("disk gone")):
@@ -1244,23 +1521,50 @@ class ApplyRemoteAtomicityTest(unittest.TestCase):
         self.assertFalse(os.path.exists(fresh + ".tmp"))
 
     def test_fsync_failure_preserves_existing_bytes(self) -> None:
-        before = ledger_raw(self.path)
-        nxt = state({"a": 2}, {"k": record("w", False, {"a": 2}, "a")})
         with mock.patch("os.fsync", side_effect=OSError("disk gone")):
             with self.assertRaises(OSError):
-                replication.apply_remote(
-                    self.path, request(rid="r2", base=self.s1, remote=nxt)
-                )
-        self.assertEqual(ledger_raw(self.path), before)
+                self.advance(self.path)
+        self.assertEqual(ledger_raw(self.path), self.before)
         self.assertFalse(os.path.exists(self.path + ".tmp"))
 
     def test_replace_failure_preserves_existing_bytes(self) -> None:
-        before = ledger_raw(self.path)
-        nxt = state({"a": 2}, {"k": record("w", False, {"a": 2}, "a")})
         with mock.patch("os.replace", side_effect=OSError("rename failed")):
             with self.assertRaises(OSError):
-                replication.apply_remote(
-                    self.path, request(rid="r3", base=self.s1, remote=nxt)
-                )
-        self.assertEqual(ledger_raw(self.path), before)
+                self.advance(self.path)
+        self.assertEqual(ledger_raw(self.path), self.before)
         self.assertFalse(os.path.exists(self.path + ".tmp"))
+
+
+class ApplyRemoteNoWritesOnRejectionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+
+    def artifacts(self):
+        return sorted(
+            name for name in os.listdir(self.dir)
+            if name.startswith(os.path.basename(self.path))
+        )
+
+    def test_type_errors_create_no_files(self) -> None:
+        with self.assertRaises(TypeError):
+            replication.apply_remote(self.path, request(rid=1))
+        with self.assertRaises(TypeError):
+            replication.apply_remote(1, request())
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_value_errors_create_no_files(self) -> None:
+        with self.assertRaises(ValueError):
+            replication.apply_remote(self.path, request(rid=""))
+        # A business-level duplicate on a never-created ledger path (empty
+        # remote against the base state) likewise writes nothing.
+        result = replication.apply_remote(
+            self.path, request(rid="e0", base=state(), remote=state())
+        )
+        self.assertEqual(result["status"], "duplicate")
+        self.assertEqual(os.listdir(self.dir), [])
+        # The rejected call left nothing a retry would recognise.
+        s1 = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        applied = replication.apply_remote(self.path, request(remote=s1))
+        self.assertEqual(applied["status"], "applied")
+        self.assertEqual(self.artifacts(), [os.path.basename(self.path)])

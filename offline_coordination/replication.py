@@ -54,6 +54,17 @@ last ``after`` hashing the stored state.  A missing ledger stands for the
 request's ``base`` state with empty indexes; any existing file that fails
 the byte, structure, state or index rules is rejected with
 :class:`ValueError` and left untouched.
+
+Replaying a request whose ``id`` is already bound to exactly the same
+request digest always yields ``duplicate`` from the saved binding alone,
+immediately or after other commits: one item per remote record in
+ascending key order, each already duplicate with an empty ``need`` map,
+and no receipt; the ledger is never read for modification on a replay.
+A bound ``id`` presented with a different request raises
+:class:`ValueError`.  Every successful commit is one durable transaction:
+write, flush, file sync, replacement and directory sync all lie inside
+its boundary, and an :class:`OSError` at any stage propagates unchanged
+with the file system restored to its pre-call state.
 """
 
 from __future__ import annotations
@@ -623,26 +634,119 @@ def _overall_status(decisions: list[str]) -> str:
     return STATUS_APPLIED if APPLY in decisions else STATUS_DUPLICATE
 
 
+def _rollback_ledger_write(
+    path: str,
+    tmp_path: str,
+    backup_path: str,
+    existed: bool,
+    stage: str,
+) -> None:
+    """Best-effort rollback of a failed :func:`_atomic_write`.
+
+    ``stage`` records how far the transaction got: ``write`` (temporary
+    file written), ``link`` (predecessor hard-linked aside), ``install``
+    (temporary moved into place) or ``sync`` (the directory sync after
+    install).  The predecessor is retained as a hard link rather than
+    rewritten, so renaming it back restores the original file
+    byte-for-byte (indeed as the same inode) even with no working fsync
+    or free space left.  The directory is synced last so the recovery is
+    durable.  Every recovery error is swallowed so the original
+    exception propagates unchanged.
+    """
+    try:
+        if stage == "sync":
+            if existed:
+                os.replace(backup_path, path)
+            else:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+        elif stage == "install":
+            # The replacement did not run: the predecessor at path is
+            # untouched; the backup link and temporary file are internal
+            # artifacts to remove.
+            try:
+                os.unlink(backup_path)
+            except FileNotFoundError:
+                pass
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+        else:
+            # write/link stages leave the predecessor in place.
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            if stage == "link":
+                try:
+                    os.unlink(backup_path)
+                except FileNotFoundError:
+                    pass
+        try:
+            storage._fsync_dir(path)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
 def _atomic_write(path: str, payload: bytes) -> None:
-    """Durably replace ``path`` with ``payload``, never touching it on error."""
+    """Durably replace ``path`` with ``payload`` as a single transaction.
+
+    The temporary file's write, flush and file sync, the replacement and
+    the following directory sync all lie inside the boundary.  An existing
+    predecessor is retained as a hard link at ``path + ".old"`` -- without
+    ever removing ``path`` -- until the new file is installed and the
+    directory has synced, so any :class:`OSError` rolls back by renaming
+    that link back: the prior file returns byte-for-byte (as the same
+    inode, with no rewriting and therefore no dependence on a working
+    fsync or free space), and a path the call created is removed again.
+    The rollback syncs the directory as well.  The original
+    :class:`OSError` propagates unchanged, no ``.tmp``/``.old`` artifact is
+    left behind and such artifacts (for example from a killed process) are
+    never read as a ledger.  On success both the file and the directory
+    have been synced.
+    """
     tmp_path = path + ".tmp"
+    backup_path = path + ".old"
+    existed = os.path.exists(path)
+    # Retained artifacts from earlier interrupted calls are internal and
+    # must never stand in the way of a fresh transaction (the temporary
+    # name is overwritten by the open below).
+    try:
+        os.unlink(backup_path)
+    except FileNotFoundError:
+        pass
+
+    stage = "write"
     try:
         with open(tmp_path, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        if existed:
+            stage = "link"
+            os.link(path, backup_path)
+        stage = "install"
         os.replace(tmp_path, path)
-        fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        stage = "sync"
+        storage._fsync_dir(path)
     except BaseException:
+        _rollback_ledger_write(path, tmp_path, backup_path, existed, stage)
+        raise
+
+    # The new ledger is durable from this point on; the retained
+    # predecessor link is internal cleanup only.  Its removal (and the
+    # matching directory sync) is best-effort and never undoes a commit.
+    if existed:
         try:
-            os.unlink(tmp_path)
+            os.unlink(backup_path)
+            storage._fsync_dir(path)
         except OSError:
             pass
-        raise
 
 
 def apply_remote(path: str, request: dict) -> dict:
@@ -656,8 +760,12 @@ def apply_remote(path: str, request: dict) -> dict:
     ``requests`` and ``audit`` are fully validated before anything else.
 
     An unknown ``id`` whose current state differs from ``base`` returns
-    ``stale`` without touching the filesystem.  A known ``id`` replays the
-    identical request as ``duplicate`` with the ledger bytes unchanged; a
+    ``stale`` without touching the filesystem.  A known ``id`` whose bound
+    request digest matches replays as ``duplicate``: the verdict comes from
+    the saved binding alone, so the result is the same immediately or after
+    later successful commits.  Its items list every remote record in
+    ascending key order, each already ``duplicate`` with ``need`` an empty
+    mapping, ``receipt`` is ``None`` and the ledger bytes are unchanged.  A
     known ``id`` presented with different contents raises
     :class:`ValueError`.
 
@@ -679,11 +787,17 @@ def apply_remote(path: str, request: dict) -> dict:
 
     The result has the key order ``items``, ``receipt``, ``status``; items
     have ``key``, ``decision``, ``need`` (``need`` is ``None`` except for
-    ``missing`` items) and ``receipt`` is ``None`` unless committed.
-    Type violations raise :class:`TypeError`; every other contract or
-    ledger violation raises :class:`ValueError`; an invalid existing
-    ledger is never written, and a write, replace or sync failure
-    propagates unchanged as :class:`OSError` with the prior bytes intact.
+    ``missing`` items, which map the still-required intervals, and
+    replayed duplicates, which carry an empty mapping) and ``receipt`` is
+    ``None`` unless committed.  Type violations raise :class:`TypeError`
+    without creating any file; every other contract or ledger violation
+    raises :class:`ValueError` and an invalid existing ledger is never
+    written.  A failure while writing, flushing, syncing, replacing or
+    syncing the directory propagates unchanged as :class:`OSError` and the
+    file system is restored to its pre-call state: an existing ledger keeps
+    its exact prior bytes, a missing ledger stays missing (with no
+    recognizable file or temporary artifact left behind), and the rollback
+    syncs the directory itself.
     """
     if not isinstance(path, str):
         raise TypeError("path must be a str")
@@ -697,18 +811,15 @@ def apply_remote(path: str, request: dict) -> dict:
             raise ValueError(
                 f"request id {request_id!r} is already bound to a different request"
             )
-        entry = next(item for item in entries if item[ID] == request_id)
-        return {
-            ITEMS: [],
-            RECEIPT: {
-                ID: request_id,
-                SOURCE: source,
-                BEFORE: entry[BEFORE],
-                AFTER: entry[AFTER],
-                "seq": entry["seq"],
-            },
-            STATUS: STATUS_DUPLICATE,
-        }
+        # The saved request binding is the whole replay verdict: regardless
+        # of how far the ledger state has advanced since the original
+        # commit, every record the replayed request carries is reported
+        # already duplicate, with no receipt and no filesystem change.
+        items = [
+            {KEY: key, DECISION: STATUS_DUPLICATE, NEED: {}}
+            for key in sorted(remote[merge.RECORDS])
+        ]
+        return {ITEMS: items, RECEIPT: None, STATUS: STATUS_DUPLICATE}
 
     current_bytes = _state_bytes(state)
     if current_bytes != _state_bytes(base):
