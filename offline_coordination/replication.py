@@ -159,6 +159,34 @@ ordered by ascending seq with the left side first on ties.  The plan is
 byte-stable for equal inputs, mirrors left/right when the proofs are
 swapped together with a ``left``/``right`` policy, and never touches the
 filesystem or the inputs.
+
+:func:`resolve_merge` closes a ``manual`` plan read-only.  It takes the
+plan byte string, the same two proofs and a list of decisions; only a
+``manual`` plan produced by :func:`plan_merge` for exactly those proofs
+may be resolved -- a plan from any other policy is a structurally valid
+version-1 plan whose steps differ from the regenerated manual plan and
+is therefore rejected as stale before any decision is considered.
+A structurally invalid plan (encoding, duplicate keys, version-1
+structure) raises :class:`InvalidPlanError`; a structurally valid plan
+that is not byte-for-byte the manual plan regenerated from the proofs
+(digest, relation, common boundary, side summaries, steps or unresolved
+references) raises :class:`StalePlanError`; both are
+:class:`ValueError` subclasses.  Each decision carries only ``side``,
+``seq`` and ``action`` (``"accept"`` or ``"reject"``), resolving one
+unresolved reference; missing, duplicate, extra or out-of-range
+references and illegal choices raise :class:`InvalidResolutionError`
+(a :class:`ValueError`).  Accepted entries must chain contiguously from
+the common boundary -- at most one accepted side per seq, no acceptance
+past a rejected seq, an unbroken seq and digest chain.  The result is
+one version-1 compact JSON object with the top-level keys ``common``,
+``left``, ``planDigest``, ``relation``, ``right``, ``steps``,
+``unresolved`` and ``version``; manual steps become
+``accept``/``reject`` with the fixed reasons ``manual-accepted``/
+``manual-rejected``, non-manual steps, carried audit entries and ``auth``
+bindings are unchanged, ``unresolved`` is empty and ``planDigest`` is the
+lowercase hex SHA-256 of the complete source plan bytes.  Resolution is
+deterministic, mirrors under a left/right swap with matching decisions,
+and never touches the filesystem or the inputs.
 """
 
 from __future__ import annotations
@@ -1941,3 +1969,408 @@ def plan_merge(left: bytes, right: bytes, policy: str) -> bytes:
         "version": PLAN_VERSION,
     }
     return _proof_compact(plan) + b"\n"
+
+
+# --- Read-only manual merge resolution ---------------------------------------
+
+RESOLVE_VERSION = 1
+
+RESOLVE_ACTION_ACCEPT = "accept"
+RESOLVE_ACTION_REJECT = "reject"
+_RESOLVE_ACTIONS = (RESOLVE_ACTION_ACCEPT, RESOLVE_ACTION_REJECT)
+
+REASON_MANUAL_ACCEPTED = "manual-accepted"
+REASON_MANUAL_REJECTED = "manual-rejected"
+
+_RESOLUTION_KEYS = frozenset(("side", "seq", "action"))
+_PLAN_TOP_KEYS = frozenset((
+    "common",
+    "left",
+    "policy",
+    "relation",
+    "right",
+    "steps",
+    "unresolved",
+    "version",
+))
+_PLAN_STEP_KEYS = frozenset(("action", "entry", "reason", "side"))
+_PLAN_REF_KEYS = frozenset(("side", "seq"))
+_PLAN_SIDE_KEYS = frozenset((PROOF_START_SEQ, PROOF_END_SEQ, PROOF_DIGEST))
+_PLAN_COMMON_KEYS = frozenset((COMMON_AFTER, COMMON_SEQ))
+_PLAN_ACTIONS = (ACTION_ACCEPT, ACTION_REJECT, ACTION_MANUAL)
+_PLAN_REASONS = (
+    REASON_EXTENSION,
+    REASON_SELECTED,
+    REASON_REJECTED,
+    REASON_MANUAL,
+)
+_PLAN_RELATIONS = (
+    RELATION_SAME,
+    RELATION_LEFT_PREFIX,
+    RELATION_RIGHT_PREFIX,
+    RELATION_OVERLAP,
+    RELATION_FORK,
+)
+_PLAN_SIDES = (_SIDE_LEFT, _SIDE_RIGHT)
+
+
+class InvalidPlanError(ValueError):
+    """A merge plan fails its byte, structure or version-1 contract."""
+
+
+class StalePlanError(ValueError):
+    """A merge plan no longer matches the proofs it claims to describe."""
+
+
+class InvalidResolutionError(ValueError):
+    """A manual merge resolution set is incomplete, invalid or broken."""
+
+
+def _plan_invalid(message: str) -> InvalidPlanError:
+    return InvalidPlanError(f"invalid merge plan: {message}")
+
+
+def _reject_duplicate_plan_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate plan object keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _plan_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _validated_plan_entry(entry: object, where: str) -> None:
+    """Structural check of one plan step's carried audit entry."""
+    if not isinstance(entry, dict):
+        raise _plan_invalid(f"{where} entry must be a JSON object")
+    keys = set(entry.keys())
+    if keys != _LEDGER_ENTRY_KEY_SET and keys != _LEDGER_ENTRY_AUTHED_SET:
+        raise _plan_invalid(
+            f"{where} entry must contain exactly the keys 'after', 'before', "
+            "'id', 'seq' and 'source' with optional 'auth'"
+        )
+    if not _is_digest(entry[BEFORE]):
+        raise _plan_invalid(f"{where} entry before must be 64 lowercase hex chars")
+    if not _is_digest(entry[AFTER]):
+        raise _plan_invalid(f"{where} entry after must be 64 lowercase hex chars")
+    if not isinstance(entry[ID], str) or entry[ID] == "":
+        raise _plan_invalid(f"{where} entry id must be a non-empty str")
+    if not isinstance(entry[SOURCE], str) or entry[SOURCE] == "":
+        raise _plan_invalid(f"{where} entry source must be a non-empty str")
+    if isinstance(entry["seq"], bool) or not isinstance(entry["seq"], int):
+        raise _plan_invalid(f"{where} entry seq must be an int")
+    if AUTH in entry:
+        auth = entry[AUTH]
+        if not isinstance(auth, dict) or set(auth.keys()) != _LEDGER_AUTH_KEYS:
+            raise _plan_invalid(
+                f"{where} entry auth must contain exactly the keys "
+                "'keyVersion' and 'node'"
+            )
+        if not isinstance(auth[NODE], str) or auth[NODE] == "":
+            raise _plan_invalid(f"{where} entry auth node must be a non-empty str")
+        if (
+            isinstance(auth[KEY_VERSION], bool)
+            or not isinstance(auth[KEY_VERSION], int)
+            or auth[KEY_VERSION] <= 0
+        ):
+            raise _plan_invalid(
+                f"{where} entry auth keyVersion must be a positive non-bool int"
+            )
+
+
+def _parse_plan(raw: bytes) -> dict:
+    """Validate a merge plan against the version-1 plan byte contract.
+
+    Only the structural contract is enforced here: canonical encoding,
+    unique keys, the fixed key sets, the integer version 1 and the value
+    domains of every field.  Whether the plan still matches the proofs it
+    describes is decided separately by :func:`resolve_merge`.
+    """
+    if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+        raise _plan_invalid("must be a single JSON object ending in one LF")
+    try:
+        text = raw[:-1].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _plan_invalid("is not valid UTF-8") from exc
+    try:
+        # The pairs hook raises directly on duplicate object keys, so a
+        # ValueError raised here means that contract fault, not bad JSON.
+        data = json.loads(text, object_pairs_hook=_reject_duplicate_plan_keys)
+    except json.JSONDecodeError as exc:
+        raise _plan_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise _plan_invalid("must be a JSON object")
+    if set(data.keys()) != _PLAN_TOP_KEYS:
+        raise _plan_invalid(
+            "top-level object must contain exactly the keys 'common', "
+            "'left', 'policy', 'relation', 'right', 'steps', 'unresolved' "
+            "and 'version'"
+        )
+    version = data["version"]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise _plan_invalid("version must be an int")
+    if version != PLAN_VERSION:
+        raise _plan_invalid("version must be the integer 1")
+
+    policy = data["policy"]
+    if not isinstance(policy, str) or policy not in _PLAN_POLICIES:
+        raise _plan_invalid("policy must be one of 'left', 'right' or 'manual'")
+    relation = data["relation"]
+    if not isinstance(relation, str) or relation not in _PLAN_RELATIONS:
+        raise _plan_invalid("relation must be a known proof relation")
+
+    common = data["common"]
+    if not isinstance(common, dict) or set(common.keys()) != _PLAN_COMMON_KEYS:
+        raise _plan_invalid("common must contain exactly the keys 'after' and 'seq'")
+    if not _is_digest(common[COMMON_AFTER]):
+        raise _plan_invalid("common after must be 64 lowercase hex characters")
+    if isinstance(common[COMMON_SEQ], bool) or not isinstance(common[COMMON_SEQ], int):
+        raise _plan_invalid("common seq must be an int")
+
+    for side_key in (_SIDE_LEFT, _SIDE_RIGHT):
+        side = data[side_key]
+        if not isinstance(side, dict) or set(side.keys()) != _PLAN_SIDE_KEYS:
+            raise _plan_invalid(
+                f"{side_key} must contain exactly the keys 'digest', "
+                "'endSeq' and 'startSeq'"
+            )
+        if not _is_digest(side[PROOF_DIGEST]):
+            raise _plan_invalid(
+                f"{side_key} digest must be 64 lowercase hex characters"
+            )
+        for seq_key in (PROOF_START_SEQ, PROOF_END_SEQ):
+            if isinstance(side[seq_key], bool) or not isinstance(side[seq_key], int):
+                raise _plan_invalid(f"{side_key} {seq_key} must be an int")
+
+    steps = data["steps"]
+    if not isinstance(steps, list):
+        raise _plan_invalid("steps must be an array")
+    for position, step in enumerate(steps):
+        where = f"step {position}"
+        if not isinstance(step, dict) or set(step.keys()) != _PLAN_STEP_KEYS:
+            raise _plan_invalid(
+                f"{where} must contain exactly the keys 'action', 'entry', "
+                "'reason' and 'side'"
+            )
+        if step["side"] not in _PLAN_SIDES:
+            raise _plan_invalid(f"{where} side must be 'left' or 'right'")
+        if step["action"] not in _PLAN_ACTIONS:
+            raise _plan_invalid(f"{where} action must be a known plan action")
+        if step["reason"] not in _PLAN_REASONS:
+            raise _plan_invalid(f"{where} reason must be a known plan reason")
+        _validated_plan_entry(step["entry"], where)
+
+    unresolved = data["unresolved"]
+    if not isinstance(unresolved, list):
+        raise _plan_invalid("unresolved must be an array")
+    for position, ref in enumerate(unresolved):
+        where = f"unresolved item {position}"
+        if not isinstance(ref, dict) or set(ref.keys()) != _PLAN_REF_KEYS:
+            raise _plan_invalid(
+                f"{where} must contain exactly the keys 'side' and 'seq'"
+            )
+        if ref["side"] not in _PLAN_SIDES:
+            raise _plan_invalid(f"{where} side must be 'left' or 'right'")
+        if isinstance(ref["seq"], bool) or not isinstance(ref["seq"], int):
+            raise _plan_invalid(f"{where} seq must be an int")
+
+    # The bytes must be the single canonical compact form with sorted keys
+    # and exactly one trailing newline.
+    if _proof_compact(data) + b"\n" != raw:
+        raise _plan_invalid("encoding is not the canonical compact form")
+    return data
+
+
+def _validate_resolution_types(decisions: object) -> None:
+    """Type-check the decisions argument before any proof or plan is parsed."""
+    if not isinstance(decisions, list):
+        raise TypeError("decisions must be a list")
+    for position, decision in enumerate(decisions):
+        where = f"decision {position}"
+        if not isinstance(decision, dict):
+            raise TypeError(f"{where} must be a dict")
+        if "side" in decision and not isinstance(decision["side"], str):
+            raise TypeError(f"{where} side must be a str")
+        if "seq" in decision and (
+            isinstance(decision["seq"], bool)
+            or not isinstance(decision["seq"], int)
+        ):
+            raise TypeError(f"{where} seq must be an int")
+        if "action" in decision and not isinstance(decision["action"], str):
+            raise TypeError(f"{where} action must be a str")
+
+
+def resolve_merge(plan: bytes, left: bytes, right: bytes, decisions: list) -> bytes:
+    """Resolve a manual merge plan into a final, auditable merge result.
+
+    ``plan`` must be :class:`bytes` produced by :func:`plan_merge` with
+    policy ``"manual"`` for exactly the same ``left`` and ``right`` proofs;
+    plans from any other policy never enter resolution.  Both proofs are
+    independently validated against the exact :func:`verify_proof`
+    contract.  ``decisions`` resolves every ``unresolved`` reference of the
+    plan exactly once: each item carries only ``side``, ``seq`` and
+    ``action`` (``"accept"`` or ``"reject"``), in any input order.
+
+    All argument and decision field types are checked before either proof
+    or the plan is parsed, so a malformed input never masks a
+    :class:`TypeError` (a :class:`bool` never poses as a ``seq``).  An
+    invalid proof raises :class:`InvalidProofError`; a plan whose encoding,
+    key sets or version-1 structure is invalid raises
+    :class:`InvalidPlanError` (a :class:`ValueError`); a structurally valid
+    plan that differs byte-for-byte from the manual plan freshly generated
+    for the same proofs -- digest, relation, common boundary, side
+    summaries, steps or unresolved references -- raises
+    :class:`StalePlanError` (a :class:`ValueError`).
+
+    A missing, duplicate, extra or out-of-range reference and any action
+    other than ``"accept"``/``"reject"`` raises
+    :class:`InvalidResolutionError` (a :class:`ValueError`).  The accepted
+    entries must chain contiguously from the common boundary: at most one
+    side may be accepted per seq, acceptance may not resume past a seq
+    where every side was rejected, and a break in the seq or before/after
+    digest chain raises :class:`InvalidResolutionError` as well.
+
+    On success the result is one version-1 UTF-8 compact JSON object --
+    every object key recursively sorted lexicographically, non-ASCII
+    preserved, exactly one trailing ``\\n`` -- with the top-level keys
+    ``common``, ``left``, ``planDigest``, ``relation``, ``right``,
+    ``steps``, ``unresolved`` and ``version`` (the integer 1).  Manual
+    steps are relabelled ``accept``/``reject`` with the fixed reasons
+    ``manual-accepted``/``manual-rejected`` in the plan's original step
+    order; non-manual steps, the carried audit entries and their ``auth``
+    bindings are unchanged and ``unresolved`` is empty.  ``relation``,
+    ``common`` and both side summaries are taken from the plan and
+    ``planDigest`` is the lowercase hex SHA-256 of the complete source
+    plan bytes.  The bytes are deterministic for equal inputs, swapping
+    the proofs together with the matching decision sides mirrors the
+    left/right semantics, and the ledger, the keyring and the filesystem
+    are never consulted and the inputs are never modified.
+    """
+    # Type faults precede every other error: all argument and decision
+    # field types are checked before either proof or the plan is parsed.
+    if not isinstance(plan, bytes):
+        raise TypeError("plan must be bytes")
+    if not isinstance(left, bytes):
+        raise TypeError("left proof must be bytes")
+    if not isinstance(right, bytes):
+        raise TypeError("right proof must be bytes")
+    _validate_resolution_types(decisions)
+
+    _parse_proof(left)
+    _parse_proof(right)
+    parsed_plan = _parse_plan(plan)
+
+    # Staleness: the plan must be byte-for-byte the manual plan freshly
+    # generated for these very proofs.  A plan that no longer regenerates
+    # at all (disjoint ranges, an unconfirmed boundary) is equally stale.
+    try:
+        expected = plan_merge(left, right, POLICY_MANUAL)
+    except ValueError as exc:
+        raise StalePlanError(
+            "plan does not match a manual plan for these proofs"
+        ) from exc
+    if plan != expected:
+        raise StalePlanError(
+            "plan does not match the manual plan regenerated from these proofs"
+        )
+
+    # Every unresolved reference must be resolved exactly once; anything
+    # missing, duplicated, extra or out of range is an invalid resolution.
+    pending = {(ref["side"], ref["seq"]) for ref in parsed_plan["unresolved"]}
+    seen: set[tuple[str, int]] = set()
+    choices: dict[tuple[str, int], str] = {}
+    for position, decision in enumerate(decisions):
+        where = f"decision {position}"
+        if set(decision.keys()) != _RESOLUTION_KEYS:
+            raise InvalidResolutionError(
+                f"{where} must contain exactly the keys 'side', 'seq' "
+                "and 'action'"
+            )
+        side = decision["side"]
+        if side not in _PLAN_SIDES:
+            raise InvalidResolutionError(f"{where} side must be 'left' or 'right'")
+        action = decision["action"]
+        if action not in _RESOLVE_ACTIONS:
+            raise InvalidResolutionError(
+                f"{where} action must be 'accept' or 'reject'"
+            )
+        ref = (side, decision["seq"])
+        if ref not in pending:
+            raise InvalidResolutionError(
+                f"{where} references no unresolved plan item"
+            )
+        if ref in seen:
+            raise InvalidResolutionError(
+                f"{where} resolves the same plan item twice"
+            )
+        seen.add(ref)
+        choices[ref] = action
+    if seen != pending:
+        raise InvalidResolutionError(
+            "every unresolved plan item must be resolved exactly once"
+        )
+
+    # The accepted entries must chain contiguously from the common
+    # boundary: one side per seq, no resumption past an all-rejected seq
+    # and an unbroken seq and before/after digest chain.
+    manual_steps = [step for step in parsed_plan["steps"] if step["action"] == ACTION_MANUAL]
+    accepted: dict[int, dict] = {}
+    for step in manual_steps:
+        seq = step["entry"]["seq"]
+        if choices[(step["side"], seq)] == RESOLVE_ACTION_ACCEPT:
+            if seq in accepted:
+                raise InvalidResolutionError(
+                    f"at most one side may be accepted at seq {seq}"
+                )
+            accepted[seq] = step["entry"]
+    expected_seq = parsed_plan["common"][COMMON_SEQ] + 1
+    expected_before = parsed_plan["common"][COMMON_AFTER]
+    for seq in sorted({step["entry"]["seq"] for step in manual_steps}):
+        entry = accepted.get(seq)
+        if entry is None:
+            if any(later > seq for later in accepted):
+                raise InvalidResolutionError(
+                    f"acceptance may not resume past the rejected seq {seq}"
+                )
+            continue
+        if seq != expected_seq or entry[BEFORE] != expected_before:
+            raise InvalidResolutionError(
+                f"accepted entry at seq {seq} does not chain from the "
+                "common boundary"
+            )
+        expected_seq = seq + 1
+        expected_before = entry[AFTER]
+
+    steps: list[dict] = []
+    for step in parsed_plan["steps"]:
+        if step["action"] != ACTION_MANUAL:
+            # Non-manual steps are carried through unchanged.
+            steps.append(step)
+            continue
+        seq = step["entry"]["seq"]
+        if choices[(step["side"], seq)] == RESOLVE_ACTION_ACCEPT:
+            action, reason = RESOLVE_ACTION_ACCEPT, REASON_MANUAL_ACCEPTED
+        else:
+            action, reason = RESOLVE_ACTION_REJECT, REASON_MANUAL_REJECTED
+        steps.append(
+            {
+                "action": action,
+                "entry": step["entry"],
+                "reason": reason,
+                "side": step["side"],
+            }
+        )
+
+    result = {
+        "common": parsed_plan["common"],
+        "left": parsed_plan["left"],
+        "planDigest": hashlib.sha256(plan).hexdigest(),
+        "relation": parsed_plan["relation"],
+        "right": parsed_plan["right"],
+        "steps": steps,
+        "unresolved": [],
+        "version": RESOLVE_VERSION,
+    }
+    return _proof_compact(result) + b"\n"
