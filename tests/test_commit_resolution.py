@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from offline_coordination import replication as R
+from offline_coordination import storage
 from offline_coordination.replication import (
     InvalidPlanError,
     InvalidProofError,
@@ -403,6 +404,94 @@ class LedgerFailureTest(CommitCase):
             with self.assertRaises(OSError):
                 self.commit()
         self.assertEqual(read_bytes(self.fork.target_path), before)
+
+
+class DirectorySyncRollbackTest(CommitCase):
+    """A directory-sync failure anywhere in the commit boundary rolls back."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.unrelated = os.path.join(self.directory, "unrelated.txt")
+        with open(self.unrelated, "wb") as handle:
+            handle.write(b"pre-existing, do not touch\n")
+
+    def commit_with_fsync_dir_failures(self, fail_on):
+        real_fsync_dir = storage._fsync_dir
+        failure = OSError("directory sync failed")
+        calls = []
+
+        def flaky_fsync_dir(path):
+            calls.append(path)
+            if len(calls) in fail_on:
+                raise failure
+            return real_fsync_dir(path)
+
+        with mock.patch.object(storage, "_fsync_dir", flaky_fsync_dir):
+            with self.assertRaises(OSError) as caught:
+                self.commit()
+        return failure, caught.exception, calls
+
+    def assert_full_rollback(self, failure, raised, before_bytes, before_ledger):
+        # The exact injected exception propagates; no secondary rollback
+        # error may replace it or turn the call into a business result.
+        self.assertIs(raised, failure)
+        # The ledger is back to its pre-call bytes, not merely parseable.
+        self.assertEqual(read_bytes(self.fork.target_path), before_bytes)
+        # Re-reading shows the original seq, state digest, request
+        # bindings and auth information.
+        self.assertEqual(read_ledger(self.fork.target_path), before_ledger)
+        # No transaction residue, and the unrelated file is untouched.
+        self.assertEqual(
+            sorted(os.listdir(self.directory)),
+            ["left.json", "right.json", "target.json", "unrelated.txt"],
+        )
+        self.assertEqual(
+            read_bytes(self.unrelated), b"pre-existing, do not touch\n"
+        )
+
+    def assert_retry_applies(self):
+        # After the rollback the same resolution applies as if the failed
+        # commit never happened: not duplicate, not stale.
+        result = self.commit()
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["next"], 4)
+        read_ledger(self.fork.target_path)
+        self.assertEqual(
+            sorted(os.listdir(self.directory)),
+            ["left.json", "right.json", "target.json", "unrelated.txt"],
+        )
+
+    def test_first_directory_sync_failure_rolls_back(self) -> None:
+        before_bytes = read_bytes(self.fork.target_path)
+        before_ledger = read_ledger(self.fork.target_path)
+        failure, raised, calls = self.commit_with_fsync_dir_failures({1})
+        # The sync after the install failed; the rollback synced again.
+        self.assertEqual(len(calls), 2)
+        self.assert_full_rollback(failure, raised, before_bytes, before_ledger)
+        self.assert_retry_applies()
+
+    def test_cleanup_directory_sync_failure_rolls_back(self) -> None:
+        before_bytes = read_bytes(self.fork.target_path)
+        before_ledger = read_ledger(self.fork.target_path)
+        failure, raised, calls = self.commit_with_fsync_dir_failures({2})
+        # The install sync succeeded, the cleanup sync failed, the
+        # rollback synced again.
+        self.assertEqual(len(calls), 3)
+        self.assert_full_rollback(failure, raised, before_bytes, before_ledger)
+        self.assert_retry_applies()
+
+    def test_successful_commit_leaves_no_transaction_residue(self) -> None:
+        result = self.commit()
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(
+            sorted(os.listdir(self.directory)),
+            ["left.json", "right.json", "target.json", "unrelated.txt"],
+        )
+        read_ledger(self.fork.target_path)
+
+
+class SignedDirectorySyncRollbackTest(DirectorySyncRollbackTest):
+    signed = True
 
 
 class ArgumentTypeTest(CommitCase):
