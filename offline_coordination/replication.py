@@ -105,6 +105,30 @@ hold the ledger entries in range unchanged, each carrying ``after``/
 canonical encoding (with no trailing newline) of the proof object with
 the ``digest`` key itself removed.  :func:`verify_proof` is purely
 offline: it reads neither the ledger nor the keyring.
+
+:func:`compare_proofs` compares two proofs entirely offline: both inputs
+are independently verified under the :func:`verify_proof` contract first
+(a non-bytes argument raises :class:`TypeError`, any invalid proof the
+existing :class:`InvalidProofError`), and no ledger, keyring or other
+file is ever read.  It returns one canonical compact UTF-8 JSON report
+(keys sorted lexicographically, non-ASCII preserved, one trailing
+``\\n``) with the fixed keys ``common``, ``conflictSeq``, ``left``,
+``overlap``, ``relation``, ``right`` and ``version`` (``version`` is the
+integer 1); each side carries the proof ``digest`` with ``startSeq`` and
+``endSeq``.  Ranges sharing no seq report ``"disjoint"`` with ``overlap``
+and ``common`` set to ``None``.  Otherwise the *complete* shared entries
+are compared in ascending seq -- never just the boundary or proof
+digests -- yielding ``"same"`` (identical shared entries and ranges, with
+``common`` at the common last seq and after), ``"left-prefix"``/
+``"right-prefix"`` (same start, the shorter side fully matching, the
+direction naming it), ``"overlap"`` (matching shared entries without
+being equal or a prefix, with ``common`` at the last shared boundary) or
+``"fork"`` (``conflictSeq`` the earliest differing seq, never skipped;
+``common`` the last agreeing entry, the boundary before the first covered
+seq when the first shared entry already conflicts but both sides agree on
+its before, else ``None``).  The report is byte-stable for identical
+inputs and swapping the inputs only exchanges left and right (and the
+prefix direction); neither input is modified.
 """
 
 from __future__ import annotations
@@ -1526,6 +1550,8 @@ def _parse_proof(raw: bytes) -> dict:
         PROOF_END_SEQ: end,
         PROOF_FIRST_BEFORE: first_before,
         PROOF_LAST_AFTER: last_after,
+        PROOF_ENTRIES: [dict(entry) for entry in raw_entries],
+        PROOF_DIGEST: claimed,
         "signedEntries": signed,
         "unsignedEntries": unsigned,
     }
@@ -1552,3 +1578,159 @@ def verify_proof(proof: bytes) -> dict:
         raise TypeError("proof must be bytes")
     result = _parse_proof(proof)
     return {key: result[key] for key in _PROOF_RESULT_KEYS}
+
+
+# --- Offline comparison of two audit-range proofs ----------------------------
+
+COMPARE_VERSION = 1
+COMPARE_AFTER = "after"
+COMPARE_SEQ = "seq"
+
+REL_SAME = "same"
+REL_LEFT_PREFIX = "left-prefix"
+REL_RIGHT_PREFIX = "right-prefix"
+REL_OVERLAP = "overlap"
+REL_FORK = "fork"
+REL_DISJOINT = "disjoint"
+
+
+def _proof_side(parsed: dict) -> dict:
+    """One report side: the proof digest and its covered seq range."""
+    return {
+        PROOF_DIGEST: parsed[PROOF_DIGEST],
+        PROOF_START_SEQ: parsed[PROOF_START_SEQ],
+        PROOF_END_SEQ: parsed[PROOF_END_SEQ],
+    }
+
+
+def _common_point(seq: int, after: str) -> dict:
+    """A shared boundary description: the seq and its following after."""
+    return {COMPARE_AFTER: after, COMPARE_SEQ: seq}
+
+
+def _entry_after_at(parsed: dict, seq: int) -> str:
+    """The after-digest recorded in the parsed proof for entry ``seq``."""
+    return parsed[PROOF_ENTRIES][seq - parsed[PROOF_START_SEQ]][AFTER]
+
+
+def compare_proofs(left: bytes, right: bytes) -> bytes:
+    """Compare two audit proofs offline and return a canonical JSON report.
+
+    Both inputs are first independently verified under the
+    :func:`verify_proof` contract; neither the ledger nor the keyring nor
+    any other file is consulted.  A non-bytes argument raises
+    :class:`TypeError`; an invalid proof raises :class:`InvalidProofError`
+    exactly as :func:`verify_proof` would.
+
+    The two seq ranges may be disjoint (``relation`` ``"disjoint"``);
+    otherwise the *complete* entries at every shared seq -- not merely the
+    boundary or proof digests -- are compared in ascending seq.  The
+    relation is one of:
+
+    * ``"same"`` -- the shared entries agree and both ranges are equal;
+      ``common`` points at the common last seq and its after-digest.
+    * ``"left-prefix"``/``"right-prefix"`` -- same start seq and every
+      entry of the shorter proof matches, the direction naming the shorter
+      side; ``common`` is that shorter side's last point.
+    * ``"overlap"`` -- the shared entries all agree but neither proof is a
+      prefix of the other; ``common`` is the last shared boundary.
+    * ``"fork"`` -- the first shared seq whose complete entries differ is
+      ``conflictSeq`` (the earliest difference, never skipped).  ``common``
+      is the last agreeing point: the preceding shared entry when one
+      exists, the boundary before the first covered seq when the conflict
+      is the first shared entry and both proofs agree on that before
+      digest, and ``None`` when that before differs as well.
+    * ``"disjoint"`` -- the ranges share no seq; ``overlap`` and ``common``
+      are ``None``.
+
+    The report is compact UTF-8 JSON with keys sorted lexicographically,
+    non-ASCII unescaped and one trailing ``\\n``.  It always carries
+    ``version`` (the integer 1), ``relation``, ``overlap``, ``common``,
+    ``conflictSeq``, ``left`` and ``right``; each side carries the proof
+    ``digest`` plus ``startSeq``/``endSeq``.  Identical inputs produce
+    byte-identical output, and swapping the inputs only swaps left/right
+    (and the prefix direction).  Neither input is modified.
+    """
+    if not isinstance(left, bytes):
+        raise TypeError("left proof must be bytes")
+    if not isinstance(right, bytes):
+        raise TypeError("right proof must be bytes")
+
+    left_p = _parse_proof(left)
+    right_p = _parse_proof(right)
+
+    l_start = left_p[PROOF_START_SEQ]
+    l_end = left_p[PROOF_END_SEQ]
+    r_start = right_p[PROOF_START_SEQ]
+    r_end = right_p[PROOF_END_SEQ]
+
+    overlap_start = max(l_start, r_start)
+    overlap_end = min(l_end, r_end)
+    if overlap_start > overlap_end:
+        report = {
+            "common": None,
+            "conflictSeq": None,
+            "left": _proof_side(left_p),
+            "overlap": None,
+            "relation": REL_DISJOINT,
+            "right": _proof_side(right_p),
+            "version": COMPARE_VERSION,
+        }
+        return _proof_compact(report) + b"\n"
+
+    overlap = [overlap_start, overlap_end]
+    left_entries = left_p[PROOF_ENTRIES]
+    right_entries = right_p[PROOF_ENTRIES]
+
+    conflict_seq: int | None = None
+    last_agree_seq = overlap_start - 1
+    for seq in range(overlap_start, overlap_end + 1):
+        left_entry = left_entries[seq - l_start]
+        right_entry = right_entries[seq - r_start]
+        if left_entry != right_entry:
+            conflict_seq = seq
+            break
+        last_agree_seq = seq
+
+    if conflict_seq is None:
+        # Every shared entry is identical.  The common last point is the
+        # end of the overlap in that case; whole-entry equality, not proof
+        # or boundary digests alone, decides the verdict.
+        common = _common_point(
+            overlap_end, _entry_after_at(left_p, overlap_end)
+        )
+        if l_start == r_start and l_end == r_end:
+            relation = REL_SAME
+        elif l_start == r_start and l_end < r_end:
+            relation = REL_LEFT_PREFIX
+        elif l_start == r_start and r_end < l_end:
+            relation = REL_RIGHT_PREFIX
+        else:
+            relation = REL_OVERLAP
+    else:
+        relation = REL_FORK
+        if last_agree_seq >= overlap_start:
+            common = _common_point(
+                last_agree_seq, _entry_after_at(left_p, last_agree_seq)
+            )
+        else:
+            # The very first shared entry already differs; the only common
+            # ground can be the boundary immediately before it, and only
+            # when both proofs record the same before-digest there.
+            left_before = left_entries[conflict_seq - l_start][BEFORE]
+            right_before = right_entries[conflict_seq - r_start][BEFORE]
+            if left_before == right_before:
+                common = _common_point(conflict_seq - 1, left_before)
+            else:
+                common = None
+
+    report = {
+        "common": common,
+        "conflictSeq": conflict_seq,
+        "left": _proof_side(left_p),
+        "overlap": overlap,
+        "relation": relation,
+        "right": _proof_side(right_p),
+        "version": COMPARE_VERSION,
+    }
+    return _proof_compact(report) + b"\n"
