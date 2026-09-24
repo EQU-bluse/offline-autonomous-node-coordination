@@ -101,6 +101,26 @@ propagates unchanged with enough intent and artifacts left for a retry.
 The ledger write entry points run this recovery automatically after
 their input validation, before the ledger is read.
 
+:func:`inspect_recovery` diagnoses an explicit, non-empty list of ledger
+paths without modifying anything: only each listed ledger, its intent
+and the artifacts the intent references are read.  Each report carries
+``path``, ``status``, ``phase``, ``digest``, ``artifacts``, ``action``
+and ``error`` -- ``clean`` with a null phase and action when no intent
+exists (the digest still summarizes the ledger bytes, or is null when
+the path is missing), ``pending`` with the intent's phase and the
+suggested action (``rollback``/``complete``) plus the candidate and
+predecessor existence, digest match and completeness when an intent is
+valid, ``blocked``/``corrupt`` when the intent or a necessary artifact
+is invalid, and ``failed``/``os-error`` when reading fails.
+:func:`recover_many` is the controlled batch form of
+:func:`recover_ledger` over the same kind of list: every path is
+recovered in order, one ledger's failure never stops or rolls back the
+others, a :class:`CorruptRecoveryError` becomes a ``blocked``/``corrupt``
+item and an :class:`OSError` a ``failed``/``os-error`` item, and failed
+ledgers keep their intent and artifacts so a re-run retries them
+independently.  Both validate the whole list (a non-empty list of
+non-empty, distinct strings) before any file is read or modified.
+
 :func:`apply_signed_remote` adds an offline-verifiable authentication
 boundary in front of the same application flow.  It receives the ledger
 path, a keyring, an envelope and the current moment.  The envelope
@@ -1208,8 +1228,17 @@ def recover_ledger(path: str) -> dict:
             raw = handle.read()
     except FileNotFoundError:
         # No intent: nothing to settle, and random leftover artifacts
-        # are never scanned.
-        return {"digest": None, STATUS: STATUS_CLEAN}
+        # are never scanned.  The digest still summarizes the ledger
+        # bytes currently at the path (None when the path is missing).
+        try:
+            with open(path, "rb") as handle:
+                current = handle.read()
+        except FileNotFoundError:
+            current = None
+        return {
+            "digest": _digest(current) if current is not None else None,
+            STATUS: STATUS_CLEAN,
+        }
 
     ledger_base = os.path.basename(path)
     intent = _parse_intent(raw, ledger_base)
@@ -1296,6 +1325,262 @@ def recover_ledger(path: str) -> dict:
     if phase == PHASE_PREPARED:
         return {"digest": old_digest, STATUS: STATUS_ROLLED_BACK}
     return {"digest": new_digest, STATUS: STATUS_COMPLETED}
+
+
+# --- Read-only recovery diagnostics and controlled batch recovery ------------
+
+STATUS_PENDING = "pending"
+STATUS_BLOCKED = "blocked"
+STATUS_FAILED = "failed"
+
+ACTION_ROLLBACK = "rollback"
+ACTION_COMPLETE = "complete"
+
+ERROR_CORRUPT = "corrupt"
+ERROR_OS_ERROR = "os-error"
+
+
+def _validated_path_list(paths: object) -> list[str]:
+    """Validate an explicit ledger path list before any file is touched.
+
+    The argument must be a non-empty list of non-empty, distinct strings:
+    a non-list container or a non-str element raises :class:`TypeError`,
+    an empty list, an empty path or a duplicate path raises
+    :class:`ValueError`.  Only a fully validated list comes back, so a
+    rejected argument guarantees no file was read or modified.
+    """
+    if not isinstance(paths, list):
+        raise TypeError("paths must be a list")
+    for path in paths:
+        if not isinstance(path, str):
+            raise TypeError("paths elements must be str")
+    if not paths:
+        raise ValueError("paths must be a non-empty list")
+    validated: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        if path == "":
+            raise ValueError("paths elements must be non-empty")
+        if path in seen:
+            raise ValueError(f"duplicate path {path!r}")
+        seen.add(path)
+        validated.append(path)
+    return validated
+
+
+def _read_bytes_or_none(path: str) -> bytes | None:
+    """Return the bytes at ``path``, or None when the path is missing."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
+
+
+def _inspect_item(
+    path: str,
+    status: str,
+    phase: str | None,
+    digest: str | None,
+    artifacts: dict | None,
+    action: str | None,
+    error: str | None,
+) -> dict:
+    """One diagnostics report entry with the fixed key order."""
+    return {
+        "path": path,
+        STATUS: status,
+        "phase": phase,
+        "digest": digest,
+        "artifacts": artifacts,
+        "action": action,
+        "error": error,
+    }
+
+
+def _inspect_one(path: str) -> dict:
+    """Diagnose one ledger path without modifying any file.
+
+    Mirrors the validation :func:`recover_ledger` performs, read-only:
+    only the ledger, its intent and the artifacts the intent references
+    are ever read.
+    """
+    try:
+        raw_intent = _read_bytes_or_none(path + ".txn")
+        current = _read_bytes_or_none(path)
+        if raw_intent is None:
+            # No intent: clean, and random artifacts are never scanned.
+            return _inspect_item(
+                path,
+                STATUS_CLEAN,
+                None,
+                _digest(current) if current is not None else None,
+                None,
+                None,
+                None,
+            )
+        try:
+            intent = _parse_intent(raw_intent, os.path.basename(path))
+        except CorruptRecoveryError:
+            return _inspect_item(
+                path,
+                STATUS_BLOCKED,
+                None,
+                _digest(current) if current is not None else None,
+                None,
+                None,
+                ERROR_CORRUPT,
+            )
+
+        phase = intent[INTENT_PHASE]
+        new_digest = intent[INTENT_NEW_DIGEST]
+        old_digest = intent[INTENT_OLD_DIGEST]
+        directory = os.path.dirname(os.path.abspath(path))
+        candidate = _read_bytes_or_none(
+            os.path.join(directory, intent[INTENT_CANDIDATE])
+        )
+        predecessor_name = intent[INTENT_PREDECESSOR]
+        predecessor = (
+            _read_bytes_or_none(os.path.join(directory, predecessor_name))
+            if predecessor_name is not None
+            else None
+        )
+    except OSError:
+        return _inspect_item(path, STATUS_FAILED, None, None, None, None, ERROR_OS_ERROR)
+
+    current_digest = _digest(current) if current is not None else None
+    artifacts = {
+        INTENT_CANDIDATE: {
+            "exists": candidate is not None,
+            "matches": (
+                _digest(candidate) == new_digest if candidate is not None else None
+            ),
+        },
+        INTENT_PREDECESSOR: (
+            None
+            if predecessor_name is None
+            else {
+                "exists": predecessor is not None,
+                "matches": (
+                    _digest(predecessor) == old_digest
+                    if predecessor is not None
+                    else None
+                ),
+            }
+        ),
+        COMPLETE: True,
+    }
+
+    # The same necessary-artifact and digest rules recover_ledger
+    # enforces, evaluated without settling anything.
+    corrupt = False
+    if phase == PHASE_PREPARED:
+        if old_digest is None:
+            if current is not None and current_digest != new_digest:
+                corrupt = True
+        elif current_digest != old_digest:
+            if current_digest is not None and current_digest != new_digest:
+                corrupt = True
+            elif predecessor is None or _digest(predecessor) != old_digest:
+                corrupt = True
+    else:
+        if current is None or current_digest != new_digest:
+            corrupt = True
+
+    action = ACTION_ROLLBACK if phase == PHASE_PREPARED else ACTION_COMPLETE
+    if corrupt:
+        artifacts[COMPLETE] = False
+        return _inspect_item(
+            path, STATUS_BLOCKED, phase, current_digest, artifacts, action,
+            ERROR_CORRUPT,
+        )
+    return _inspect_item(
+        path, STATUS_PENDING, phase, current_digest, artifacts, action, None
+    )
+
+
+def inspect_recovery(paths: list[str]) -> list[dict]:
+    """Read-only recovery diagnostics for an explicit list of ledgers.
+
+    ``paths`` must be a non-empty list of non-empty, distinct strings;
+    the whole list is validated before any file is read, so a
+    :class:`TypeError` (container or element type) or :class:`ValueError`
+    (empty list, empty path, duplicate path) guarantees nothing was
+    touched.  Only the listed ledgers, their intents and the artifacts
+    those intents reference are ever read -- random leftover artifacts
+    are never scanned -- and no file is created, modified or deleted.
+
+    The result is one fresh report dict per path, in the given order,
+    with the fixed key order ``path``, ``status``, ``phase``, ``digest``,
+    ``artifacts``, ``action``, ``error``.  ``digest`` is the lowercase
+    hex SHA-256 of the current ledger bytes, or ``None`` when the path
+    is missing.  Without an intent the status is ``clean`` and ``phase``,
+    ``artifacts``, ``action`` and ``error`` are all ``None``.  A valid
+    intent reports ``pending`` with its ``phase`` and the suggested
+    ``action`` (``rollback`` for ``prepared``, ``complete`` for
+    ``installed``); ``artifacts`` then tells for the candidate and the
+    predecessor whether each exists and matches its recorded digest and
+    whether every necessary artifact is complete.  An intent or a
+    necessary artifact that fails validation yields ``blocked`` with
+    error ``corrupt`` instead of raising, and an :class:`OSError` while
+    reading yields ``failed`` with error ``os-error``; either way the
+    remaining paths are still diagnosed.
+    """
+    return [_inspect_one(path) for path in _validated_path_list(paths)]
+
+
+def recover_many(paths: list[str]) -> list[dict]:
+    """Recover every ledger in an explicit path list, in order.
+
+    ``paths`` is validated exactly as in :func:`inspect_recovery` before
+    anything is read or modified.  Each path is then settled through
+    :func:`recover_ledger` in the given order; one ledger's failure never
+    stops the later ones, and ledgers already recovered are never rolled
+    back because a later one failed.
+
+    The result is one fresh report dict per path, in the given order,
+    with the fixed key order ``path``, ``status``, ``digest``, ``error``.
+    A successful recovery keeps the :func:`recover_ledger` status
+    (``clean``, ``rolled-back`` or ``completed``) and its digest, with
+    ``error`` ``None``.  A :class:`CorruptRecoveryError` becomes a
+    ``blocked`` item with error ``corrupt`` and an :class:`OSError` a
+    ``failed`` item with error ``os-error``; both carry a ``None``
+    digest, and the intent and artifacts the failing recovery left
+    behind stay in place, so re-running the call retries each failed
+    ledger independently.
+    """
+    items: list[dict] = []
+    for path in _validated_path_list(paths):
+        try:
+            result = recover_ledger(path)
+        except CorruptRecoveryError:
+            items.append(
+                {
+                    "path": path,
+                    STATUS: STATUS_BLOCKED,
+                    "digest": None,
+                    "error": ERROR_CORRUPT,
+                }
+            )
+        except OSError:
+            items.append(
+                {
+                    "path": path,
+                    STATUS: STATUS_FAILED,
+                    "digest": None,
+                    "error": ERROR_OS_ERROR,
+                }
+            )
+        else:
+            items.append(
+                {
+                    "path": path,
+                    STATUS: result[STATUS],
+                    "digest": result["digest"],
+                    "error": None,
+                }
+            )
+    return items
 
 
 def _atomic_write(path: str, payload: bytes) -> None:
