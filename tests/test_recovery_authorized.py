@@ -85,7 +85,7 @@ def make_ticket(
     signature = hmac.new(
         bytes.fromhex(secret), compact(payload), hashlib.sha256
     ).hexdigest()
-    return compact({"payload": payload, "signature": signature}) + b"\n"
+    return compact({"payload": payload, "signature": signature})
 
 
 def digest_of(data):
@@ -234,26 +234,27 @@ class TicketValidationTest(AuthorizedCase):
         }
         cases = []
         # Wrong top-level key set.
-        cases.append(compact({"payload": payload}) + b"\n")
+        cases.append(compact({"payload": payload}))
         # Wrong payload key set.
         bad_payload = dict(payload)
         del bad_payload["nonce"]
-        cases.append(compact({"payload": bad_payload, "signature": "0" * 64}) + b"\n")
+        cases.append(compact({"payload": bad_payload, "signature": "0" * 64}))
         # Empty nonce.
         bad_payload = dict(payload, nonce="")
-        cases.append(compact({"payload": bad_payload, "signature": "0" * 64}) + b"\n")
+        cases.append(compact({"payload": bad_payload, "signature": "0" * 64}))
         # Inverted interval.
         bad_payload = dict(payload, notBefore=5, notAfter=4)
-        cases.append(compact({"payload": bad_payload, "signature": "0" * 64}) + b"\n")
+        cases.append(compact({"payload": bad_payload, "signature": "0" * 64}))
         # Bad signature format.
-        cases.append(compact({"payload": payload, "signature": "zz"}) + b"\n")
+        cases.append(compact({"payload": payload, "signature": "zz"}))
         # Non-canonical encoding (whitespace).
-        cases.append(b'{"payload": ' + compact(payload) + b', "signature": "' + b"0" * 64 + b'"}\n')
-        # Missing trailing newline / double newline.
-        cases.append(good[:-1])
+        cases.append(b'{"payload": ' + compact(payload) + b', "signature": "' + b"0" * 64 + b'"}')
+        # Old-style trailing newline, trailing space, double newline.
         cases.append(good + b"\n")
+        cases.append(good + b" ")
+        cases.append(good + b"\n\n")
         # Not JSON.
-        cases.append(b"nope\n")
+        cases.append(b"nope")
         for bad in cases:
             with self.subTest(bad=bad[:40]):
                 with self.assertRaises(ValueError):
@@ -270,8 +271,8 @@ class TicketValidationTest(AuthorizedCase):
             "paths": [path],
         }
         cases = []
-        cases.append(compact({"payload": [1], "signature": "0" * 64}) + b"\n")
-        cases.append(compact([1, 2]) + b"\n")
+        cases.append(compact({"payload": [1], "signature": "0" * 64}))
+        cases.append(compact([1, 2]))
         for key, bad in (
             ("issuer", 1),
             ("keyVersion", True),
@@ -284,11 +285,11 @@ class TicketValidationTest(AuthorizedCase):
             bad_payload = dict(payload)
             bad_payload[key] = bad
             cases.append(
-                compact({"payload": bad_payload, "signature": "0" * 64}) + b"\n"
+                compact({"payload": bad_payload, "signature": "0" * 64})
             )
         bad_payload = dict(payload)
         cases.append(
-            compact({"payload": bad_payload, "signature": 7}) + b"\n"
+            compact({"payload": bad_payload, "signature": 7})
         )
         for bad in cases:
             with self.subTest(bad=bad[:60]):

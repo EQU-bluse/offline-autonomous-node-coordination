@@ -265,8 +265,8 @@ boundary and a durable operation audit around the same batch recovery.
 It takes the ledger path list, a keyring, a ticket, the current moment
 and the recovery audit path.  The ticket is one UTF-8 compact JSON
 object -- every object key recursively sorted lexicographically,
-non-ASCII preserved, exactly one trailing ``\\n`` -- carrying exactly
-``payload`` and ``signature``.  The payload holds exactly ``issuer``,
+non-ASCII preserved, no trailing newline or any other trailing byte --
+carrying exactly ``payload`` and ``signature``.  The payload holds exactly ``issuer``,
 ``keyVersion``, ``nonce``, ``notBefore``, ``notAfter`` and the ordered
 ``paths``; the signature is the lowercase hex HMAC-SHA256 of the
 canonical compact payload encoding, computed with the key the keyring
@@ -351,6 +351,34 @@ checkpoint faults raise :class:`InvalidRecoveryCheckpointError` and
 page or cursor faults raise :class:`InvalidRecoveryPageError`; both
 format errors subclass :class:`ValueError`.  No input or file is
 modified.
+
+:func:`verify_recovery_checkpoints` verifies a whole batch of
+checkpoints offline, in input order, and never reads a file.  Each
+item carries exactly a non-empty, batch-unique ``id``, the
+``checkpoint`` bytes and the ordered, non-empty ``pages`` exported
+for that checkpoint; the batch is validated in full before any item
+is verified, so a container, field or element type fault raises
+:class:`TypeError` and an empty list, an empty or duplicate id or an
+empty page list raises :class:`ValueError` without producing any
+result.  Every item is then verified in isolation from a zero cursor
+through the exact :func:`verify_recovery_page` paging rules, each
+round resuming from a cursor bound to the same checkpoint digest and
+the previous page's chain tail, and one item's failure never stops
+the later items.  Each checkpoint selects its key by its own exact
+issuer and version with no fallback, so checkpoints signed before
+and after a key rotation verify independently in the same batch as
+long as the keyring retains both versions.  An item that reaches the
+signed ``lastSeq`` must have no further pages; an item whose pages
+run out earlier is ``incomplete`` and keeps its verified boundary.
+Every item reports ``id``, the checkpoint ``digest``, the signed
+``issuer`` and ``keyVersion`` (both ``None`` when the checkpoint
+does not parse), the verified ``boundary`` (``None`` when nothing
+was verified), a ``status`` of ``verified``, ``incomplete``,
+``invalid-checkpoint``, ``invalid-page`` or ``unauthenticated`` and
+an ``error`` (``None`` exactly when the item verified).  The result
+is a fresh dict with the fixed key order ``items``, ``version``
+(the integer 1); only batch-level or keyring-level faults raise,
+never one item's verification failure.
 """
 
 from __future__ import annotations
@@ -3761,10 +3789,12 @@ def _parse_ticket(raw: bytes) -> tuple[dict, str]:
     :class:`TypeError`; key-set, nonce, validity-interval, encoding and
     signature-format faults raise :class:`ValueError`.
     """
-    if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
-        raise _ticket_invalid("must be a single JSON object ending in one LF")
+    # The ticket carries no terminator of any kind: no trailing newline
+    # and no other byte past the closing brace.
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _ticket_invalid("must end with the closing brace, no LF")
     try:
-        text = raw[:-1].decode("utf-8")
+        text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise _ticket_invalid("is not valid UTF-8") from exc
     try:
@@ -3822,8 +3852,8 @@ def _parse_ticket(raw: bytes) -> tuple[dict, str]:
     _validated_path_list(payload[TICKET_PATHS])
 
     # The bytes must be the single canonical compact encoding with
-    # recursively sorted keys and exactly one trailing newline.
-    if _proof_compact(data) + b"\n" != raw:
+    # recursively sorted keys and no trailing byte whatsoever.
+    if _proof_compact(data) != raw:
         raise _ticket_invalid("encoding is not the canonical compact form")
     return payload, signature
 
@@ -4954,4 +4984,246 @@ def verify_recovery_page(
         CP_LAST_SEQ: signed_last_seq,
         STATUS: _VERIFY_VERIFIED,
         CP_TAIL: current_tail,
+    }
+
+
+# --- Offline batch verification of signed recovery checkpoints ---------------
+
+CHECKPOINTS_VERSION = 1
+
+VERIFY_INCOMPLETE = "incomplete"
+VERIFY_INVALID_CHECKPOINT = "invalid-checkpoint"
+VERIFY_INVALID_PAGE = "invalid-page"
+VERIFY_UNAUTHENTICATED = "unauthenticated"
+
+CHECKPOINT_ITEM_CHECKPOINT = "checkpoint"
+CHECKPOINT_ITEM_PAGES = "pages"
+CHECKPOINT_ITEM_BOUNDARY = "boundary"
+CHECKPOINT_ITEM_ERROR = "error"
+
+_CHECKPOINT_ITEM_KEYS = frozenset((
+    CHECKPOINT_ITEM_CHECKPOINT,
+    ID,
+    CHECKPOINT_ITEM_PAGES,
+))
+
+
+def _validated_checkpoint_items(items: object) -> list[dict]:
+    """Validate the batch structure before any checkpoint is verified.
+
+    The argument must be a non-empty list of dicts each holding exactly
+    ``id`` (a non-empty str, unique across the batch), ``checkpoint``
+    (bytes) and ``pages`` (a non-empty list of page dicts).  Container,
+    field and element type faults raise :class:`TypeError`; an empty
+    list, an empty or duplicate id, a wrong key set or an empty page
+    list raises :class:`ValueError`.  Only a fully validated batch
+    comes back -- as fresh item dicts with a copied page list, so the
+    verification below never mutates the caller's objects.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _CHECKPOINT_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'checkpoint', "
+                "'id' and 'pages'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        checkpoint = item[CHECKPOINT_ITEM_CHECKPOINT]
+        if not isinstance(checkpoint, bytes):
+            raise TypeError(f"{where} checkpoint must be bytes")
+        pages = item[CHECKPOINT_ITEM_PAGES]
+        if not isinstance(pages, list):
+            raise TypeError(f"{where} pages must be a list")
+        if not pages:
+            raise ValueError(f"{where} pages must be a non-empty list")
+        for page in pages:
+            if not isinstance(page, dict):
+                raise TypeError(f"{where} pages elements must be dict")
+        validated.append(
+            {
+                ID: item_id,
+                CHECKPOINT_ITEM_CHECKPOINT: checkpoint,
+                CHECKPOINT_ITEM_PAGES: list(pages),
+            }
+        )
+    return validated
+
+
+def _checkpoint_item_result(
+    item_id: str,
+    digest: str,
+    issuer: str | None,
+    key_version: int | None,
+    boundary: dict | None,
+    status: str,
+    error: str | None,
+) -> dict:
+    """One batch report entry with the fixed key order."""
+    return {
+        ID: item_id,
+        CP_DIGEST: digest,
+        CP_ISSUER: issuer,
+        CP_KEY_VERSION: key_version,
+        CHECKPOINT_ITEM_BOUNDARY: boundary,
+        STATUS: status,
+        CHECKPOINT_ITEM_ERROR: error,
+    }
+
+
+def _verify_checkpoint_item(
+    item: dict, keyring: dict[str, list[dict]], moment: int
+) -> dict:
+    """Verify one batch item in isolation and report its outcome.
+
+    The checkpoint is parsed and authenticated against the current
+    keyring (exact issuer and version, usable at ``moment``, no
+    fallback); the pages are then walked from a zero cursor through
+    the exact :func:`verify_recovery_page` rules, each round resuming
+    from a cursor bound to this checkpoint's digest and the previous
+    page's chain tail.  No file is ever read and no input is modified.
+    """
+    item_id = item[ID]
+    checkpoint = item[CHECKPOINT_ITEM_CHECKPOINT]
+    digest = hashlib.sha256(checkpoint).hexdigest()
+    try:
+        payload, signature = _parse_checkpoint(checkpoint)
+    except (InvalidRecoveryCheckpointError, TypeError) as exc:
+        return _checkpoint_item_result(
+            item_id, digest, None, None, None,
+            VERIFY_INVALID_CHECKPOINT, str(exc),
+        )
+    issuer = payload[CP_ISSUER]
+    key_version = payload[CP_KEY_VERSION]
+    try:
+        entry = _usable_checkpoint_key(keyring, issuer, key_version, moment)
+        expected_signature = hmac.new(
+            bytes.fromhex(entry[SECRET]),
+            _checkpoint_payload_bytes(payload),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(expected_signature, signature):
+            raise AuthenticationError("checkpoint signature does not match")
+    except AuthenticationError as exc:
+        return _checkpoint_item_result(
+            item_id, digest, issuer, key_version, None,
+            VERIFY_UNAUTHENTICATED, str(exc),
+        )
+
+    boundary: dict | None = None
+    cursor: dict | None = None
+    pages = item[CHECKPOINT_ITEM_PAGES]
+    last_index = len(pages) - 1
+    for index, page in enumerate(pages):
+        try:
+            result = verify_recovery_page(
+                checkpoint, page, keyring, moment, cursor
+            )
+        except (InvalidRecoveryPageError, TypeError) as exc:
+            return _checkpoint_item_result(
+                item_id, digest, issuer, key_version, boundary,
+                VERIFY_INVALID_PAGE, str(exc),
+            )
+        boundary = {
+            CP_LAST_SEQ: result[CP_LAST_SEQ],
+            CP_TAIL: result[CP_TAIL],
+        }
+        if result[STATUS] == _VERIFY_VERIFIED:
+            if index != last_index:
+                # The signed tail is final: no page may follow it.
+                return _checkpoint_item_result(
+                    item_id, digest, issuer, key_version, boundary,
+                    VERIFY_INVALID_PAGE,
+                    "pages continue past the signed lastSeq",
+                )
+            return _checkpoint_item_result(
+                item_id, digest, issuer, key_version, boundary,
+                _VERIFY_VERIFIED, None,
+            )
+        cursor = {
+            CP_DIGEST: result[CP_DIGEST],
+            NEXT: result[CP_LAST_SEQ],
+            CP_TAIL: result[CP_TAIL],
+        }
+    # The pages ran out before the signed chain tail was reached.
+    return _checkpoint_item_result(
+        item_id, digest, issuer, key_version, boundary,
+        VERIFY_INCOMPLETE,
+        "pages exhausted before the signed lastSeq",
+    )
+
+
+def verify_recovery_checkpoints(
+    items: list, keyring: dict, moment: int
+) -> dict:
+    """Verify a batch of signed recovery checkpoints, entirely offline.
+
+    ``items`` is a non-empty list of batch items, each a dict with
+    exactly the keys ``id`` (a non-empty str, unique across the batch),
+    ``checkpoint`` (the checkpoint bytes produced by
+    :func:`export_recovery_checkpoint`) and ``pages`` (a non-empty list
+    of page dicts as exported by :func:`export_recovery_audit`, in
+    export order, covering one chain prefix).  ``keyring`` follows the
+    :func:`apply_signed_remote` rules and ``moment`` is the current
+    time as a non-negative integer.  No file is ever read and no input
+    is modified.
+
+    The whole batch structure is validated before any item is
+    verified: container, field or element type faults raise
+    :class:`TypeError` (a :class:`bool` never poses as an int) and an
+    empty list, an empty or duplicate id, a wrong item key set or an
+    empty page list raises :class:`ValueError`; keyring and ``moment``
+    faults follow the :func:`verify_recovery_page` classification.
+    Only these batch-level faults raise -- one item's verification
+    failure never stops or rolls back the other items.
+
+    Each item is then verified in isolation, in input order: its
+    checkpoint is parsed and authenticated against the current keyring
+    with the key bound to the checkpoint's own exact issuer and
+    version (no fallback, so checkpoints signed before and after a key
+    rotation verify independently in the same batch), and its pages
+    are walked from a zero cursor through the exact
+    :func:`verify_recovery_page` paging rules, every cursor bound to
+    the same checkpoint digest and the previous page's chain tail.
+    Reaching the signed ``lastSeq`` ends the walk -- further pages are
+    a page fault -- and pages that run out earlier leave the item
+    ``incomplete`` with its verified boundary kept.
+
+    The result is a fresh dict with the fixed key order ``items``,
+    ``version`` (the integer 1).  Every item reports, in this key
+    order, ``id``, the checkpoint ``digest`` (the lowercase hex
+    SHA-256 of the checkpoint bytes), the signed ``issuer`` and
+    ``keyVersion`` (both ``None`` when the checkpoint does not parse),
+    the verified ``boundary`` ``{"lastSeq", "tail"}`` (``None`` when
+    nothing was verified), a ``status`` of ``verified``,
+    ``incomplete``, ``invalid-checkpoint``, ``invalid-page`` or
+    ``unauthenticated`` and an ``error`` message (``None`` exactly
+    when the item verified).
+    """
+    validated_items = _validated_checkpoint_items(items)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+    return {
+        ITEMS: [
+            _verify_checkpoint_item(item, validated_keyring, moment)
+            for item in validated_items
+        ],
+        VERSION: CHECKPOINTS_VERSION,
     }
