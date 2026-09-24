@@ -1,12 +1,13 @@
 import json
+import hashlib
 import os
 import tempfile
 import unittest
 from unittest import mock
 
-from offline_coordination import audit
+from offline_coordination import audit, storage
 from offline_coordination.audit import CorruptAuditError, append
-from offline_coordination.replication import export_batch, import_batch
+from offline_coordination.replication import export_batch, import_batch, apply_remote
 
 KEYS = ("detail", "hash", "kind", "prev", "seq", "source")
 TOP_KEYS = ("after", "complete", "next", "records", "version")
@@ -617,6 +618,674 @@ class ImportBatchValidationTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 import_batch(self.path, b"garbage\n")
         patched.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# apply_remote
+# ---------------------------------------------------------------------------
+
+APPLY_RESULT_KEYS = ("items", "receipt", "status")
+APPLY_ITEM_KEYS = ("key", "decision", "need")
+RECEIPT_KEYS = ("after", "before", "id", "seq", "source")
+LEDGER_KEYS = ("audit", "requests", "state", "version")
+
+
+def mstate(clock=None, records=None):
+    return {"clock": dict(clock or {}), "records": dict(records or {})}
+
+
+def mrecord(value, deleted, clock, writer):
+    return [value, deleted, dict(clock), writer]
+
+
+def areq(request_id="r1", source="node-a", base=None, remote=None):
+    return {
+        "id": request_id,
+        "source": source,
+        "base": mstate() if base is None else base,
+        "remote": mstate() if remote is None else remote,
+    }
+
+
+def ledger_bytes(state, requests, audit_entries):
+    ledger = {
+        "audit": audit_entries,
+        "requests": requests,
+        "state": state,
+        "version": 1,
+    }
+    return canonical(ledger) + b"\n"
+
+
+def state_digest_of(state):
+    clock, records = state["clock"], state["records"]
+    return hashlib.sha256(storage._serialize(clock, records)).hexdigest()
+
+
+def request_digest_of(request):
+    summary = {
+        "base": request["base"],
+        "id": request["id"],
+        "remote": request["remote"],
+        "source": request["source"],
+    }
+    return hashlib.sha256(canonical(summary)).hexdigest()
+
+
+class ApplyRemoteSuccessTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+
+    def read_ledger(self):
+        with open(self.path, "rb") as handle:
+            return json.loads(handle.read())
+
+    def test_applies_missing_key_and_creates_canonical_ledger(self) -> None:
+        base = mstate()
+        remote = mstate({"a": 1}, {"k": mrecord("v", False, {"a": 1}, "a")})
+        result = apply_remote(self.path, areq(base=base, remote=remote))
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(tuple(result.keys()), APPLY_RESULT_KEYS)
+        self.assertEqual(
+            result["items"],
+            [{"key": "k", "decision": "apply", "need": {}}],
+        )
+        self.assertEqual(tuple(result["items"][0].keys()), APPLY_ITEM_KEYS)
+
+        raw = open(self.path, "rb").read()
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertFalse(raw.endswith(b"\n\n"))
+        ledger = json.loads(raw)
+        self.assertEqual(tuple(ledger.keys()), LEDGER_KEYS)
+        self.assertEqual(
+            raw,
+            json.dumps(ledger, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")).encode("utf-8") + b"\n",
+        )
+        self.assertEqual(ledger["version"], 1)
+        self.assertEqual(ledger["state"], remote)
+        self.assertEqual(set(ledger["requests"]), {"r1"})
+        self.assertEqual(len(ledger["audit"]), 1)
+
+    def test_receipt_is_the_audit_entry(self) -> None:
+        base = mstate()
+        remote = mstate({"a": 1}, {"k": mrecord("v", False, {"a": 1}, "a")})
+        result = apply_remote(self.path, areq(base=base, remote=remote))
+        receipt = result["receipt"]
+        self.assertEqual(tuple(receipt.keys()), RECEIPT_KEYS)
+        self.assertEqual(receipt["id"], "r1")
+        self.assertEqual(receipt["source"], "node-a")
+        self.assertEqual(receipt["seq"], 1)
+        self.assertEqual(receipt["before"], state_digest_of(base))
+        self.assertEqual(receipt["after"], state_digest_of(remote))
+        self.assertEqual(self.read_ledger()["audit"][0], receipt)
+
+    def test_audit_seq_increments_and_chains_state_digests(self) -> None:
+        s0 = mstate()
+        r1 = mstate({"a": 1}, {"k1": mrecord("v1", False, {"a": 1}, "a")})
+        first = apply_remote(self.path, areq("r1", "node-a", s0, r1))
+        self.assertEqual(first["receipt"]["seq"], 1)
+        r2 = mstate({"a": 2}, {
+            "k1": mrecord("v1", False, {"a": 1}, "a"),
+            "k2": mrecord("v2", False, {"a": 2}, "a"),
+        })
+        second = apply_remote(self.path, areq("r2", "node-b", r1, r2))
+        self.assertEqual(second["status"], "applied")
+        self.assertEqual(second["receipt"]["seq"], 2)
+        self.assertEqual(second["receipt"]["before"], first["receipt"]["after"])
+        self.assertEqual(second["receipt"]["after"], state_digest_of(r2))
+        entries = self.read_ledger()["audit"]
+        self.assertEqual([e["seq"] for e in entries], [1, 2])
+        self.assertEqual([e["id"] for e in entries], ["r1", "r2"])
+        self.assertEqual([e["source"] for e in entries], ["node-a", "node-b"])
+
+    def test_apply_and_duplicate_mix_commits(self) -> None:
+        base = mstate({"a": 4, "b": 3}, {
+            "keep": mrecord("z", False, {"a": 1}, "a"),
+        })
+        remote = mstate({"a": 5, "b": 3}, {
+            "keep": mrecord("z", False, {"a": 1}, "a"),
+            "new": mrecord("n", False, {"a": 5, "b": 3}, "a"),
+        })
+        result = apply_remote(self.path, areq(base=base, remote=remote))
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(
+            [(i["key"], i["decision"]) for i in result["items"]],
+            [("keep", "duplicate"), ("new", "apply")],
+        )
+        state = self.read_ledger()["state"]
+        self.assertEqual(state["clock"], {"a": 5, "b": 3})
+
+    def test_clock_promoted_from_applied_record_clocks(self) -> None:
+        # The writer component may run exactly one past the local outer
+        # clock (the prerequisite decrements it by one); other nodes stay.
+        base = mstate({"a": 2, "b": 4}, {})
+        remote = mstate({"a": 3, "b": 4}, {
+            "one": mrecord("1", False, {"a": 3, "b": 4}, "a"),
+            "two": mrecord("2", False, {"a": 3}, "a"),
+        })
+        result = apply_remote(self.path, areq(base=base, remote=remote))
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(self.read_ledger()["state"]["clock"], {"a": 3, "b": 4})
+
+    def test_deleted_record_applies_with_empty_value(self) -> None:
+        base = mstate({"a": 1}, {"k": mrecord("v", False, {"a": 1}, "a")})
+        remote = mstate({"a": 2}, {"k": mrecord("", True, {"a": 2}, "a")})
+        result = apply_remote(self.path, areq(base=base, remote=remote))
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(
+            self.read_ledger()["state"]["records"]["k"],
+            ["", True, {"a": 2}, "a"],
+        )
+
+    def test_items_sorted_by_key(self) -> None:
+        remote = mstate({"a": 3}, {
+            "zeta": mrecord("1", False, {"a": 1}, "a"),
+            "alpha": mrecord("2", False, {"a": 2}, "a"),
+            "mid": mrecord("3", False, {"a": 3}, "a"),
+        })
+        result = apply_remote(self.path, areq(remote=remote))
+        self.assertEqual([i["key"] for i in result["items"]],
+                         ["alpha", "mid", "zeta"])
+
+    def test_unicode_preserved_un_escaped(self) -> None:
+        remote = mstate({"a": 1}, {"k": mrecord("雪 ☃", False, {"a": 1}, "a")})
+        apply_remote(self.path, areq(remote=remote))
+        self.assertIn("雪 ☃".encode("utf-8"), open(self.path, "rb").read())
+
+
+class ApplyRemoteReplayTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+        self.base = mstate()
+        self.remote = mstate({"a": 1}, {"k": mrecord("v", False, {"a": 1}, "a")})
+        self.request = areq(base=self.base, remote=self.remote)
+        apply_remote(self.path, self.request)
+
+    def bytes(self):
+        with open(self.path, "rb") as handle:
+            return handle.read()
+
+    def test_same_request_is_duplicate_with_unchanged_bytes(self) -> None:
+        before = self.bytes()
+        result = apply_remote(self.path, self.request)
+        self.assertEqual(result["status"], "duplicate")
+        self.assertEqual(result["receipt"], None)
+        self.assertEqual(
+            result["items"],
+            [{"key": "k", "decision": "duplicate", "need": {}}],
+        )
+        self.assertEqual(self.bytes(), before)
+
+    def test_semantically_equal_request_is_duplicate(self) -> None:
+        # A fresh object with identical content binds the same digest.
+        replay = {
+            "id": "r1",
+            "source": "node-a",
+            "base": mstate(),
+            "remote": mstate({"a": 1}, {"k": mrecord("v", False, {"a": 1}, "a")}),
+        }
+        before = self.bytes()
+        result = apply_remote(self.path, replay)
+        self.assertEqual(result["status"], "duplicate")
+        self.assertEqual(self.bytes(), before)
+
+    def test_same_id_different_request_raises_and_keeps_bytes(self) -> None:
+        changed = dict(self.request, remote=mstate(
+            {"a": 1}, {"k": mrecord("other", False, {"a": 1}, "a")}
+        ))
+        before = self.bytes()
+        with self.assertRaises(ValueError):
+            apply_remote(self.path, changed)
+        self.assertEqual(self.bytes(), before)
+
+    def test_replay_succeeds_even_when_state_no_longer_equals_base(self) -> None:
+        # The duplicate gate precedes the stale gate.
+        other = mstate({"a": 2}, {
+            "k": mrecord("v", False, {"a": 1}, "a"),
+            "k2": mrecord("w", False, {"a": 2}, "a"),
+        })
+        apply_remote(self.path, areq("r2", "node-a", self.remote, other))
+        result = apply_remote(self.path, self.request)
+        self.assertEqual(result["status"], "duplicate")
+
+
+class ApplyRemoteRejectionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+        self.remote = mstate({"a": 1}, {"k": mrecord("v", False, {"a": 1}, "a")})
+
+    def assert_no_file_written(self):
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_stale_when_current_differs_from_base(self) -> None:
+        first_remote = mstate({"b": 1}, {"x": mrecord("1", False, {"b": 1}, "b")})
+        apply_remote(self.path, areq("first", "node-b", mstate(), first_remote))
+        stale = areq("second", "node-c", mstate(), self.remote)
+        before = open(self.path, "rb").read()
+        result = apply_remote(self.path, stale)
+        self.assertEqual(result["status"], "stale")
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["receipt"], None)
+        self.assertEqual(open(self.path, "rb").read(), before)
+
+    def test_missing_reports_need_intervals_without_writing(self) -> None:
+        base = mstate({"a": 1})
+        remote = mstate({"a": 1, "b": 3}, {
+            "k": mrecord("v", False, {"a": 1, "b": 3}, "b"),
+        })
+        result = apply_remote(self.path, areq(base=base, remote=remote))
+        self.assertEqual(result["status"], "missing")
+        self.assertEqual(result["receipt"], None)
+        self.assertEqual(result["items"][0]["decision"], "missing")
+        # writer b component decremented: prerequisite b=2; local b=0.
+        self.assertEqual(result["items"][0]["need"], {"b": [1, 2]})
+        self.assert_no_file_written()
+
+    def test_missing_need_zero_when_prerequisite_met(self) -> None:
+        base = mstate({"a": 2})
+        remote = mstate({"a": 3}, {"k": mrecord("v", False, {"a": 3}, "a")})
+        result = apply_remote(self.path, areq(base=base, remote=remote))
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["items"][0]["need"], {})
+
+    def test_conflict_concurrent_records_not_written(self) -> None:
+        base = mstate({"a": 1, "b": 1}, {
+            "k": mrecord("local", False, {"a": 1}, "a"),
+        })
+        remote = mstate({"a": 1, "b": 1}, {
+            "k": mrecord("remote", False, {"b": 1}, "b"),
+        })
+        result = apply_remote(self.path, areq(base=base, remote=remote))
+        self.assertEqual(result["status"], "conflict")
+        self.assertEqual(result["items"][0]["decision"], "conflict")
+        self.assertEqual(result["items"][0]["need"], {})
+        self.assert_no_file_written()
+
+    def test_stale_item_when_local_dominates_remote(self) -> None:
+        base = mstate({"a": 2}, {"k": mrecord("new", False, {"a": 2}, "a")})
+        remote = mstate({"a": 2}, {"k": mrecord("old", False, {"a": 1}, "a")})
+        result = apply_remote(self.path, areq(base=base, remote=remote))
+        self.assertEqual(result["status"], "stale")
+        self.assertEqual(result["items"][0]["decision"], "stale")
+        self.assert_no_file_written()
+
+    def test_all_equal_records_is_overall_duplicate(self) -> None:
+        base = mstate({"a": 1}, {"k": mrecord("v", False, {"a": 1}, "a")})
+        result = apply_remote(self.path, areq(base=base, remote=base))
+        self.assertEqual(result["status"], "duplicate")
+        self.assertEqual(result["items"][0]["decision"], "duplicate")
+        self.assertEqual(result["receipt"], None)
+        self.assert_no_file_written()
+
+    def test_empty_remote_with_equal_state_is_duplicate(self) -> None:
+        result = apply_remote(self.path, areq(remote=mstate()))
+        self.assertEqual(result["status"], "duplicate")
+        self.assertEqual(result["items"], [])
+        self.assert_no_file_written()
+
+    def test_overall_precedence_missing_beats_conflict(self) -> None:
+        base = mstate({"a": 1, "b": 1}, {
+            "c": mrecord("local", False, {"a": 1}, "a"),
+        })
+        remote = mstate({"a": 1, "b": 1, "d": 3}, {
+            "c": mrecord("remote", False, {"b": 1}, "b"),       # conflict
+            "m": mrecord("v", False, {"d": 3}, "d"),           # missing
+        })
+        result = apply_remote(self.path, areq(base=base, remote=remote))
+        self.assertEqual(result["status"], "missing")
+        decisions = {i["key"]: i["decision"] for i in result["items"]}
+        self.assertEqual(decisions["c"], "conflict")
+        self.assertEqual(decisions["m"], "missing")
+        self.assert_no_file_written()
+
+    def test_overall_precedence_conflict_beats_stale(self) -> None:
+        base = mstate({"a": 2, "b": 1}, {
+            "old": mrecord("new", False, {"a": 2}, "a"),
+            "con": mrecord("local", False, {"a": 1}, "a"),
+        })
+        remote = mstate({"a": 2, "b": 1}, {
+            "old": mrecord("x", False, {"a": 1}, "a"),          # stale
+            "con": mrecord("remote", False, {"b": 1}, "b"),     # conflict
+        })
+        result = apply_remote(self.path, areq(base=base, remote=remote))
+        self.assertEqual(result["status"], "conflict")
+        self.assert_no_file_written()
+
+    def test_stale_item_beats_duplicate(self) -> None:
+        base = mstate({"a": 2}, {
+            "old": mrecord("new", False, {"a": 2}, "a"),
+            "dup": mrecord("d", False, {"a": 1}, "a"),
+        })
+        remote = mstate({"a": 2}, {
+            "old": mrecord("x", False, {"a": 1}, "a"),
+            "dup": mrecord("d", False, {"a": 1}, "a"),
+        })
+        result = apply_remote(self.path, areq(base=base, remote=remote))
+        self.assertEqual(result["status"], "stale")
+
+    def test_apply_alongside_stale_does_not_commit(self) -> None:
+        base = mstate({"a": 2}, {
+            "old": mrecord("new", False, {"a": 2}, "a"),
+        })
+        remote = mstate({"a": 2}, {
+            "old": mrecord("x", False, {"a": 1}, "a"),          # stale
+            "fresh": mrecord("f", False, {"a": 2}, "a"),        # apply
+        })
+        result = apply_remote(self.path, areq(base=base, remote=remote))
+        self.assertEqual(result["status"], "stale")
+        self.assert_no_file_written()
+
+
+class ApplyRemoteLedgerValidationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+        self.good_state = mstate({"a": 1}, {"k": mrecord("v", False, {"a": 1}, "a")})
+
+    def write_ledger(self, state, requests=None, audit_entries=None,
+                     payload=None):
+        if payload is None:
+            entry = {
+                "after": state_digest_of(state),
+                "before": state_digest_of(mstate()),
+                "id": "r0",
+                "seq": 1,
+                "source": "node-a",
+            }
+            audit_entries = [entry] if audit_entries is None else audit_entries
+            requests = {"r0": "0" * 64} if requests is None else requests
+            payload = ledger_bytes(state, requests, audit_entries)
+        with open(self.path, "wb") as handle:
+            handle.write(payload)
+
+    def valid_request(self):
+        return areq(base=self.good_state, remote=mstate(
+            {"a": 2}, {"k": mrecord("v2", False, {"a": 2}, "a")}
+        ))
+
+    def test_non_json_ledger_raises_value_error(self) -> None:
+        self.write_ledger(None, payload=b"garbage\n")
+        with self.assertRaises(ValueError):
+            apply_remote(self.path, self.valid_request())
+
+    def test_missing_trailing_newline_raises_value_error(self) -> None:
+        good = ledger_bytes(self.good_state, {"r0": "0" * 64}, [{
+            "after": state_digest_of(self.good_state),
+            "before": state_digest_of(mstate()),
+            "id": "r0", "seq": 1, "source": "node-a",
+        }])
+        self.write_ledger(None, payload=good[:-1])
+        with self.assertRaises(ValueError):
+            apply_remote(self.path, self.valid_request())
+
+    def test_bad_top_level_keys_raise_value_error(self) -> None:
+        self.write_ledger(None, payload=b'{"version":1}\n')
+        with self.assertRaises(ValueError):
+            apply_remote(self.path, self.valid_request())
+
+    def test_bad_version_raises_value_error(self) -> None:
+        payload = ledger_bytes(self.good_state, {}, [])
+        data = json.loads(payload)
+        data["version"] = 2
+        self.write_ledger(None, payload=canonical(data) + b"\n")
+        with self.assertRaises(ValueError):
+            apply_remote(self.path, self.valid_request())
+
+    def test_corrupt_state_raises_value_error(self) -> None:
+        payload = ledger_bytes(self.good_state, {}, [])
+        data = json.loads(payload)
+        data["state"] = {"clock": {"a": -1}, "records": {}}
+        self.write_ledger(None, payload=canonical(data) + b"\n")
+        with self.assertRaises(ValueError):
+            apply_remote(self.path, self.valid_request())
+
+    def test_state_shape_error_is_value_error_not_type_error(self) -> None:
+        payload = ledger_bytes(self.good_state, {}, [])
+        data = json.loads(payload)
+        data["state"] = {"clock": [], "records": {}}
+        self.write_ledger(None, payload=canonical(data) + b"\n")
+        with self.assertRaises(ValueError):
+            apply_remote(self.path, self.valid_request())
+
+    def test_bool_clock_count_raises_value_error(self) -> None:
+        payload = ledger_bytes(self.good_state, {}, [])
+        data = json.loads(payload)
+        data["state"] = {"clock": {"a": True}, "records": {}}
+        self.write_ledger(None, payload=canonical(data) + b"\n")
+        with self.assertRaises(ValueError):
+            apply_remote(self.path, self.valid_request())
+
+    def test_non_canonical_encoding_raises_value_error(self) -> None:
+        payload = ledger_bytes(self.good_state, {}, [])
+        data = json.loads(payload)
+        self.write_ledger(
+            None,
+            payload=json.dumps(data, sort_keys=True, indent=1).encode("utf-8")
+            + b"\n",
+        )
+        with self.assertRaises(ValueError):
+            apply_remote(self.path, self.valid_request())
+
+    def test_bound_request_without_audit_entry_raises(self) -> None:
+        self.write_ledger(self.good_state, requests={"ghost": "0" * 64},
+                          audit_entries=[])
+        with self.assertRaises(ValueError):
+            apply_remote(self.path, self.valid_request())
+
+    def test_audit_entry_without_bound_request_raises(self) -> None:
+        entry = {
+            "after": state_digest_of(self.good_state),
+            "before": state_digest_of(mstate()),
+            "id": "ghost", "seq": 1, "source": "node-a",
+        }
+        self.write_ledger(self.good_state, requests={}, audit_entries=[entry])
+        with self.assertRaises(ValueError):
+            apply_remote(self.path, self.valid_request())
+
+    def test_duplicate_audit_id_raises(self) -> None:
+        e1 = {
+            "after": state_digest_of(self.good_state),
+            "before": state_digest_of(mstate()),
+            "id": "r0", "seq": 1, "source": "node-a",
+        }
+        e2 = dict(e1, seq=2)
+        self.write_ledger(self.good_state, requests={"r0": "0" * 64},
+                          audit_entries=[e1, e2])
+        with self.assertRaises(ValueError):
+            apply_remote(self.path, self.valid_request())
+
+    def test_gap_in_audit_seq_raises(self) -> None:
+        entry = {
+            "after": state_digest_of(self.good_state),
+            "before": state_digest_of(mstate()),
+            "id": "r0", "seq": 2, "source": "node-a",
+        }
+        self.write_ledger(self.good_state, requests={"r0": "0" * 64},
+                          audit_entries=[entry])
+        with self.assertRaises(ValueError):
+            apply_remote(self.path, self.valid_request())
+
+    def test_corrupt_ledger_never_written(self) -> None:
+        self.write_ledger(None, payload=b"garbage\n")
+        before = open(self.path, "rb").read()
+        with self.assertRaises(ValueError):
+            apply_remote(self.path, self.valid_request())
+        self.assertEqual(open(self.path, "rb").read(), before)
+
+
+class ApplyRemoteRequestValidationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+
+    def invoke(self, request):
+        return apply_remote(self.path, request)
+
+    def test_path_must_be_str(self) -> None:
+        with self.assertRaises(TypeError):
+            apply_remote(1, areq())
+
+    def test_request_must_be_dict(self) -> None:
+        with self.assertRaises(TypeError):
+            self.invoke([])
+        with self.assertRaises(TypeError):
+            self.invoke(None)
+
+    def test_request_key_set(self) -> None:
+        request = areq()
+        for key in ("id", "source", "base", "remote"):
+            missing = dict(request)
+            del missing[key]
+            with self.assertRaises(ValueError):
+                self.invoke(missing)
+        extra = dict(request, extra="x")
+        with self.assertRaises(ValueError):
+            self.invoke(extra)
+
+    def test_id_and_source_types(self) -> None:
+        with self.assertRaises(TypeError):
+            self.invoke(areq(request_id=1))
+        with self.assertRaises(TypeError):
+            self.invoke(areq(source=7))
+
+    def test_id_and_source_non_empty(self) -> None:
+        with self.assertRaises(ValueError):
+            self.invoke(areq(request_id=""))
+        with self.assertRaises(ValueError):
+            self.invoke(areq(source=""))
+
+    def test_base_and_remote_must_be_states(self) -> None:
+        with self.assertRaises((TypeError, ValueError)):
+            self.invoke(areq(base=[]))
+        with self.assertRaises((TypeError, ValueError)):
+            self.invoke(areq(remote={"clock": None, "records": {}}))
+        with self.assertRaises(ValueError):
+            self.invoke(areq(remote=mstate({"a": -1})))
+
+    def test_clock_count_must_be_int_not_bool(self) -> None:
+        with self.assertRaises(TypeError):
+            self.invoke(areq(remote=mstate({"a": True})))
+        with self.assertRaises(TypeError):
+            self.invoke(areq(remote=mstate({"a": 1.0})))
+
+    def test_deleted_value_must_be_empty(self) -> None:
+        bad = mstate({"a": 1}, {"k": ["v", True, {"a": 1}, "a"]})
+        with self.assertRaises(ValueError):
+            self.invoke(areq(remote=bad))
+
+    def test_record_clock_must_contain_writer(self) -> None:
+        bad = mstate({"a": 1}, {"k": ["v", False, {"a": 1}, "b"]})
+        with self.assertRaises(ValueError):
+            self.invoke(areq(remote=bad))
+
+    def test_record_clock_bounded_by_outer_clock(self) -> None:
+        bad = mstate({"a": 1}, {"k": ["v", False, {"a": 2}, "a"]})
+        with self.assertRaises(ValueError):
+            self.invoke(areq(remote=bad))
+
+    def test_invalid_request_never_touches_filesystem(self) -> None:
+        with self.assertRaises(TypeError):
+            apply_remote(self.path, areq(request_id=1))
+        with self.assertRaises(ValueError):
+            apply_remote(self.path, areq(request_id=""))
+        self.assertFalse(os.path.exists(self.path))
+
+
+class ApplyRemoteAtomicityTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+        apply_remote(self.path, areq(
+            "r1", "node-a", mstate(),
+            mstate({"a": 1}, {"k1": mrecord("v1", False, {"a": 1}, "a")}),
+        ))
+
+    def bytes(self):
+        with open(self.path, "rb") as handle:
+            return handle.read()
+
+    def next_request(self):
+        state = mstate({"a": 1}, {"k1": mrecord("v1", False, {"a": 1}, "a")})
+        return areq("r2", "node-a", state,
+                    mstate({"a": 2}, {
+                        "k1": mrecord("v1", False, {"a": 1}, "a"),
+                        "k2": mrecord("v2", False, {"a": 2}, "a"),
+                    }))
+
+    def test_fsync_failure_preserves_existing_bytes(self) -> None:
+        before = self.bytes()
+        with mock.patch("os.fsync", side_effect=OSError("disk gone")):
+            with self.assertRaises(OSError):
+                apply_remote(self.path, self.next_request())
+        self.assertEqual(self.bytes(), before)
+
+    def test_replace_failure_preserves_existing_bytes(self) -> None:
+        before = self.bytes()
+        with mock.patch("os.replace", side_effect=OSError("denied")):
+            with self.assertRaises(OSError):
+                apply_remote(self.path, self.next_request())
+        self.assertEqual(self.bytes(), before)
+        self.assertFalse(os.path.exists(self.path + ".tmp"))
+
+    def test_write_failure_keeps_bytes_for_new_ledger(self) -> None:
+        fresh = os.path.join(self.dir, "fresh.json")
+        real_open = open
+
+        def opening(path, *args, **kwargs):
+            if "w" in (args[0] if args else kwargs.get("mode", "r")):
+                raise OSError("write failed")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=opening):
+            with self.assertRaises(OSError):
+                apply_remote(fresh, areq(remote=mstate(
+                    {"a": 1}, {"k": mrecord("v", False, {"a": 1}, "a")}
+                )))
+        self.assertFalse(os.path.exists(fresh))
+
+    def test_oserror_propagates_unchanged_from_ledger_read(self) -> None:
+        with mock.patch("builtins.open", side_effect=PermissionError("nope")):
+            with self.assertRaises(PermissionError):
+                apply_remote(self.path, self.next_request())
+
+    def test_fsync_failure_keeps_new_ledger_missing(self) -> None:
+        fresh = os.path.join(self.dir, "fresh.json")
+        with mock.patch("os.fsync", side_effect=OSError("disk gone")):
+            with self.assertRaises(OSError):
+                apply_remote(fresh, areq(remote=mstate(
+                    {"a": 1}, {"k": mrecord("v", False, {"a": 1}, "a")}
+                )))
+        # The main ledger is never created; an orphaned .tmp is never read.
+        self.assertFalse(os.path.exists(fresh))
+
+
+class ApplyRemoteInputImmutabilityTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "ledger.json")
+
+    def test_apply_does_not_mutate_request(self) -> None:
+        request = areq(remote=mstate(
+            {"a": 1}, {"k": mrecord("v", False, {"a": 1}, "a")}
+        ))
+        snapshot = json.dumps(request, sort_keys=True)
+        apply_remote(self.path, request)
+        self.assertEqual(json.dumps(request, sort_keys=True), snapshot)
+
+    def test_rejected_request_not_mutated(self) -> None:
+        base = mstate({"a": 1}, {"k": mrecord("v", False, {"a": 1}, "a")})
+        remote = mstate({"a": 1, "b": 1}, {
+            "k": mrecord("w", False, {"b": 1}, "b"),
+        })
+        request = areq(base=base, remote=remote)
+        snapshot = json.dumps(request, sort_keys=True)
+        result = apply_remote(self.path, request)
+        self.assertEqual(result["status"], "conflict")
+        self.assertEqual(json.dumps(request, sort_keys=True), snapshot)
 
 
 if __name__ == "__main__":
