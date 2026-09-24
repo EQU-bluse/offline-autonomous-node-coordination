@@ -66,6 +66,41 @@ write, flush, file sync, replacement and directory sync all lie inside
 its boundary, and an :class:`OSError` at any stage propagates unchanged
 with the file system restored to its pre-call state.
 
+Each commit is additionally backed by a *recovery intent* so a crash of
+the committing process itself can be reconciled later, across processes.
+Before anything is replaced, the commit publishes an intent at ``path +
+".txn"``: one UTF-8 compact JSON object (keys recursively sorted,
+exactly one trailing ``\n``) recording only ``version`` (the integer 1),
+``phase``, the lowercase hex SHA-256 digests of the new and old ledger
+bytes (``newDigest``/``oldDigest``) and the safe base names of the
+candidate and predecessor transaction files, all confined to the
+ledger's own directory; when the ledger did not exist, ``oldDigest`` and
+``predecessor`` are both ``null``.  The intent starts in phase
+``prepared`` and is republished as ``installed`` only after the new
+ledger has replaced the old one and the directory has synced; the
+intent's own creation and phase change each sync the file and the
+directory.  A crash before the ``installed`` intent is durable leaves
+the commit unconfirmed: :func:`recover_ledger` keeps or restores the old
+bytes (byte-for-byte, and missing again when the path was missing) and
+deletes the referenced candidate.  A crash afterwards lets
+:func:`recover_ledger` verify the new bytes against ``newDigest`` and
+finish the cleanup.  Only files the intent references are removed, the
+intent itself is deleted last and the directory is synced, and a
+repeated call reports ``clean`` without scanning random artifacts.
+
+:func:`recover_ledger` returns a fresh dict with the key order
+``digest``, ``status``: ``clean`` when no intent exists, ``rolled-back``
+or ``completed`` after a recovery, with ``digest`` holding the digest of
+the resulting ledger bytes (``None`` when the path is missing).  A
+``path`` that is not a str raises :class:`TypeError`; an intent that
+fails to parse, or whose fields, phase, names, digests or necessary
+artifacts are invalid, raises :class:`CorruptRecoveryError` (a
+:class:`ValueError`) without touching the ledger or any unrelated file;
+an :class:`OSError` while reading, replacing, deleting or syncing
+propagates unchanged with enough intent and artifacts left for a retry.
+The ledger write entry points run this recovery automatically after
+their input validation, before the ledger is read.
+
 :func:`apply_signed_remote` adds an offline-verifiable authentication
 boundary in front of the same application flow.  It receives the ledger
 path, a keyring, an envelope and the current moment.  The envelope
@@ -850,24 +885,28 @@ def _rollback_ledger_write(
     """Best-effort rollback of a failed :func:`_atomic_write`.
 
     ``stage`` records how far the transaction got: ``write`` (temporary
-    file written), ``link`` (predecessor hard-linked aside), ``install``
-    (temporary moved into place), ``sync`` (the directory sync after
-    install) or ``cleanup`` (the predecessor link removed, its directory
-    sync failed).  The predecessor is retained as a hard link rather than
-    rewritten, so renaming it back restores the original file
-    byte-for-byte (indeed as the same inode) even with no working fsync
-    or free space left; once that link is already gone, the captured
-    pre-call bytes are rewritten from memory instead.  The directory is
-    synced last so the recovery is durable.  Every recovery error is
-    swallowed so the original exception propagates unchanged.
+    file written), ``link`` (predecessor hard-linked aside), ``intent``
+    (the prepared recovery intent published), ``install`` (temporary
+    moved into place), ``sync`` (the directory sync after install),
+    ``confirm`` (the installed intent published), ``cleanup`` (the
+    predecessor link removed) or ``final`` (the intent removed, its
+    directory sync failed).  The predecessor is retained as a hard link
+    rather than rewritten, so renaming it back restores the original
+    file byte-for-byte (indeed as the same inode) even with no working
+    fsync or free space left; once that link is already gone, the
+    captured pre-call bytes are rewritten from memory instead.  The
+    recovery intent at ``path + ".txn"`` only ever belongs to the failed
+    call and is removed as well.  The directory is synced last so the
+    recovery is durable.  Every recovery error is swallowed so the
+    original exception propagates unchanged.
     """
     try:
-        if stage == "cleanup":
+        if stage in ("cleanup", "final"):
             # The new ledger was installed and the install synced; only
-            # the backup removal or its directory sync failed.  The
-            # commit still must not stand: rename the retained link back
-            # when it survives, otherwise rewrite the captured pre-call
-            # bytes from memory.
+            # the backup removal, the intent removal or a directory sync
+            # failed.  The commit still must not stand: rename the
+            # retained link back when it survives, otherwise rewrite the
+            # captured pre-call bytes from memory.
             _remove_quietly(tmp_path)
             if backup_path is not None and os.path.exists(backup_path):
                 os.replace(backup_path, path)
@@ -878,7 +917,7 @@ def _rollback_ledger_write(
                     os.unlink(path)
                 except FileNotFoundError:
                     pass
-        elif stage == "sync":
+        elif stage in ("sync", "confirm"):
             _remove_quietly(tmp_path)
             if existed:
                 os.replace(backup_path, path)
@@ -887,7 +926,7 @@ def _rollback_ledger_write(
                     os.unlink(path)
                 except FileNotFoundError:
                     pass
-        elif stage == "install":
+        elif stage in ("install", "intent"):
             # The replacement did not run: the predecessor at path is
             # untouched; the backup link and temporary file are internal
             # artifacts to remove.
@@ -914,6 +953,8 @@ def _rollback_ledger_write(
                     os.unlink(backup_path)
                 except FileNotFoundError:
                     pass
+        # The recovery intent only ever belongs to this transaction.
+        _remove_quietly(path + ".txn")
         try:
             storage._fsync_dir(path)
         except OSError:
@@ -930,6 +971,20 @@ def _remove_quietly(target: str) -> None:
         pass
 
 
+def _reserve_unique_file(prefix: str) -> tuple[BinaryIO, str]:
+    """Open a fresh file named ``prefix + <random hex>``, exclusively."""
+    last_error: OSError | None = None
+    for _ in range(128):
+        tmp_path = f"{prefix}{os.urandom(8).hex()}"
+        try:
+            return open(tmp_path, "xb"), tmp_path
+        except FileExistsError as exc:
+            last_error = exc
+    raise last_error if last_error is not None else OSError(
+        "could not reserve a unique transaction file name"
+    )
+
+
 def _reserve_tmp_file(path: str) -> tuple[BinaryIO, str]:
     """Open a fresh, uniquely named transaction file next to ``path``.
 
@@ -938,16 +993,7 @@ def _reserve_tmp_file(path: str) -> tuple[BinaryIO, str]:
     simply retries.  The returned open binary handle owns the file until
     the caller closes it.
     """
-    last_error: OSError | None = None
-    for _ in range(128):
-        tmp_path = f"{path}.tmp.{os.urandom(8).hex()}"
-        try:
-            return open(tmp_path, "xb"), tmp_path
-        except FileExistsError as exc:
-            last_error = exc
-    raise last_error if last_error is not None else OSError(
-        "could not reserve a ledger temporary file name"
-    )
+    return _reserve_unique_file(f"{path}.tmp.")
 
 
 def _link_predecessor_aside(path: str) -> str:
@@ -973,6 +1019,285 @@ def _link_predecessor_aside(path: str) -> str:
     )
 
 
+# --- Cross-process crash recovery for ledger replacement ---------------------
+
+RECOVERY_VERSION = 1
+
+PHASE_PREPARED = "prepared"
+PHASE_INSTALLED = "installed"
+
+STATUS_CLEAN = "clean"
+STATUS_ROLLED_BACK = "rolled-back"
+STATUS_COMPLETED = "completed"
+
+INTENT_CANDIDATE = "candidate"
+INTENT_NEW_DIGEST = "newDigest"
+INTENT_OLD_DIGEST = "oldDigest"
+INTENT_PHASE = "phase"
+INTENT_PREDECESSOR = "predecessor"
+
+_INTENT_KEYS = frozenset((
+    INTENT_CANDIDATE,
+    INTENT_NEW_DIGEST,
+    INTENT_OLD_DIGEST,
+    INTENT_PHASE,
+    INTENT_PREDECESSOR,
+    VERSION,
+))
+
+
+class CorruptRecoveryError(ValueError):
+    """A recovery intent or one of its referenced artifacts is corrupt."""
+
+
+def _recovery_invalid(message: str) -> CorruptRecoveryError:
+    return CorruptRecoveryError(f"invalid recovery intent: {message}")
+
+
+def _intent_compact(obj: object) -> bytes:
+    """Canonical compact sorted-key UTF-8 JSON of intent content."""
+    return json.dumps(
+        obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _intent_payload(
+    phase: str,
+    new_digest: str,
+    old_digest: str | None,
+    candidate_name: str,
+    predecessor_name: str | None,
+) -> bytes:
+    """Canonical intent bytes: compact JSON, sorted keys, one trailing LF."""
+    intent = {
+        INTENT_CANDIDATE: candidate_name,
+        INTENT_NEW_DIGEST: new_digest,
+        INTENT_OLD_DIGEST: old_digest,
+        INTENT_PHASE: phase,
+        INTENT_PREDECESSOR: predecessor_name,
+        VERSION: RECOVERY_VERSION,
+    }
+    return _intent_compact(intent) + b"\n"
+
+
+def _publish_intent(path: str, payload: bytes) -> None:
+    """Atomically publish the recovery intent at ``path + ".txn"``.
+
+    The intent is written to a uniquely named temporary in the same
+    directory, flushed and synced, then renamed into place and the
+    directory synced, so a crash leaves either no intent or the complete
+    intent; the intent's own creation and phase change are as durable as
+    the transaction steps they record.
+    """
+    handle, tmp_path = _reserve_unique_file(f"{path}.txn.")
+    try:
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path + ".txn")
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            _remove_quietly(tmp_path)
+    storage._fsync_dir(path)
+
+
+def _validated_artifact_name(name: object, key: str, ledger_base: str) -> None:
+    """Require a safe base name confined to the ledger's own directory."""
+    if not isinstance(name, str) or name == "":
+        raise _recovery_invalid(f"{key} must be a non-empty str")
+    if (
+        name in (".", "..")
+        or os.path.basename(name) != name
+        or os.sep in name
+        or (os.altsep is not None and os.altsep in name)
+    ):
+        raise _recovery_invalid(f"{key} must be a plain base name")
+    if name == ledger_base or name == ledger_base + ".txn":
+        raise _recovery_invalid(
+            f"{key} must not name the ledger or the intent itself"
+        )
+
+
+def _parse_intent(raw: bytes, ledger_base: str) -> dict:
+    """Validate every byte of a recovery intent and return its decoded form.
+
+    Any decoding, structural, phase, name or digest violation raises
+    :class:`CorruptRecoveryError`.
+    """
+    if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+        raise _recovery_invalid("must be a single JSON object ending in one LF")
+    try:
+        text = raw[:-1].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _recovery_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise _recovery_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict) or set(data.keys()) != _INTENT_KEYS:
+        raise _recovery_invalid(
+            "must contain exactly the keys 'candidate', 'newDigest', "
+            "'oldDigest', 'phase', 'predecessor' and 'version'"
+        )
+    version = data[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise _recovery_invalid("version must be an int")
+    if version != RECOVERY_VERSION:
+        raise _recovery_invalid("version must be the integer 1")
+    phase = data[INTENT_PHASE]
+    if phase not in (PHASE_PREPARED, PHASE_INSTALLED):
+        raise _recovery_invalid("phase must be 'prepared' or 'installed'")
+    if not _is_digest(data[INTENT_NEW_DIGEST]):
+        raise _recovery_invalid("newDigest must be 64 lowercase hex characters")
+    old_digest = data[INTENT_OLD_DIGEST]
+    if old_digest is not None and not _is_digest(old_digest):
+        raise _recovery_invalid(
+            "oldDigest must be null or 64 lowercase hex characters"
+        )
+    _validated_artifact_name(data[INTENT_CANDIDATE], "candidate", ledger_base)
+    predecessor = data[INTENT_PREDECESSOR]
+    if predecessor is not None:
+        _validated_artifact_name(predecessor, "predecessor", ledger_base)
+    if (old_digest is None) != (predecessor is None):
+        raise _recovery_invalid(
+            "oldDigest and predecessor must both be null or both be set"
+        )
+
+    # The bytes must be the single canonical compact encoding with
+    # recursively sorted keys and exactly one trailing newline.
+    if _intent_compact(data) + b"\n" != raw:
+        raise _recovery_invalid("encoding is not the canonical compact form")
+    return data
+
+
+def recover_ledger(path: str) -> dict:
+    """Reconcile an interrupted ledger transaction at ``path``.
+
+    When no recovery intent exists at ``path + ".txn"`` the result is
+    ``clean`` and no random artifacts are scanned.  Otherwise the intent
+    is fully validated -- a parse, field, phase, name, digest or
+    necessary-artifact violation raises :class:`CorruptRecoveryError` (a
+    :class:`ValueError`) without touching the ledger or any unrelated
+    file -- and the interrupted transaction is settled by its phase:
+
+    - ``prepared``: the commit was never confirmed.  The old bytes are
+      kept or restored byte-for-byte from the retained predecessor (the
+      path stays missing when it was missing) and the referenced new
+      candidate is deleted; the status is ``rolled-back``.
+    - ``installed``: the new ledger already replaced the old one and the
+      directory synced.  The current bytes must hash to ``newDigest``;
+      the remaining referenced artifacts are cleaned and the status is
+      ``completed``.
+
+    Only files the intent references are removed, the intent itself is
+    deleted last and the directory is synced, so a repeated call reports
+    ``clean``.  The result is a fresh dict with the key order ``digest``,
+    ``status``; ``digest`` is the digest of the resulting ledger bytes,
+    or ``None`` when the path is missing.  A ``path`` that is not a str
+    raises :class:`TypeError`; an :class:`OSError` while reading,
+    replacing, deleting or syncing propagates unchanged with enough
+    intent and artifacts left in place for a retry.
+    """
+    if not isinstance(path, str):
+        raise TypeError("path must be a str")
+    try:
+        with open(path + ".txn", "rb") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        # No intent: nothing to settle, and random leftover artifacts
+        # are never scanned.
+        return {"digest": None, STATUS: STATUS_CLEAN}
+
+    ledger_base = os.path.basename(path)
+    intent = _parse_intent(raw, ledger_base)
+    phase = intent[INTENT_PHASE]
+    new_digest = intent[INTENT_NEW_DIGEST]
+    old_digest = intent[INTENT_OLD_DIGEST]
+    directory = os.path.dirname(os.path.abspath(path))
+    candidate_path = os.path.join(directory, intent[INTENT_CANDIDATE])
+    predecessor_path = (
+        os.path.join(directory, intent[INTENT_PREDECESSOR])
+        if intent[INTENT_PREDECESSOR] is not None
+        else None
+    )
+
+    try:
+        with open(path, "rb") as handle:
+            current = handle.read()
+    except FileNotFoundError:
+        current = None
+
+    # Every validation finishes before the first mutation, so a
+    # CorruptRecoveryError never changes the ledger or any other file.
+    restore = False
+    remove_path = False
+    if phase == PHASE_PREPARED:
+        current_digest = _digest(current) if current is not None else None
+        if old_digest is None:
+            # The path was missing: it may only hold the unconfirmed new
+            # bytes (the replacement already ran) and must be missing
+            # again after the rollback.
+            if current is not None:
+                if current_digest != new_digest:
+                    raise _recovery_invalid(
+                        "ledger bytes do not match newDigest"
+                    )
+                remove_path = True
+        elif current_digest != old_digest:
+            if current_digest is not None and current_digest != new_digest:
+                raise _recovery_invalid(
+                    "ledger bytes match neither oldDigest nor newDigest"
+                )
+            # The old bytes must come back byte-for-byte from the
+            # retained predecessor (also when the path vanished).
+            try:
+                with open(predecessor_path, "rb") as handle:
+                    predecessor = handle.read()
+            except FileNotFoundError as exc:
+                raise _recovery_invalid(
+                    "predecessor artifact is missing"
+                ) from exc
+            if _digest(predecessor) != old_digest:
+                raise _recovery_invalid(
+                    "predecessor artifact does not match oldDigest"
+                )
+            restore = True
+    else:
+        # installed: the new ledger is the durable content and must
+        # still hash to the confirmed digest.
+        if current is None:
+            raise _recovery_invalid("ledger is missing the installed bytes")
+        if _digest(current) != new_digest:
+            raise _recovery_invalid(
+                "ledger bytes do not match the installed newDigest"
+            )
+
+    # Settle the transaction.  The intent survives every failure here
+    # (it is deleted last), so an OSError leaves enough state to retry.
+    if restore:
+        os.replace(predecessor_path, path)
+        predecessor_path = None
+    elif remove_path:
+        os.unlink(path)
+    for artifact in (candidate_path, predecessor_path):
+        if artifact is None:
+            continue
+        try:
+            os.unlink(artifact)
+        except FileNotFoundError:
+            pass
+    storage._fsync_dir(path)
+    os.unlink(path + ".txn")
+    storage._fsync_dir(path)
+
+    if phase == PHASE_PREPARED:
+        return {"digest": old_digest, STATUS: STATUS_ROLLED_BACK}
+    return {"digest": new_digest, STATUS: STATUS_COMPLETED}
+
+
 def _atomic_write(path: str, payload: bytes) -> None:
     """Durably replace ``path`` with ``payload`` as a single transaction.
 
@@ -985,21 +1310,29 @@ def _atomic_write(path: str, payload: bytes) -> None:
     transaction starts -- a sweep failure cannot block the commit, which
     never depends on those names.
 
-    The temporary file's write, flush and file sync, the replacement,
-    the directory sync after the install and the directory sync after
-    the predecessor cleanup all lie inside the boundary.  An existing
-    predecessor is retained as a hard link -- without ever removing
-    ``path`` -- until the new file is installed and the directory has
-    synced, and its pre-call bytes are additionally held in memory until
-    the cleanup sync completes, so an :class:`OSError` at any stage
-    rolls the whole transaction back: the prior file returns
-    byte-for-byte (renamed back as the same inode while the retained
-    link survives, rewritten from the captured bytes once the link was
-    already removed), and a path the call created is removed again.  The
-    rollback syncs the directory as well, and the original
-    :class:`OSError` propagates unchanged.  On success both the file and
-    the directory have been synced and neither a temporary file nor a
-    predecessor link remains.
+    Before anything is replaced, a recovery intent is published at
+    ``path + ".txn"`` (see :func:`recover_ledger`) in phase ``prepared``,
+    recording both ledger digests and the base names of the candidate
+    and predecessor; after the replacement and its directory sync the
+    intent is republished in phase ``installed`` and only then are the
+    predecessor link and the intent removed.  A crash of the process at
+    any point leaves a state a later :func:`recover_ledger` settles.
+
+    The temporary file's write, flush and file sync, the intent
+    publications, the replacement, the directory sync after the install
+    and the directory sync after the cleanup all lie inside the
+    boundary.  An existing predecessor is retained as a hard link --
+    without ever removing ``path`` -- until the new file is installed
+    and the directory has synced, and its pre-call bytes are
+    additionally held in memory until the cleanup completes, so an
+    :class:`OSError` at any stage rolls the whole transaction back: the
+    prior file returns byte-for-byte (renamed back as the same inode
+    while the retained link survives, rewritten from the captured bytes
+    once the link was already removed), and a path the call created is
+    removed again.  The rollback syncs the directory as well, and the
+    original :class:`OSError` propagates unchanged.  On success both the
+    file and the directory have been synced and neither a temporary
+    file, a predecessor link nor a recovery intent remains.
     """
     existed = os.path.exists(path)
     # Retained fixed-name artifacts from earlier interrupted calls are
@@ -1016,6 +1349,9 @@ def _atomic_write(path: str, payload: bytes) -> None:
         with open(path, "rb") as handle:
             original = handle.read()
 
+    new_digest = _digest(payload)
+    old_digest = _digest(original) if original is not None else None
+
     tmp_handle, tmp_path = _reserve_tmp_file(path)
     backup_path: str | None = None
     stage = "write"
@@ -1027,10 +1363,39 @@ def _atomic_write(path: str, payload: bytes) -> None:
         if existed:
             backup_path = _link_predecessor_aside(path)
             stage = "link"
+        # The prepared intent makes the unconfirmed transaction visible
+        # to a later recover_ledger before anything is replaced.
+        _publish_intent(
+            path,
+            _intent_payload(
+                PHASE_PREPARED,
+                new_digest,
+                old_digest,
+                os.path.basename(tmp_path),
+                os.path.basename(backup_path)
+                if backup_path is not None
+                else None,
+            ),
+        )
         stage = "install"
         os.replace(tmp_path, path)
         stage = "sync"
         storage._fsync_dir(path)
+        # Only now is the commit confirmed: the installed intent tells a
+        # later recover_ledger that the new bytes are the durable ones.
+        stage = "confirm"
+        _publish_intent(
+            path,
+            _intent_payload(
+                PHASE_INSTALLED,
+                new_digest,
+                old_digest,
+                os.path.basename(tmp_path),
+                os.path.basename(backup_path)
+                if backup_path is not None
+                else None,
+            ),
+        )
         if backup_path is not None:
             # The backup link's removal itself is best-effort (a
             # leftover is internal and swept by the next commit), but
@@ -1039,7 +1404,14 @@ def _atomic_write(path: str, payload: bytes) -> None:
             # commit back instead of standing as a success.
             stage = "cleanup"
             _remove_quietly(backup_path)
-            storage._fsync_dir(path)
+        # The intent is deleted last; only then is the transaction over.
+        # Its removal is best-effort like the backup link's: a leftover
+        # installed intent is internal, never read as a ledger, and is
+        # settled by the next recover_ledger, but the directory sync
+        # persisting the cleanup stays inside the transaction boundary.
+        stage = "final"
+        _remove_quietly(path + ".txn")
+        storage._fsync_dir(path)
     except BaseException:
         _rollback_ledger_write(
             path, tmp_path, backup_path, existed, stage, original
@@ -1111,6 +1483,9 @@ def _apply(path: str, request: dict, auth: dict | None) -> dict:
         raise TypeError("path must be a str")
 
     request_id, source, base, remote = _validated_apply_request(request)
+
+    # Settle any interrupted earlier commit before the ledger is read.
+    recover_ledger(path)
 
     state, requests, entries = _read_ledger(path, base)
 
@@ -2867,9 +3242,11 @@ def commit_resolution(
             "material state does not hash to the last accepted entry's after"
         )
 
-    # Only now is the ledger read: a missing ledger propagates
-    # FileNotFoundError, a corrupt one ValueError, and any other read
-    # failure propagates as OSError.
+    # Only now is the ledger read: any interrupted earlier commit is
+    # settled first, a missing ledger propagates FileNotFoundError, a
+    # corrupt one ValueError, and any other read failure propagates as
+    # OSError.
+    recover_ledger(path)
     with open(path, "rb") as handle:
         raw = handle.read()
     stored_state, stored_requests, stored_entries = _parse_ledger(raw)
