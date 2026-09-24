@@ -90,6 +90,21 @@ expiry cannot be bypassed through a historical request binding.  Audit
 entries committed through :func:`apply_signed_remote` record the verified
 credentials under ``auth``; entries without ``auth`` remain readable and
 :func:`apply_remote` keeps its public behaviour and ledger format.
+
+:func:`export_proof` and :func:`verify_proof` add offline audit-proof
+exchange over the same ledger.  A proof is one version-1 UTF-8 compact
+JSON object -- every object key recursively sorted lexicographically,
+non-ASCII preserved, exactly one trailing ``\\n`` -- with the top-level
+keys ``digest``, ``endSeq``, ``entries``, ``firstBefore``, ``lastAfter``,
+``startSeq`` and ``version``.  ``startSeq``/``endSeq`` name the covered
+audit range, ``firstBefore`` is the state digest before the first covered
+entry and ``lastAfter`` the state digest after the last one; ``entries``
+hold the ledger entries in range unchanged, each carrying ``after``/
+``before`` state digests, ``id``, ``seq`` and ``source`` with the optional
+``auth`` binding.  ``digest`` is the lowercase hex SHA-256 of the compact
+canonical encoding (with no trailing newline) of the proof object with
+the ``digest`` key itself removed.  :func:`verify_proof` is purely
+offline: it reads neither the ledger nor the keyring.
 """
 
 from __future__ import annotations
@@ -99,6 +114,7 @@ import hmac
 import json
 import os
 import re
+from typing import BinaryIO
 
 from offline_coordination import audit, merge, storage
 
@@ -702,8 +718,8 @@ def _overall_status(decisions: list[str]) -> str:
 
 def _rollback_ledger_write(
     path: str,
-    tmp_path: str,
-    backup_path: str,
+    tmp_path: str | None,
+    backup_path: str | None,
     existed: bool,
     stage: str,
 ) -> None:
@@ -732,21 +748,25 @@ def _rollback_ledger_write(
             # The replacement did not run: the predecessor at path is
             # untouched; the backup link and temporary file are internal
             # artifacts to remove.
-            try:
-                os.unlink(backup_path)
-            except FileNotFoundError:
-                pass
-            try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
+            if backup_path is not None:
+                try:
+                    os.unlink(backup_path)
+                except FileNotFoundError:
+                    pass
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
         else:
-            # write/link stages leave the predecessor in place.
-            try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
-            if stage == "link":
+            # write/link stages leave the predecessor in place; the link
+            # stage additionally leaves a backup link to remove.
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
+            if stage == "link" and backup_path is not None:
                 try:
                     os.unlink(backup_path)
                 except FileNotFoundError:
@@ -759,43 +779,100 @@ def _rollback_ledger_write(
         pass
 
 
+def _remove_quietly(target: str) -> None:
+    """Best-effort unlink that never lets cleanup block the caller."""
+    try:
+        os.unlink(target)
+    except OSError:
+        pass
+
+
+def _reserve_tmp_file(path: str) -> tuple[BinaryIO, str]:
+    """Open a fresh, uniquely named transaction file next to ``path``.
+
+    Exclusive binary create (``"xb"``) atomically reserves a random name
+    and gives the file the same mode a plain create would; a collision
+    simply retries.  The returned open binary handle owns the file until
+    the caller closes it.
+    """
+    last_error: OSError | None = None
+    for _ in range(128):
+        tmp_path = f"{path}.tmp.{os.urandom(8).hex()}"
+        try:
+            return open(tmp_path, "xb"), tmp_path
+        except FileExistsError as exc:
+            last_error = exc
+    raise last_error if last_error is not None else OSError(
+        "could not reserve a ledger temporary file name"
+    )
+
+
+def _link_predecessor_aside(path: str) -> str:
+    """Hard-link the existing ledger to a unique backup name.
+
+    ``os.link`` is atomic and fails with :class:`FileExistsError` when the
+    candidate name already exists (for example as a leftover of a killed
+    transaction), so the name can be reserved by the link itself without
+    any create-then-link window.
+    """
+    last_error: OSError | None = None
+    for _ in range(128):
+        backup_path = f"{path}.old.{os.urandom(8).hex()}"
+        try:
+            os.link(path, backup_path)
+        except FileExistsError as exc:
+            last_error = exc
+            continue
+        return backup_path
+    # Practically unreachable: 128 random 64-bit name collisions in a row.
+    raise last_error if last_error is not None else OSError(
+        "could not reserve a ledger backup file name"
+    )
+
+
 def _atomic_write(path: str, payload: bytes) -> None:
     """Durably replace ``path`` with ``payload`` as a single transaction.
 
+    Every transaction uses *unique* file names (an exclusively created
+    ``path + ".tmp.<random>"`` temporary and a random-suffixed hard link
+    for the predecessor), so a fixed ``path + ".tmp"``/``path + ".old"``
+    leftover from an older interrupted process never collides with a
+    fresh commit.  Such fixed leftovers are internal artifacts: they are
+    never read as a ledger and are swept best-effort before the
+    transaction starts -- a sweep failure cannot block the commit, which
+    never depends on those names.
+
     The temporary file's write, flush and file sync, the replacement and
     the following directory sync all lie inside the boundary.  An existing
-    predecessor is retained as a hard link at ``path + ".old"`` -- without
-    ever removing ``path`` -- until the new file is installed and the
-    directory has synced, so any :class:`OSError` rolls back by renaming
-    that link back: the prior file returns byte-for-byte (as the same
-    inode, with no rewriting and therefore no dependence on a working
-    fsync or free space), and a path the call created is removed again.
-    The rollback syncs the directory as well.  The original
-    :class:`OSError` propagates unchanged, no ``.tmp``/``.old`` artifact is
-    left behind and such artifacts (for example from a killed process) are
-    never read as a ledger.  On success both the file and the directory
-    have been synced.
+    predecessor is retained as a hard link -- without ever removing
+    ``path`` -- until the new file is installed and the directory has
+    synced, so any :class:`OSError` rolls back by renaming that link back:
+    the prior file returns byte-for-byte (as the same inode, with no
+    rewriting and therefore no dependence on a working fsync or free
+    space), and a path the call created is removed again.  The rollback
+    syncs the directory as well.  The original :class:`OSError` propagates
+    unchanged.  On success both the file and the directory have been
+    synced; the unique backup link's removal (and the matching directory
+    sync) is best-effort and never undoes a commit.
     """
-    tmp_path = path + ".tmp"
-    backup_path = path + ".old"
     existed = os.path.exists(path)
-    # Retained artifacts from earlier interrupted calls are internal and
-    # must never stand in the way of a fresh transaction (the temporary
-    # name is overwritten by the open below).
-    try:
-        os.unlink(backup_path)
-    except FileNotFoundError:
-        pass
+    # Retained fixed-name artifacts from earlier interrupted calls are
+    # internal, never read as a ledger, and must never stand in the way of
+    # a fresh transaction; the transaction itself uses unique names.
+    _remove_quietly(path + ".tmp")
+    _remove_quietly(path + ".old")
 
+    tmp_handle, tmp_path = _reserve_tmp_file(path)
+    backup_path: str | None = None
     stage = "write"
     try:
-        with open(tmp_path, "wb") as handle:
+        with tmp_handle as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         if existed:
+            backup_path = _link_predecessor_aside(path)
             stage = "link"
-            os.link(path, backup_path)
         stage = "install"
         os.replace(tmp_path, path)
         stage = "sync"
@@ -807,9 +884,9 @@ def _atomic_write(path: str, payload: bytes) -> None:
     # The new ledger is durable from this point on; the retained
     # predecessor link is internal cleanup only.  Its removal (and the
     # matching directory sync) is best-effort and never undoes a commit.
-    if existed:
+    if existed and backup_path is not None:
+        _remove_quietly(backup_path)
         try:
-            os.unlink(backup_path)
             storage._fsync_dir(path)
         except OSError:
             pass
@@ -1186,3 +1263,292 @@ def apply_signed_remote(
         validated_keyring, node, key_version, request, source, signature, moment
     )
     return _apply(path, request, {KEY_VERSION: key_version, NODE: node})
+
+
+# --- Offline audit-range proofs ----------------------------------------------
+
+PROOF_DIGEST = "digest"
+PROOF_END_SEQ = "endSeq"
+PROOF_ENTRIES = "entries"
+PROOF_FIRST_BEFORE = "firstBefore"
+PROOF_LAST_AFTER = "lastAfter"
+PROOF_START_SEQ = "startSeq"
+
+PROOF_VERSION = 1
+_PROOF_TOP_KEYS = frozenset((
+    PROOF_DIGEST,
+    PROOF_END_SEQ,
+    PROOF_ENTRIES,
+    PROOF_FIRST_BEFORE,
+    PROOF_LAST_AFTER,
+    PROOF_START_SEQ,
+    VERSION,
+))
+_PROOF_RESULT_KEYS = (
+    PROOF_START_SEQ,
+    PROOF_END_SEQ,
+    PROOF_FIRST_BEFORE,
+    PROOF_LAST_AFTER,
+    "signedEntries",
+    "unsignedEntries",
+)
+
+
+class InvalidProofError(ValueError):
+    """An audit proof fails its offline byte, chain or digest contract."""
+
+
+def _proof_invalid(message: str) -> InvalidProofError:
+    return InvalidProofError(f"invalid audit proof: {message}")
+
+
+def _proof_compact(obj: object) -> bytes:
+    """Canonical compact sorted-key UTF-8 JSON of proof content."""
+    return json.dumps(
+        obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _reject_duplicate_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate object keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _proof_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def export_proof(path: str, start_seq: int, end_seq: int | None = None) -> bytes:
+    """Export a self-certifying audit-range proof from the ledger at ``path``.
+
+    The proof covers the ledger's audit entries with ``startSeq <= seq <=
+    endSeq``.  ``start_seq`` must be at least 1; when ``end_seq`` is
+    omitted the range runs through the ledger's last entry.  The range
+    must lie completely inside the existing, non-empty audit sequence.
+
+    The result is canonical version-1 proof bytes: one compact UTF-8 JSON
+    object with every object key recursively sorted lexicographically,
+    non-ASCII preserved unescaped and exactly one trailing ``\\n``.  It
+    declares ``version`` (the integer 1), the range, ``firstBefore`` (the
+    before-digest of the first entry) and ``lastAfter`` (the after-digest
+    of the last one), carries the unchanged ledger entries, and binds the
+    whole content with ``digest``, the lowercase hex SHA-256 of the
+    canonical encoding of the proof with its ``digest`` key removed.
+
+    The ledger is opened read-only and never modified.  Type violations
+    (including a :class:`bool` posing as an int or as ``path``) raise
+    :class:`TypeError`; an inverted or out-of-range request, an empty
+    audit and a corrupt ledger raise :class:`ValueError`; a missing
+    ledger raises :class:`FileNotFoundError` and every other read failure
+    propagates unchanged as :class:`OSError`.
+    """
+    if not isinstance(path, str):
+        raise TypeError("path must be a str")
+    if isinstance(start_seq, bool) or not isinstance(start_seq, int):
+        raise TypeError("start_seq must be an int")
+    if end_seq is not None and (
+        isinstance(end_seq, bool) or not isinstance(end_seq, int)
+    ):
+        raise TypeError("end_seq must be an int or None")
+    if start_seq < 1:
+        raise ValueError("start_seq must be >= 1")
+    if end_seq is not None and end_seq < start_seq:
+        raise ValueError("end_seq must not be less than start_seq")
+
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    # A missing file propagates as FileNotFoundError; a corrupt ledger as
+    # ValueError; any other read failure already propagated as OSError.
+    _state, _requests, entries = _parse_ledger(raw)
+
+    total = len(entries)
+    if total == 0:
+        raise ValueError("cannot export a proof from an empty audit")
+    if start_seq > total:
+        raise ValueError("start_seq must not exceed the last audit seq")
+    if end_seq is None:
+        end_seq = total
+    elif end_seq > total:
+        raise ValueError("end_seq must not exceed the last audit seq")
+
+    selected = entries[start_seq - 1:end_seq]
+    body = {
+        PROOF_END_SEQ: end_seq,
+        PROOF_ENTRIES: [_serialize_entry(entry) for entry in selected],
+        PROOF_FIRST_BEFORE: selected[0][BEFORE],
+        PROOF_LAST_AFTER: selected[-1][AFTER],
+        PROOF_START_SEQ: start_seq,
+        VERSION: PROOF_VERSION,
+    }
+    digest = hashlib.sha256(_proof_compact(body)).hexdigest()
+    proof = dict(body)
+    proof[PROOF_DIGEST] = digest
+    return _proof_compact(proof) + b"\n"
+
+
+def _parse_proof(raw: bytes) -> dict:
+    """Validate every byte and link of a proof and return its decoded form."""
+    if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+        raise _proof_invalid("must be a single JSON object ending in one LF")
+    try:
+        text = raw[:-1].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _proof_invalid("is not valid UTF-8") from exc
+    try:
+        # The pairs hook raises directly on duplicate object keys, so a
+        # ValueError raised here means that contract fault, not bad JSON.
+        data = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except json.JSONDecodeError as exc:
+        raise _proof_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise _proof_invalid("must be a JSON object")
+    if set(data.keys()) != _PROOF_TOP_KEYS:
+        raise _proof_invalid(
+            "top-level object must contain exactly the keys 'digest', "
+            "'endSeq', 'entries', 'firstBefore', 'lastAfter', 'startSeq' "
+            "and 'version'"
+        )
+    version = data[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise _proof_invalid("version must be an int")
+    if version != PROOF_VERSION:
+        raise _proof_invalid("version must be the integer 1")
+
+    start = data[PROOF_START_SEQ]
+    end = data[PROOF_END_SEQ]
+    if isinstance(start, bool) or not isinstance(start, int):
+        raise _proof_invalid("startSeq must be an int")
+    if isinstance(end, bool) or not isinstance(end, int):
+        raise _proof_invalid("endSeq must be an int")
+    if start < 1:
+        raise _proof_invalid("startSeq must be >= 1")
+    if end < start:
+        raise _proof_invalid("endSeq must not be less than startSeq")
+
+    first_before = data[PROOF_FIRST_BEFORE]
+    last_after = data[PROOF_LAST_AFTER]
+    if not _is_digest(first_before):
+        raise _proof_invalid("firstBefore must be 64 lowercase hex characters")
+    if not _is_digest(last_after):
+        raise _proof_invalid("lastAfter must be 64 lowercase hex characters")
+
+    raw_entries = data[PROOF_ENTRIES]
+    if not isinstance(raw_entries, list):
+        raise _proof_invalid("entries must be an array")
+    expected_count = end - start + 1
+    if len(raw_entries) != expected_count:
+        raise _proof_invalid(
+            f"entries must contain exactly the {expected_count} items of the "
+            "declared range"
+        )
+
+    signed = 0
+    previous_after: str | None = None
+    for position, entry in enumerate(raw_entries):
+        where = f"entry {position}"
+        if not isinstance(entry, dict):
+            raise _proof_invalid(f"{where} must be a JSON object")
+        keys = set(entry.keys())
+        if keys != _LEDGER_ENTRY_KEY_SET and keys != _LEDGER_ENTRY_AUTHED_SET:
+            raise _proof_invalid(
+                f"{where} must contain exactly the keys 'after', 'before', "
+                "'id', 'seq' and 'source' with optional 'auth'"
+            )
+        before = entry[BEFORE]
+        after = entry[AFTER]
+        entry_id = entry[ID]
+        source = entry[SOURCE]
+        seq = entry["seq"]
+        if not _is_digest(before):
+            raise _proof_invalid(f"{where} before must be 64 lowercase hex chars")
+        if not _is_digest(after):
+            raise _proof_invalid(f"{where} after must be 64 lowercase hex chars")
+        if not isinstance(entry_id, str) or entry_id == "":
+            raise _proof_invalid(f"{where} id must be a non-empty str")
+        if not isinstance(source, str) or source == "":
+            raise _proof_invalid(f"{where} source must be a non-empty str")
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            raise _proof_invalid(f"{where} seq must be an int")
+        expected_seq = start + position
+        if seq != expected_seq:
+            raise _proof_invalid(
+                f"{where} seq is {seq}, expected {expected_seq}"
+            )
+        expected_before = first_before if position == 0 else previous_after
+        if before != expected_before:
+            raise _proof_invalid(
+                f"{where} before does not chain to the previous after"
+            )
+        if AUTH in entry:
+            auth = entry[AUTH]
+            if not isinstance(auth, dict) or set(auth.keys()) != _LEDGER_AUTH_KEYS:
+                raise _proof_invalid(
+                    f"{where} auth must contain exactly the keys "
+                    "'keyVersion' and 'node'"
+                )
+            node = auth[NODE]
+            key_version = auth[KEY_VERSION]
+            if not isinstance(node, str) or node == "":
+                raise _proof_invalid(f"{where} auth node must be a non-empty str")
+            if (
+                isinstance(key_version, bool)
+                or not isinstance(key_version, int)
+                or key_version <= 0
+            ):
+                raise _proof_invalid(
+                    f"{where} auth keyVersion must be a positive non-bool int"
+                )
+            signed += 1
+        previous_after = after
+
+    if previous_after != last_after:
+        raise _proof_invalid("lastAfter must equal the last entry's after")
+
+    claimed = data[PROOF_DIGEST]
+    if not _is_digest(claimed):
+        raise _proof_invalid("digest must be 64 lowercase hex characters")
+    unsigned = expected_count - signed
+    body = {key: value for key, value in data.items() if key != PROOF_DIGEST}
+    actual = hashlib.sha256(_proof_compact(body)).hexdigest()
+    if not hmac.compare_digest(actual, claimed):
+        raise _proof_invalid("digest does not match the proof contents")
+
+    # The bytes must be the single canonical compact form with sorted keys
+    # and exactly one trailing newline: no whitespace, no non-canonical
+    # escapes, no permuted keys, no escaped non-ASCII.
+    if _proof_compact(data) + b"\n" != raw:
+        raise _proof_invalid("encoding is not the canonical compact form")
+
+    return {
+        PROOF_START_SEQ: start,
+        PROOF_END_SEQ: end,
+        PROOF_FIRST_BEFORE: first_before,
+        PROOF_LAST_AFTER: last_after,
+        "signedEntries": signed,
+        "unsignedEntries": unsigned,
+    }
+
+
+def verify_proof(proof: bytes) -> dict:
+    """Verify an audit proof without consulting the ledger or any keyring.
+
+    ``proof`` must be :class:`bytes` produced by :func:`export_proof`.
+    Verification checks the canonical encoding, the unique key set, the
+    integer version 1, the overall digest, the contiguous unique entry
+    sequence and the before/after state-digest chain, and matches the
+    declared range boundaries.
+
+    On success a fresh dict is returned with the key order ``startSeq``,
+    ``endSeq``, ``firstBefore``, ``lastAfter``, ``signedEntries`` and
+    ``unsignedEntries``: the covered range, its boundary state digests and
+    the counts of entries with and without an ``auth`` binding.  Any
+    encoding, key-set, version, digest, gap, duplicate, reordering, chain,
+    tamper or auth-binding fault raises :class:`InvalidProofError` (a
+    :class:`ValueError`); a non-bytes argument raises :class:`TypeError`.
+    """
+    if not isinstance(proof, bytes):
+        raise TypeError("proof must be bytes")
+    result = _parse_proof(proof)
+    return {key: result[key] for key in _PROOF_RESULT_KEYS}
