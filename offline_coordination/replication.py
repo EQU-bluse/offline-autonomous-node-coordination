@@ -137,6 +137,45 @@ conflicts but its ``before`` digests agree (its seq may be 0), and
 ``null`` for every non-fork relation.  The bytes are deterministic for
 equal inputs; swapping the inputs only exchanges ``left``/``right`` and
 mirrors the prefix direction.
+
+:func:`plan_merge` turns such a read-only comparison into a canonical,
+read-only *merge plan*; the sealed source code offers no equivalent
+entry point.  It takes two proof byte strings and one of the policies
+``"left"``, ``"right"`` and ``"manual"``.  Both proofs are first
+independently checked against the exact :func:`verify_proof` contract,
+so a non-bytes proof or a non-str policy raises :class:`TypeError`
+(before either proof is parsed, so a bad proof can never mask a type
+fault), an invalid proof raises :class:`InvalidProofError`, and any
+other policy string raises :class:`ValueError`.  The comparison is the
+same read-only one :func:`compare_proofs` performs -- the ledger,
+keyring and filesystem are never touched and neither input changes --
+and the plan's ``relation``, ``common`` and both side digests/ranges
+are exactly those of that conclusion.  A plan is refused with
+:class:`ValueError` when the ranges are disjoint or when a fork cannot
+be anchored to a shared boundary (``common`` is ``null``): no
+speculative plan is ever produced.
+
+Only audit entries strictly after the common boundary are candidates,
+so boundary records and everything before them are never listed twice.
+For an un-forked identical, prefix or overlapping history, the longer
+side's trailing entries are marked ``accept`` with reason
+``"extension"`` in seq order.  For a fork, policy ``"left"`` accepts
+the left tail (``"selected"``) and rejects the right tail
+(``"rejected"``); ``"right"`` is exactly symmetric.  With
+``"manual"`` neither tail is chosen automatically: every tail entry on
+both sides is marked ``"manual"`` and referenced from ``unresolved``.
+Each step carries ``side``, ``action``, ``reason`` and the unchanged
+original ``entry``; authentication bindings and digests are never
+rewritten.  Steps sort by ascending ``seq`` with the left side first
+within a seq, and the ``unresolved`` references follow that same order
+without repetition.  The plan is a version-1 compact UTF-8 JSON object
+(every object key recursively sorted lexicographically, non-ASCII
+preserved, exactly one trailing ``\\n``) with the top-level keys
+``common``, ``left``, ``policy``, ``relation``, ``right``, ``steps``,
+``unresolved`` and ``version``; ``left``/``right`` record the proof
+digest and range as in :func:`compare_proofs`.  The bytes are
+deterministic for equal inputs, and swapping the proofs while mirroring
+the policy (``"left"`` <-> ``"right"``) mirrors the whole plan.
 """
 
 from __future__ import annotations
@@ -1627,6 +1666,90 @@ def _boundary(after: str, seq: int) -> dict:
     return {COMMON_AFTER: after, COMMON_SEQ: seq}
 
 
+def _relate_parsed(left_parsed: dict, right_parsed: dict) -> dict:
+    """Relate two already-validated proofs, purely from their entries.
+
+    Returns a dict with ``common`` (a boundary marker or ``None``),
+    ``conflictSeq`` (an int or ``None``), ``overlap`` (a closed
+    ``[start, end]`` interval or ``None``) and ``relation``.  This is
+    the single read-only conclusion :func:`compare_proofs` publishes and
+    :func:`plan_merge` builds on, so the two can never disagree.
+    """
+    left_start = left_parsed[PROOF_START_SEQ]
+    left_end = left_parsed[PROOF_END_SEQ]
+    right_start = right_parsed[PROOF_START_SEQ]
+    right_end = right_parsed[PROOF_END_SEQ]
+
+    overlap_start = max(left_start, right_start)
+    overlap_end = min(left_end, right_end)
+
+    if overlap_start > overlap_end:
+        return {
+            "common": None,
+            "conflictSeq": None,
+            "overlap": None,
+            "relation": RELATION_DISJOINT,
+        }
+
+    overlap = [overlap_start, overlap_end]
+    left_entries = left_parsed[PROOF_ENTRIES]
+    right_entries = right_parsed[PROOF_ENTRIES]
+
+    # Compare the complete entries at every shared seq in ascending
+    # order.  Boundary or proof digests alone are never consulted here.
+    fork_seq: int | None = None
+    for seq in range(overlap_start, overlap_end + 1):
+        if left_entries[seq - left_start] != right_entries[seq - right_start]:
+            fork_seq = seq
+            break
+
+    if fork_seq is not None:
+        left_at = left_entries[fork_seq - left_start]
+        right_at = right_entries[fork_seq - right_start]
+        if fork_seq > overlap_start:
+            # Equal entries precede the conflict: the last one defines
+            # the common boundary, on either side (they match there).
+            previous = left_entries[fork_seq - left_start - 1]
+            common = _boundary(previous[AFTER], fork_seq - 1)
+        elif left_at[BEFORE] == right_at[BEFORE]:
+            # The first shared entry already conflicts, but both chains
+            # start from the same state digest: that prior boundary is
+            # still common (its seq may be 0, outside both ranges).
+            common = _boundary(left_at[BEFORE], fork_seq - 1)
+        else:
+            common = None
+        return {
+            "common": common,
+            "conflictSeq": fork_seq,
+            "overlap": overlap,
+            "relation": RELATION_FORK,
+        }
+
+    if left_start == right_start and left_end == right_end:
+        relation = RELATION_SAME
+    else:
+        left_is_shorter = (left_end - left_start) < (right_end - right_start)
+        right_is_shorter = (right_end - right_start) < (left_end - left_start)
+        same_start = left_start == right_start
+        if same_start and (left_is_shorter or right_is_shorter):
+            # Same start and the shorter side matches in full; the
+            # relation is named for the shorter (prefix) side.
+            relation = (
+                RELATION_LEFT_PREFIX if left_is_shorter else RELATION_RIGHT_PREFIX
+            )
+        else:
+            relation = RELATION_OVERLAP
+    # All shared entries agree: the common boundary is the last shared
+    # entry's seq together with its after digest.
+    last_shared = left_entries[overlap_end - left_start]
+    return {
+        "common": _boundary(last_shared[AFTER], overlap_end),
+        "conflictSeq": None,
+        "overlap": overlap,
+        "relation": relation,
+    }
+
+
 def compare_proofs(left: bytes, right: bytes) -> bytes:
     """Compare two offline audit proofs and return a canonical JSON report.
 
@@ -1658,84 +1781,200 @@ def compare_proofs(left: bytes, right: bytes) -> bytes:
     left_parsed = _parse_proof(left)
     right_parsed = _parse_proof(right)
 
-    left_start = left_parsed[PROOF_START_SEQ]
-    left_end = left_parsed[PROOF_END_SEQ]
-    right_start = right_parsed[PROOF_START_SEQ]
-    right_end = right_parsed[PROOF_END_SEQ]
-
-    overlap_start = max(left_start, right_start)
-    overlap_end = min(left_end, right_end)
-
-    if overlap_start > overlap_end:
-        report = {
-            "common": None,
-            "conflictSeq": None,
-            "left": _side_info(left_parsed),
-            "overlap": None,
-            "relation": RELATION_DISJOINT,
-            "right": _side_info(right_parsed),
-            "version": COMPARE_VERSION,
-        }
-        return _proof_compact(report) + b"\n"
-
-    overlap = [overlap_start, overlap_end]
-    left_entries = left_parsed[PROOF_ENTRIES]
-    right_entries = right_parsed[PROOF_ENTRIES]
-
-    # Compare the complete entries at every shared seq in ascending
-    # order.  Boundary or proof digests alone are never consulted here.
-    fork_seq: int | None = None
-    for seq in range(overlap_start, overlap_end + 1):
-        if left_entries[seq - left_start] != right_entries[seq - right_start]:
-            fork_seq = seq
-            break
-
-    if fork_seq is not None:
-        left_at = left_entries[fork_seq - left_start]
-        right_at = right_entries[fork_seq - right_start]
-        if fork_seq > overlap_start:
-            # Equal entries precede the conflict: the last one defines
-            # the common boundary, on either side (they match there).
-            previous = left_entries[fork_seq - left_start - 1]
-            common = _boundary(previous[AFTER], fork_seq - 1)
-        elif left_at[BEFORE] == right_at[BEFORE]:
-            # The first shared entry already conflicts, but both chains
-            # start from the same state digest: that prior boundary is
-            # still common (its seq may be 0, outside both ranges).
-            common = _boundary(left_at[BEFORE], fork_seq - 1)
-        else:
-            common = None
-        relation = RELATION_FORK
-        conflict_seq: int | None = fork_seq
-    else:
-        conflict_seq = None
-        if left_start == right_start and left_end == right_end:
-            relation = RELATION_SAME
-        else:
-            left_is_shorter = (left_end - left_start) < (right_end - right_start)
-            right_is_shorter = (right_end - right_start) < (left_end - left_start)
-            same_start = left_start == right_start
-            if same_start and (left_is_shorter or right_is_shorter):
-                # Same start and the shorter side matches in full; the
-                # relation is named for the shorter (prefix) side.
-                relation = (
-                    RELATION_LEFT_PREFIX if left_is_shorter
-                    else RELATION_RIGHT_PREFIX
-                )
-            else:
-                relation = RELATION_OVERLAP
-        # All shared entries agree: the common boundary is the last
-        # shared entry's seq together with its after digest.
-        last_shared = left_entries[overlap_end - left_start]
-        common = _boundary(last_shared[AFTER], overlap_end)
-
+    conclusion = _relate_parsed(left_parsed, right_parsed)
     report = {
-        "common": common,
-        "conflictSeq": conflict_seq,
+        "common": conclusion["common"],
+        "conflictSeq": conclusion["conflictSeq"],
         "left": _side_info(left_parsed),
-        "overlap": overlap,
-        "relation": relation,
+        "overlap": conclusion["overlap"],
+        "relation": conclusion["relation"],
         "right": _side_info(right_parsed),
         "version": COMPARE_VERSION,
     }
     return _proof_compact(report) + b"\n"
+
+
+# --- Read-only merge plans built on top of a proof comparison ----------------
+
+PLAN_VERSION = 1
+POLICY_LEFT = "left"
+POLICY_RIGHT = "right"
+POLICY_MANUAL = "manual"
+_POLICIES = frozenset((POLICY_LEFT, POLICY_RIGHT, POLICY_MANUAL))
+
+PLAN_SIDE_LEFT = "left"
+PLAN_SIDE_RIGHT = "right"
+
+ACTION_ACCEPT = "accept"
+ACTION_REJECT = "reject"
+ACTION_MANUAL = "manual"
+
+REASON_EXTENSION = "extension"
+REASON_SELECTED = "selected"
+REASON_REJECTED = "rejected"
+REASON_MANUAL = "manual"
+
+
+def _tail_entries(parsed: dict, boundary_seq: int) -> list[dict]:
+    """The proof's complete audit entries strictly after ``boundary_seq``.
+
+    Entries at or before the common boundary are not candidates and are
+    never listed again.  Proof entries already run in ascending seq
+    order, so the filtered slice keeps that order.
+    """
+    return [
+        entry
+        for entry in parsed[PROOF_ENTRIES]
+        if entry["seq"] > boundary_seq
+    ]
+
+
+def plan_merge(left: bytes, right: bytes, policy: str) -> bytes:
+    """Plan a merge of two offline audit proofs without applying anything.
+
+    ``left`` and ``right`` are :class:`bytes` produced by
+    :func:`export_proof`; each is independently validated against the
+    exact :func:`verify_proof` contract.  ``policy`` is one of the
+    strings ``"left"``, ``"right"`` and ``"manual"``.
+
+    The type checks run first, so a non-bytes proof or a non-str policy
+    raises :class:`TypeError` before either proof is parsed and a bad
+    proof can never mask that :class:`TypeError`; an invalid proof then
+    raises :class:`InvalidProofError`; any other policy string raises
+    :class:`ValueError`.  The relation, common boundary and side
+    digests/ranges are exactly the read-only conclusion of
+    :func:`compare_proofs` -- nothing is read from disk and no input
+    changes.  A plan cannot be guessed, so disjoint ranges and a fork
+    with no confirmable common boundary (``common`` is ``null``) raise
+    :class:`ValueError`.
+
+    Only entries strictly after the common boundary become steps.  In an
+    un-forked same/prefix/overlap history the longer side's trailing
+    entries are ``accept``/``"extension"``.  In a fork, ``"left"``
+    accepts the left tail (``"selected"``) and rejects the right tail
+    (``"rejected"``); ``"right"`` is symmetric; ``"manual"`` marks
+    both tails ``"manual"`` and references each from ``unresolved``.
+    Steps carry ``side``, ``action``, ``reason`` and the unchanged
+    original ``entry``, sorted by ascending seq with the left side first
+    at a shared seq; ``unresolved`` lists ``{"seq", "side"}`` references
+    in that same order without repetition.
+
+    The result is canonical version-1 compact UTF-8 JSON (keys sorted
+    lexicographically, non-ASCII preserved, exactly one trailing
+    ``\\n``) and is byte-for-byte stable for equal inputs.
+    """
+    # Type faults precede every content fault: check all three argument
+    # types before either proof is parsed, so no malformed proof can mask
+    # a TypeError.
+    if not isinstance(left, bytes):
+        raise TypeError("left proof must be bytes")
+    if not isinstance(right, bytes):
+        raise TypeError("right proof must be bytes")
+    if not isinstance(policy, str):
+        raise TypeError("policy must be a str")
+
+    # Both proofs are independently verified under the existing contract
+    # before any policy value is judged, so an invalid proof keeps
+    # raising InvalidProofError exactly as compare_proofs reports it.
+    left_parsed = _parse_proof(left)
+    right_parsed = _parse_proof(right)
+
+    if policy not in _POLICIES:
+        raise ValueError(
+            "policy must be one of 'left', 'right' or 'manual'"
+        )
+
+    conclusion = _relate_parsed(left_parsed, right_parsed)
+    relation = conclusion["relation"]
+    common = conclusion["common"]
+
+    # No speculative plans: disjoint ranges share nothing, and an
+    # unanchored fork offers no boundary the tails can extend from.
+    if relation == RELATION_DISJOINT:
+        raise ValueError("cannot plan a merge of disjoint proof ranges")
+    if common is None:
+        raise ValueError(
+            "cannot plan a merge without a confirmable common boundary"
+        )
+
+    boundary_seq = common[COMMON_SEQ]
+    left_tail = _tail_entries(left_parsed, boundary_seq)
+    right_tail = _tail_entries(right_parsed, boundary_seq)
+
+    # One descriptor per candidate step:
+    # (side, original entry, action, reason).  Entries stay exactly as
+    # verified; the manual review set is derived from the action below.
+    descriptors: list[tuple[str, dict, str, str]] = []
+    if relation == RELATION_FORK:
+        if policy == POLICY_LEFT:
+            descriptors.extend(
+                (PLAN_SIDE_LEFT, entry, ACTION_ACCEPT, REASON_SELECTED)
+                for entry in left_tail
+            )
+            descriptors.extend(
+                (PLAN_SIDE_RIGHT, entry, ACTION_REJECT, REASON_REJECTED)
+                for entry in right_tail
+            )
+        elif policy == POLICY_RIGHT:
+            descriptors.extend(
+                (PLAN_SIDE_LEFT, entry, ACTION_REJECT, REASON_REJECTED)
+                for entry in left_tail
+            )
+            descriptors.extend(
+                (PLAN_SIDE_RIGHT, entry, ACTION_ACCEPT, REASON_SELECTED)
+                for entry in right_tail
+            )
+        else:  # POLICY_MANUAL: neither branch is chosen automatically.
+            descriptors.extend(
+                (PLAN_SIDE_LEFT, entry, ACTION_MANUAL, REASON_MANUAL)
+                for entry in left_tail
+            )
+            descriptors.extend(
+                (PLAN_SIDE_RIGHT, entry, ACTION_MANUAL, REASON_MANUAL)
+                for entry in right_tail
+            )
+    else:
+        # same / left-prefix / right-prefix / overlap: whichever side
+        # extends past the shared history does so as a plain extension.
+        descriptors.extend(
+            (PLAN_SIDE_LEFT, entry, ACTION_ACCEPT, REASON_EXTENSION)
+            for entry in left_tail
+        )
+        descriptors.extend(
+            (PLAN_SIDE_RIGHT, entry, ACTION_ACCEPT, REASON_EXTENSION)
+            for entry in right_tail
+        )
+
+    # Ascending seq, left before right at the same seq.  The side rank is
+    # the only tie-break, so ordering is total and deterministic.
+    def step_order(item: tuple[str, dict, str, str]) -> tuple[int, int]:
+        side = item[0]
+        return (item[1]["seq"], 0 if side == PLAN_SIDE_LEFT else 1)
+
+    descriptors.sort(key=step_order)
+
+    steps: list[dict] = []
+    unresolved: list[dict] = []
+    for side, entry, action, reason in descriptors:
+        steps.append(
+            {
+                "action": action,
+                "entry": entry,
+                "reason": reason,
+                "side": side,
+            }
+        )
+        if action == ACTION_MANUAL:
+            unresolved.append({"seq": entry["seq"], "side": side})
+
+    plan = {
+        "common": common,
+        "left": _side_info(left_parsed),
+        "policy": policy,
+        "relation": relation,
+        "right": _side_info(right_parsed),
+        "steps": steps,
+        "unresolved": unresolved,
+        "version": PLAN_VERSION,
+    }
+    return _proof_compact(plan) + b"\n"
