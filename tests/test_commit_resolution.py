@@ -405,6 +405,92 @@ class LedgerFailureTest(CommitCase):
         self.assertEqual(read_bytes(self.fork.target_path), before)
 
 
+class DirSyncFailureTest(CommitCase):
+    """Directory-sync failures anywhere in the commit boundary roll back."""
+
+    def residue(self):
+        return sorted(
+            name
+            for name in os.listdir(self.directory)
+            if name.startswith("target.json.tmp")
+            or name.startswith("target.json.old")
+        )
+
+    def plant_unrelated_file(self):
+        unrelated = os.path.join(self.directory, "unrelated.keep")
+        with open(unrelated, "wb") as handle:
+            handle.write(b"do not touch\n")
+        return unrelated
+
+    def assert_rolled_back(self, before, unrelated):
+        # The exact pre-call bytes are back -- not merely a parseable
+        # ledger -- and the pre-existing unrelated file is untouched.
+        self.assertEqual(read_bytes(self.fork.target_path), before)
+        self.assertEqual(read_bytes(unrelated), b"do not touch\n")
+        self.assertEqual(self.residue(), [])
+        # The restored ledger shows the original seqs, state digest and
+        # request bindings, and the retry applies as if never committed.
+        stored_state, requests, entries = read_ledger(self.fork.target_path)
+        self.assertEqual([entry["id"] for entry in entries], ["r1", "r2"])
+        self.assertEqual(
+            R._digest(R._state_bytes(stored_state)),
+            R._digest(R._state_bytes(S2)),
+        )
+        self.assertEqual(set(requests), {"r1", "r2"})
+        result = self.commit()
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(self.commit()["status"], "duplicate")
+
+    def test_install_dir_sync_failure_rolls_back(self) -> None:
+        before = read_bytes(self.fork.target_path)
+        unrelated = self.plant_unrelated_file()
+        sentinel = OSError("install dir sync failed")
+        with mock.patch(
+            "offline_coordination.storage._fsync_dir", side_effect=sentinel
+        ):
+            with self.assertRaises(OSError) as caught:
+                self.commit()
+        self.assertIs(caught.exception, sentinel)
+        self.assert_rolled_back(before, unrelated)
+
+    def test_cleanup_dir_sync_failure_rolls_back(self) -> None:
+        before = read_bytes(self.fork.target_path)
+        unrelated = self.plant_unrelated_file()
+        sentinel = OSError("cleanup dir sync failed")
+        syncs = []
+
+        def flaky_fsync(path):
+            syncs.append(path)
+            # Only the cleanup sync (after the predecessor backup was
+            # already unlinked) fails; the install sync and every
+            # rollback sync succeed.
+            if len(syncs) == 2:
+                raise sentinel
+
+        with mock.patch(
+            "offline_coordination.storage._fsync_dir", side_effect=flaky_fsync
+        ):
+            with self.assertRaises(OSError) as caught:
+                self.commit()
+        self.assertIs(caught.exception, sentinel)
+        self.assertGreaterEqual(len(syncs), 2)
+        self.assert_rolled_back(before, unrelated)
+
+    def test_rollback_error_does_not_replace_the_original(self) -> None:
+        sentinel = OSError("install dir sync failed")
+        # The install replace succeeds; the rollback's restore replace
+        # fails too.  The original OSError still propagates unchanged.
+        with mock.patch(
+            "offline_coordination.storage._fsync_dir", side_effect=sentinel
+        ), mock.patch(
+            "os.replace",
+            side_effect=[None, OSError("rollback replace failed")],
+        ):
+            with self.assertRaises(OSError) as caught:
+                self.commit()
+        self.assertIs(caught.exception, sentinel)
+
+
 class ArgumentTypeTest(CommitCase):
     def test_non_str_path_raises_type_error(self) -> None:
         for bad in (None, 1, b"path", True):

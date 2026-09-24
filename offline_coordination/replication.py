@@ -815,27 +815,71 @@ def _overall_status(decisions: list[str]) -> str:
     return STATUS_APPLIED if APPLY in decisions else STATUS_DUPLICATE
 
 
+def _restore_bytes_quietly(path: str, payload: bytes) -> None:
+    """Best-effort rewrite of ``payload`` to ``path`` as one replacement.
+
+    Used when the retained predecessor link is already gone and the
+    pre-call bytes survive only in memory.  Every error is swallowed so
+    the original exception propagates unchanged.
+    """
+    tmp_path: str | None = None
+    try:
+        handle, tmp_path = _reserve_tmp_file(path)
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+        storage._fsync_dir(path)
+    except OSError:
+        pass
+    finally:
+        if tmp_path is not None:
+            _remove_quietly(tmp_path)
+
+
 def _rollback_ledger_write(
     path: str,
     tmp_path: str | None,
     backup_path: str | None,
     existed: bool,
     stage: str,
+    original: bytes | None,
 ) -> None:
     """Best-effort rollback of a failed :func:`_atomic_write`.
 
     ``stage`` records how far the transaction got: ``write`` (temporary
     file written), ``link`` (predecessor hard-linked aside), ``install``
-    (temporary moved into place) or ``sync`` (the directory sync after
-    install).  The predecessor is retained as a hard link rather than
+    (temporary moved into place), ``sync`` (the directory sync after
+    install) or ``cleanup`` (the predecessor link removed, its directory
+    sync failed).  The predecessor is retained as a hard link rather than
     rewritten, so renaming it back restores the original file
     byte-for-byte (indeed as the same inode) even with no working fsync
-    or free space left.  The directory is synced last so the recovery is
-    durable.  Every recovery error is swallowed so the original
-    exception propagates unchanged.
+    or free space left; once that link is already gone, the captured
+    pre-call bytes are rewritten from memory instead.  The directory is
+    synced last so the recovery is durable.  Every recovery error is
+    swallowed so the original exception propagates unchanged.
     """
     try:
-        if stage == "sync":
+        if stage == "cleanup":
+            # The new ledger was installed and the install synced; only
+            # the backup removal or its directory sync failed.  The
+            # commit still must not stand: rename the retained link back
+            # when it survives, otherwise rewrite the captured pre-call
+            # bytes from memory.
+            _remove_quietly(tmp_path)
+            if backup_path is not None and os.path.exists(backup_path):
+                os.replace(backup_path, path)
+            elif original is not None:
+                _restore_bytes_quietly(path, original)
+            else:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+        elif stage == "sync":
+            _remove_quietly(tmp_path)
             if existed:
                 os.replace(backup_path, path)
             else:
@@ -941,18 +985,21 @@ def _atomic_write(path: str, payload: bytes) -> None:
     transaction starts -- a sweep failure cannot block the commit, which
     never depends on those names.
 
-    The temporary file's write, flush and file sync, the replacement and
-    the following directory sync all lie inside the boundary.  An existing
+    The temporary file's write, flush and file sync, the replacement,
+    the directory sync after the install and the directory sync after
+    the predecessor cleanup all lie inside the boundary.  An existing
     predecessor is retained as a hard link -- without ever removing
     ``path`` -- until the new file is installed and the directory has
-    synced, so any :class:`OSError` rolls back by renaming that link back:
-    the prior file returns byte-for-byte (as the same inode, with no
-    rewriting and therefore no dependence on a working fsync or free
-    space), and a path the call created is removed again.  The rollback
-    syncs the directory as well.  The original :class:`OSError` propagates
-    unchanged.  On success both the file and the directory have been
-    synced; the unique backup link's removal (and the matching directory
-    sync) is best-effort and never undoes a commit.
+    synced, and its pre-call bytes are additionally held in memory until
+    the cleanup sync completes, so an :class:`OSError` at any stage
+    rolls the whole transaction back: the prior file returns
+    byte-for-byte (renamed back as the same inode while the retained
+    link survives, rewritten from the captured bytes once the link was
+    already removed), and a path the call created is removed again.  The
+    rollback syncs the directory as well, and the original
+    :class:`OSError` propagates unchanged.  On success both the file and
+    the directory have been synced and neither a temporary file nor a
+    predecessor link remains.
     """
     existed = os.path.exists(path)
     # Retained fixed-name artifacts from earlier interrupted calls are
@@ -960,6 +1007,14 @@ def _atomic_write(path: str, payload: bytes) -> None:
     # a fresh transaction; the transaction itself uses unique names.
     _remove_quietly(path + ".tmp")
     _remove_quietly(path + ".old")
+
+    # The pre-call bytes are captured up front so the transaction can
+    # still be rolled back byte-for-byte after the retained predecessor
+    # link is gone.
+    original: bytes | None = None
+    if existed:
+        with open(path, "rb") as handle:
+            original = handle.read()
 
     tmp_handle, tmp_path = _reserve_tmp_file(path)
     backup_path: str | None = None
@@ -976,19 +1031,20 @@ def _atomic_write(path: str, payload: bytes) -> None:
         os.replace(tmp_path, path)
         stage = "sync"
         storage._fsync_dir(path)
-    except BaseException:
-        _rollback_ledger_write(path, tmp_path, backup_path, existed, stage)
-        raise
-
-    # The new ledger is durable from this point on; the retained
-    # predecessor link is internal cleanup only.  Its removal (and the
-    # matching directory sync) is best-effort and never undoes a commit.
-    if existed and backup_path is not None:
-        _remove_quietly(backup_path)
-        try:
+        if backup_path is not None:
+            # The backup link's removal itself is best-effort (a
+            # leftover is internal and swept by the next commit), but
+            # the directory sync persisting the cleanup belongs to the
+            # same transaction boundary: its failure still rolls the
+            # commit back instead of standing as a success.
+            stage = "cleanup"
+            _remove_quietly(backup_path)
             storage._fsync_dir(path)
-        except OSError:
-            pass
+    except BaseException:
+        _rollback_ledger_write(
+            path, tmp_path, backup_path, existed, stage, original
+        )
+        raise
 
 
 def apply_remote(path: str, request: dict) -> dict:
