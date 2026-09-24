@@ -259,6 +259,41 @@ the contiguous accepted entries -- rejected entries never enter the
 audit -- are written in one fail-safe replacement, returning
 ``applied``.  The result carries only ``next``, ``resolutionDigest``
 and ``status``.
+
+:func:`recover_authorized` adds an offline authorization and audit
+boundary around the same :func:`recover_many` batch flow.  It takes the
+ordered ledger paths, a node-keyed keyring (the same entries, validity
+and revocation rules as :func:`apply_signed_remote`, with keys selected
+by exact issuer and version), a raw byte *ticket*, the recovery audit
+path and the current moment.  The ticket is one canonical compact UTF-8
+JSON object with exactly ``payload`` and ``signature``; the payload
+holds exactly ``issuer``, ``keyVersion``, ``nonce``, ``notBefore``/
+``notAfter`` and the ordered ``paths``, and the signature is the
+lowercase hex HMAC-SHA256 over the payload's own compact JSON bytes
+(keys recursively sorted).  The command paths must equal the ticket
+paths element-for-element.  Unknown credentials, a revoked, not-yet-
+valid or expired key, an out-of-window ticket, a path mismatch and a
+bad signature raise :class:`AuthenticationError`; type faults (a
+:class:`bool` never poses as a moment) raise :class:`TypeError` and
+ticket key-set, nonce, interval, encoding or signature-format faults
+raise :class:`ValueError`, all before any ledger or audit file is read,
+so a rejected call creates no audit record, consumes no nonce and
+leaves no temporary file.  The audit
+(:mod:`offline_coordination.recovery_audit`) is a hash-chained JSONL log
+of ``batch``/``before``/``after`` records: the batch header binds the
+ticket digest, issuer and ordered paths first, each ledger records its
+pre-settlement digest, phase and planned action before it is settled
+and its new digest, status and failure category afterwards, every
+record flushed and fsynced before work continues.  Re-entering with the
+same nonce and ticket reuses the recorded results and finishes only the
+open tail, completing a ledger that recovered before its result record
+from the recorded plan without repeating the side effect; the same
+nonce bound to a different ticket raises :class:`ReplayError` (a
+:class:`ValueError`) and a corrupt chain
+:class:`CorruptRecoveryAuditError` (also a :class:`ValueError`), both
+without changing a file.  :func:`export_page` in the recovery-audit
+module pages that chain read-only by ``after``/``limit``, treating a
+missing audit as an empty chain.
 """
 
 from __future__ import annotations
@@ -270,7 +305,7 @@ import os
 import re
 from typing import BinaryIO
 
-from offline_coordination import audit, merge, storage
+from offline_coordination import audit, merge, recovery_audit, storage
 
 AFTER = "after"
 COMPLETE = "complete"
@@ -3589,3 +3624,514 @@ def commit_resolution(
     new_requests.update(material_requests)
     _atomic_write(path, _serialize_ledger(final_state, new_requests, new_entries))
     return _commit_result(accepted[-1]["seq"], resolution_digest, STATUS_APPLIED)
+
+
+# --- Authorized, audited recovery runs ---------------------------------------
+
+TICKET_PAYLOAD = "payload"
+TICKET_ISSUER = "issuer"
+TICKET_NONCE = "nonce"
+TICKET_PATHS = "paths"
+
+_TICKET_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_TICKET_PAYLOAD_KEYS = frozenset((
+    TICKET_ISSUER,
+    KEY_VERSION,
+    TICKET_NONCE,
+    NOT_BEFORE,
+    NOT_AFTER,
+    TICKET_PATHS,
+))
+
+# The recovery audit's corruption type is part of this entry point's
+# public surface and inherits ValueError, like the other corruptions here.
+CorruptRecoveryAuditError = recovery_audit.CorruptRecoveryAuditError
+
+
+class ReplayError(ValueError):
+    """A recovery nonce is already bound to a different ticket."""
+
+
+def _reject_duplicate_ticket_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate ticket keys into ValueError."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"recovery ticket has a duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _ticket_invalid(message: str) -> ValueError:
+    return ValueError(f"invalid recovery ticket: {message}")
+
+
+def _parse_recovery_ticket(raw: object) -> dict:
+    """Validate every structural rule of a recovery ticket's bytes.
+
+    The ticket is one canonical compact UTF-8 JSON object (keys
+    recursively sorted, no trailing whitespace) with exactly the keys
+    ``payload`` and ``signature``; ``payload`` is itself an object with
+    exactly ``issuer``, ``keyVersion``, ``nonce``, ``notBefore``,
+    ``notAfter`` and ``paths``.  The signature's shape is checked like any
+    field; whether it matches the payload is decided afterwards as an
+    authentication failure, never a format error.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("ticket must be bytes")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _ticket_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(text, object_pairs_hook=_reject_duplicate_ticket_keys)
+    except json.JSONDecodeError as exc:
+        raise _ticket_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict) or set(data.keys()) != _TICKET_TOP_KEYS:
+        raise _ticket_invalid(
+            "ticket must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("ticket signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
+        raise _ticket_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise _ticket_invalid("payload must be a JSON object")
+    if set(payload.keys()) != _TICKET_PAYLOAD_KEYS:
+        raise _ticket_invalid(
+            "payload must contain exactly the keys 'issuer', 'keyVersion', "
+            "'nonce', 'notBefore', 'notAfter' and 'paths'"
+        )
+
+    issuer = payload[TICKET_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("ticket issuer must be a str")
+    if issuer == "":
+        raise _ticket_invalid("issuer must be non-empty")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("ticket keyVersion must be an int")
+    if key_version <= 0:
+        raise _ticket_invalid("keyVersion must be positive")
+    nonce = payload[TICKET_NONCE]
+    if not isinstance(nonce, str):
+        raise TypeError("ticket nonce must be a str")
+    if recovery_audit.NONCE_RE.fullmatch(nonce) is None:
+        raise _ticket_invalid(
+            "nonce must be 16 to 64 URL-safe characters "
+            "(A-Z, a-z, 0-9, '-' or '_')"
+        )
+    bounds: dict[str, int] = {}
+    for bound_key in (NOT_BEFORE, NOT_AFTER):
+        bound = payload[bound_key]
+        if isinstance(bound, bool) or not isinstance(bound, int):
+            raise TypeError(f"ticket {bound_key} must be an int")
+        if bound < 0:
+            raise _ticket_invalid(f"{bound_key} must be non-negative")
+        bounds[bound_key] = bound
+    if bounds[NOT_BEFORE] > bounds[NOT_AFTER]:
+        raise _ticket_invalid("notBefore must not exceed notAfter")
+    ticket_paths = payload[TICKET_PATHS]
+    if not isinstance(ticket_paths, list):
+        raise TypeError("ticket paths must be a list")
+    if not ticket_paths:
+        raise _ticket_invalid("paths must be a non-empty list")
+    seen: set[str] = set()
+    for position, path in enumerate(ticket_paths):
+        if not isinstance(path, str):
+            raise TypeError(f"ticket paths entry {position} must be str")
+        if path == "":
+            raise _ticket_invalid("paths entries must be non-empty")
+        if path in seen:
+            raise _ticket_invalid(f"paths entry {path!r} is repeated")
+        seen.add(path)
+
+    # The bytes must be the single canonical compact form with recursively
+    # sorted keys: no whitespace, no permuted keys, no trailing newline.
+    canonical = json.dumps(
+        data, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if canonical != raw:
+        raise _ticket_invalid("encoding is not the canonical compact form")
+
+    return {
+        TICKET_PAYLOAD: {
+            TICKET_ISSUER: issuer,
+            KEY_VERSION: key_version,
+            TICKET_NONCE: nonce,
+            NOT_BEFORE: bounds[NOT_BEFORE],
+            NOT_AFTER: bounds[NOT_AFTER],
+            TICKET_PATHS: list(ticket_paths),
+        },
+        SIGNATURE: signature,
+    }
+
+
+def _ticket_payload_bytes(payload: dict) -> bytes:
+    """The signed ticket text: compact JSON of the payload, keys sorted."""
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _before_detail_for(path: str) -> dict:
+    """Read-only pre-settlement plan for one ledger's ``before`` record.
+
+    Uses the same read-only classification as :func:`inspect_recovery`:
+    a valid intent contributes its phase and predetermined action, a
+    corrupt or unreadable intent contributes nulls, and the digest is the
+    current ledger digest or null when the path is missing or unreadable.
+    Nothing is modified.
+    """
+    inspection = _inspect_one(path)
+    return {
+        recovery_audit.PATH: path,
+        recovery_audit.PHASE: inspection["phase"],
+        recovery_audit.ACTION: inspection["action"],
+        recovery_audit.DIGEST: inspection["digest"],
+    }
+
+
+def _settle_for_audit(path: str) -> dict:
+    """Settle one ledger and return its ``recover_many``-shaped report.
+
+    A :class:`CorruptRecoveryError` is isolated as ``blocked``/
+    ``corrupt`` and an :class:`OSError` as ``failed``/``os-error`` exactly
+    as in :func:`recover_many`; one ledger's failure never stops the run.
+    """
+    try:
+        result = recover_ledger(path)
+    except CorruptRecoveryError:
+        return {
+            "path": path,
+            STATUS: STATUS_BLOCKED,
+            "digest": None,
+            "error": ERROR_CORRUPT,
+        }
+    except OSError:
+        return {
+            "path": path,
+            STATUS: STATUS_FAILED,
+            "digest": None,
+            "error": ERROR_OS_ERROR,
+        }
+    return {
+        "path": path,
+        STATUS: result[STATUS],
+        "digest": result["digest"],
+        "error": None,
+    }
+
+
+def _after_detail_for(report: dict) -> dict:
+    """One ``after`` record detail from a settlement report."""
+    return {
+        recovery_audit.PATH: report["path"],
+        recovery_audit.STATUS: report[STATUS],
+        recovery_audit.ERROR: report["error"],
+        recovery_audit.DIGEST: report["digest"],
+    }
+
+
+def _report_from_after(detail: dict) -> dict:
+    """Reconstruct one ``recover_many``-shaped report from an after detail."""
+    return {
+        "path": detail[recovery_audit.PATH],
+        STATUS: detail[recovery_audit.STATUS],
+        "digest": detail[recovery_audit.DIGEST],
+        "error": detail[recovery_audit.ERROR],
+    }
+
+
+def _process_ledger(audit_path: str, path: str) -> dict:
+    """Durably run one ledger: ``before``, settle, ``after``.
+
+    The ``before`` record is written, flushed and synced before the
+    ledger is settled, and the ``after`` record is equally durable before
+    the run continues, so a crash anywhere leaves a consistent prefix
+    that a re-entry can resume without repeating a side effect.
+    """
+    recovery_audit.append_record(
+        audit_path, recovery_audit.KIND_BEFORE, _before_detail_for(path)
+    )
+    report = _settle_for_audit(path)
+    recovery_audit.append_record(
+        audit_path, recovery_audit.KIND_AFTER, _after_detail_for(report)
+    )
+    return report
+
+
+def _resume_open_item(audit_path: str, path: str, before: dict) -> dict:
+    """Complete a ledger whose ``before`` record is durable but whose
+    ``after`` record never made it.
+
+    The settlement itself (:func:`recover_ledger`) is idempotent, so it is
+    simply run again; when it reports ``clean`` because the recorded
+    action already finished before the crash, the recorded plan supplies
+    the true status (``rolled-back``/``completed``) rather than performing
+    anything a second time.
+    """
+    try:
+        result = recover_ledger(path)
+    except CorruptRecoveryError:
+        report = {
+            "path": path,
+            STATUS: STATUS_BLOCKED,
+            "digest": None,
+            "error": ERROR_CORRUPT,
+        }
+    except OSError:
+        report = {
+            "path": path,
+            STATUS: STATUS_FAILED,
+            "digest": None,
+            "error": ERROR_OS_ERROR,
+        }
+    else:
+        status = result[STATUS]
+        planned = before[recovery_audit.ACTION]
+        if status == STATUS_CLEAN and planned is not None:
+            # The intent is gone because the recorded action settled the
+            # ledger before the crash; report that action, not the
+            # no-op "clean" a second settlement observes.
+            status = (
+                STATUS_ROLLED_BACK
+                if planned == recovery_audit.ACTION_ROLLBACK
+                else STATUS_COMPLETED
+            )
+        report = {
+            "path": path,
+            STATUS: status,
+            "digest": result["digest"],
+            "error": None,
+        }
+    recovery_audit.append_record(
+        audit_path, recovery_audit.KIND_AFTER, _after_detail_for(report)
+    )
+    return report
+
+
+def _run_pairs(
+    records: list[dict], batch_index: int
+) -> list[tuple[dict, dict | None]]:
+    """Collect a run's (before, after-or-None) pairs after its batch.
+
+    The run ends at the next batch record or the chain tail; the chain's
+    own ordering rules already guarantee alternating before/after
+    records, so only the trailing item may be open.
+    """
+    pairs: list[tuple[dict, dict | None]] = []
+    tail = records[batch_index + 1:]
+    position = 0
+    while position < len(tail):
+        record = tail[position]
+        if record[recovery_audit.KIND] == recovery_audit.KIND_BATCH:
+            break
+        before = record[recovery_audit.DETAIL]
+        after: dict | None = None
+        if (
+            position + 1 < len(tail)
+            and tail[position + 1][recovery_audit.KIND]
+            == recovery_audit.KIND_AFTER
+        ):
+            after = tail[position + 1][recovery_audit.DETAIL]
+            position += 2
+        else:
+            position += 1
+        pairs.append((before, after))
+    return pairs
+
+
+def recover_authorized(
+    paths: list[str],
+    keyring: dict,
+    ticket: bytes,
+    audit_path: str,
+    moment: int,
+) -> list[dict]:
+    """Run an authorized, audited recovery batch.
+
+    Full authorization finishes before any ledger or the audit is read:
+    ``paths`` must be a non-empty list of non-empty, distinct strings and
+    must equal the ticket payload's ordered ``paths`` element-for-element
+    (no added, dropped, reordered or implicitly normalized entry);
+    ``keyring`` follows the same node-keyed shape, entry fields and
+    validity/revocation rules as :func:`apply_signed_remote`; ``ticket``
+    is the compact UTF-8 JSON byte string ``{"payload": ...,
+    "signature": ...}`` whose payload contains exactly ``issuer``,
+    ``keyVersion``, ``nonce``, ``notBefore``/``notAfter`` and the ordered
+    ``paths``; ``moment`` is a non-negative non-bool int.  The signature
+    is the lowercase hex HMAC-SHA256 over the payload's canonical compact
+    encoding (keys recursively sorted), keyed by the entry selected for
+    the exact issuer and key version.
+
+    Unknown credentials, a revoked, not-yet-valid or expired key, a
+    ticket outside its own validity window, an unauthorized path list
+    and a wrong signature all raise :class:`AuthenticationError` (a
+    :class:`ValueError`).  Type faults in the arguments, bytes, paths or
+    moment (a bool never poses as a moment) raise :class:`TypeError`;
+    ticket key sets, the nonce, validity windows, encoding or signature
+    format raise :class:`ValueError`.  A rejected call creates no audit
+    record, consumes no nonce and leaves no temporary file behind.
+
+    On a nonce's first use the batch header -- ticket digest, issuer and
+    the ordered paths -- is persisted first; each ledger then gets a
+    ``before`` record (current digest, recovery phase, predetermined
+    action), is settled in :func:`recover_many` order and receives an
+    ``after`` record (new digest, status, failure category), every record
+    flushed and synced before work continues.  The return value keeps the
+    public :func:`recover_many` item shape -- ``path``, ``status``,
+    ``digest``, ``error`` -- and blocked/system failures stay isolated per
+    ledger.  Re-entering with the same nonce and the same ticket reuses
+    the recorded results and only settles the still-open tail; a crash
+    between a ledger's recovery and its result record is completed from
+    the recorded plan and digest without repeating the side effect.  The
+    same nonce bound to a different ticket raises :class:`ReplayError`
+    (a :class:`ValueError`) without touching a file.  A corrupt audit
+    chain raises :class:`CorruptRecoveryAuditError`; audit reads, writes,
+    flushes or syncs failing raise :class:`OSError` unchanged, leaving a
+    retryable consistent prefix.
+    """
+    # --- Pure input validation and authentication: no file is touched. ----
+    validated_paths = _validated_path_list(paths)
+    validated_keyring = _validated_keyring(keyring)
+    parsed_ticket = _parse_recovery_ticket(ticket)
+    if not isinstance(audit_path, str):
+        raise TypeError("audit_path must be a str")
+    if audit_path == "":
+        raise ValueError("audit_path must be non-empty")
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+
+    payload = parsed_ticket[TICKET_PAYLOAD]
+    signature = parsed_ticket[SIGNATURE]
+    issuer = payload[TICKET_ISSUER]
+    key_version = payload[KEY_VERSION]
+    nonce = payload[TICKET_NONCE]
+    ticket_paths = payload[TICKET_PATHS]
+    payload_bytes = _ticket_payload_bytes(payload)
+    ticket_digest = hashlib.sha256(payload_bytes).hexdigest()
+
+    entry = next(
+        (
+            candidate
+            for candidate in validated_keyring.get(issuer, ())
+            if candidate[VERSION] == key_version
+        ),
+        None,
+    )
+    if entry is None:
+        raise AuthenticationError(
+            f"no credentials for issuer {issuer!r} and key version "
+            f"{key_version}"
+        )
+    if entry[REVOKED]:
+        raise AuthenticationError(
+            f"credentials for issuer {issuer!r} key version {key_version} "
+            "are revoked"
+        )
+    if moment < entry[NOT_BEFORE] or moment > entry[NOT_AFTER]:
+        raise AuthenticationError(
+            f"credentials for issuer {issuer!r} key version {key_version} "
+            f"are not valid at moment {moment}"
+        )
+    if (
+        moment < payload[NOT_BEFORE]
+        or moment > payload[NOT_AFTER]
+    ):
+        raise AuthenticationError(
+            f"recovery ticket is not valid at moment {moment}"
+        )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        payload_bytes,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError("signature does not match the ticket payload")
+    if ticket_paths != validated_paths:
+        raise AuthenticationError(
+            "command paths do not match the ticket's authorized paths exactly"
+        )
+
+    # --- Only now is the durable audit consulted. --------------------------
+    records = recovery_audit.read_chain(audit_path)
+
+    matching_batches = [
+        index
+        for index, record in enumerate(records)
+        if record[recovery_audit.KIND] == recovery_audit.KIND_BATCH
+        and record[recovery_audit.DETAIL][recovery_audit.NONCE] == nonce
+    ]
+    for index in matching_batches:
+        if (
+            records[index][recovery_audit.DETAIL][recovery_audit.TICKET_DIGEST]
+            != ticket_digest
+        ):
+            raise ReplayError(
+                f"recovery nonce {nonce!r} is already bound to a different "
+                "ticket"
+            )
+
+    if matching_batches:
+        batch_index = matching_batches[-1]
+        pairs = _run_pairs(records, batch_index)
+        expected_order = validated_paths[: len(pairs)]
+        recorded_order = [before[recovery_audit.PATH] for before, _ in pairs]
+        if recorded_order != expected_order:
+            raise recovery_audit.CorruptRecoveryAuditError(
+                "invalid recovery audit: recorded items do not follow the "
+                "ticket path order"
+            )
+        for before, after in pairs:
+            if after is not None and after[recovery_audit.PATH] != before[
+                recovery_audit.PATH
+            ]:
+                raise recovery_audit.CorruptRecoveryAuditError(
+                    "invalid recovery audit: after record path does not match "
+                    "its before record"
+                )
+
+        reports = [
+            _report_from_after(after)
+            for _before, after in pairs
+            if after is not None
+        ]
+        closed = len(reports)
+        if pairs and pairs[-1][1] is None:
+            # Crash after the ledger was settled but before its result was
+            # recorded: complete it from the durable plan, no second
+            # side effect.
+            before = pairs[-1][0]
+            reports.append(
+                _resume_open_item(audit_path, validated_paths[closed], before)
+            )
+            closed += 1
+        if closed == len(validated_paths):
+            return reports
+        # Finish the never-started tail in the normal order.
+        for path in validated_paths[closed:]:
+            reports.append(_process_ledger(audit_path, path))
+        return reports
+
+    # First use of this nonce: the batch header (ticket digest, issuer and
+    # ordered paths) is durable before any ledger is read for settlement.
+    recovery_audit.append_record(
+        audit_path,
+        recovery_audit.KIND_BATCH,
+        {
+            recovery_audit.ISSUER: issuer,
+            recovery_audit.NONCE: nonce,
+            recovery_audit.PATHS: list(validated_paths),
+            recovery_audit.TICKET_DIGEST: ticket_digest,
+        },
+    )
+    return [_process_ledger(audit_path, path) for path in validated_paths]
