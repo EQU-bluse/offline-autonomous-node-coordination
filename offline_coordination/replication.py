@@ -306,6 +306,51 @@ without modifying any file, and a corrupt chain raises
 :func:`export_recovery_audit` pages the recovery audit read-only:
 ``after``/``limit`` select the window, the whole chain is validated
 and a missing audit is treated as an empty chain.
+
+:func:`export_recovery_checkpoint` adds an offline signature anchor
+over the same chain.  It takes the audit path, a keyring, an issuer,
+a key version and a moment, reads and validates the whole chain
+read-only and returns one canonical compact UTF-8 JSON object -- keys
+recursively sorted, non-ASCII preserved, no trailing newline or any
+other trailing byte -- carrying exactly ``payload`` and ``signature``.
+The payload binds exactly ``issuer``, ``keyVersion``, ``lastSeq``,
+``moment``, ``tail`` and ``version`` (the integer 1); ``lastSeq`` is
+the chain's last seq (0 for a missing audit) and ``tail`` the last
+record hash (the zero hash for an empty chain).  The signature is the
+lowercase hex HMAC-SHA256 of the canonical compact payload bytes under
+the key the keyring binds to the exact issuer and version, with no
+fallback; unknown credentials and a revoked, not-yet-valid or expired
+key raise :class:`AuthenticationError`, a corrupt chain raises
+:class:`CorruptRecoveryAuditError` and an :class:`OSError` while
+reading propagates unchanged.
+
+:func:`verify_recovery_page` verifies a paging dict against such a
+checkpoint entirely offline: it reads no file.  The checkpoint is
+parsed and its HMAC is verified against the current keyring (exact
+issuer/version, usable at the given moment, so a later revocation or
+expiry rejects the checkpoint as it does a replay); the moment bound
+into the payload is part of the signed anchor itself and needs no
+equality with the verification time.  The first round passes no cursor
+and the page's ``after`` must be zero; every later round passes the
+``{"digest", "next", "tail"}`` cursor built from the previous result,
+requiring ``after`` to equal the cursor's ``next``, the first record
+to chain to the cursor's ``tail`` and the cursor ``digest`` to equal
+this checkpoint's SHA-256 digest, so a cursor can never resume
+another checkpoint.  Every page's records must be contiguous from
+``after + 1`` (no gap, reordering or duplicate), hash-correct and
+chained inside the page and across its boundaries, and verification
+never crosses the signed ``lastSeq``; before that seq an empty page
+or a wrong ``complete`` flag is rejected as an invalid page.  The
+result carries the fixed keys ``digest``, ``lastSeq``, ``status`` and
+``tail``: reaching the signed tail yields ``"verified"``, every
+earlier page ``"continue"``.  An empty checkpoint accepts only an
+empty page starting at zero and reports seq 0, the zero hash and
+``"verified"``.  Type faults raise :class:`TypeError` (a bool never
+poses as an int), keyring faults raise :class:`ValueError`,
+checkpoint faults raise :class:`InvalidRecoveryCheckpointError` and
+page or cursor faults raise :class:`InvalidRecoveryPageError`; both
+format errors subclass :class:`ValueError`.  No input or file is
+modified.
 """
 
 from __future__ import annotations
@@ -4255,4 +4300,658 @@ def export_recovery_audit(path: str, after: int = 0, limit: int = 100) -> dict:
         COMPLETE: next_seq == last_seq,
         NEXT: next_seq,
         RECORDS: [dict(record) for record in selected],
+    }
+
+
+# --- Signed recovery checkpoints and offline page verification --------------
+
+CHECKPOINT_VERSION = 1
+
+CP_DIGEST = "digest"
+CP_ISSUER = TICKET_ISSUER
+CP_KEY_VERSION = KEY_VERSION
+CP_MOMENT = "moment"
+CP_LAST_SEQ = "lastSeq"
+CP_TAIL = "tail"
+
+_CHECKPOINT_TOP_KEYS = frozenset((
+    TICKET_PAYLOAD,
+    SIGNATURE,
+))
+_CHECKPOINT_PAYLOAD_KEYS = frozenset((
+    CP_ISSUER,
+    CP_KEY_VERSION,
+    CP_LAST_SEQ,
+    CP_MOMENT,
+    CP_TAIL,
+    VERSION,
+))
+_PAGE_KEYS = frozenset((AFTER, COMPLETE, NEXT, RECORDS))
+_CURSOR_KEYS = frozenset((CP_DIGEST, NEXT, CP_TAIL))
+
+_VERIFY_CONTINUE = "continue"
+_VERIFY_VERIFIED = "verified"
+
+
+class InvalidRecoveryCheckpointError(ValueError):
+    """Recovery checkpoint bytes fail their format or anchor contract."""
+
+
+class InvalidRecoveryPageError(ValueError):
+    """A recovery page or cursor fails its format or continuity contract."""
+
+
+def _checkpoint_invalid(message: str) -> InvalidRecoveryCheckpointError:
+    return InvalidRecoveryCheckpointError(f"invalid recovery checkpoint: {message}")
+
+
+def _page_invalid(message: str) -> InvalidRecoveryPageError:
+    return InvalidRecoveryPageError(f"invalid recovery page: {message}")
+
+
+def _reject_duplicate_checkpoint_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate checkpoint keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _checkpoint_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _checkpoint_compact(obj: object) -> bytes:
+    """Canonical compact sorted-key UTF-8 JSON of checkpoint content."""
+    return json.dumps(
+        obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _select_checkpoint_key(
+    keyring: dict[str, list[dict]], issuer: str, key_version: int
+) -> dict:
+    """Pick the key bound to exactly ``issuer`` and ``key_version``.
+
+    Selection is exact with no fallback; missing credentials raise
+    :class:`AuthenticationError`.
+    """
+    for candidate in keyring.get(issuer, ()):
+        if candidate[VERSION] == key_version:
+            return candidate
+    raise AuthenticationError(
+        f"no credentials for issuer {issuer!r} and key version {key_version}"
+    )
+
+
+def _usable_checkpoint_key(
+    keyring: dict[str, list[dict]],
+    issuer: str,
+    key_version: int,
+    moment: int,
+) -> dict:
+    """Select the exact key and require it to be usable at ``moment``.
+
+    Unknown credentials and a revoked, not-yet-valid or expired key
+    raise :class:`AuthenticationError`; selection never falls back to
+    another version.
+    """
+    entry = _select_checkpoint_key(keyring, issuer, key_version)
+    if entry[REVOKED]:
+        raise AuthenticationError(
+            f"credentials for issuer {issuer!r} key version {key_version} "
+            "are revoked"
+        )
+    if moment < entry[NOT_BEFORE]:
+        raise AuthenticationError(
+            f"credentials for issuer {issuer!r} key version {key_version} "
+            "are not yet valid"
+        )
+    if moment > entry[NOT_AFTER]:
+        raise AuthenticationError(
+            f"credentials for issuer {issuer!r} key version {key_version} "
+            "have expired"
+        )
+    return entry
+
+
+def _checkpoint_payload_bytes(payload: dict) -> bytes:
+    """The signed canonical bytes: the payload alone, compact and sorted."""
+    return _checkpoint_compact(payload)
+
+
+def _parse_checkpoint(raw: object) -> tuple[dict, str]:
+    """Validate checkpoint bytes structurally into ``(payload, signature)``.
+
+    A non-bytes argument or a field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, range, shape or canonical-format fault raises
+    :class:`InvalidRecoveryCheckpointError`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("checkpoint must be bytes")
+    # The checkpoint carries no terminator of any kind: no trailing
+    # newline and no other byte past the closing brace.
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _checkpoint_invalid("must end with the closing brace, no LF")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _checkpoint_invalid("is not valid UTF-8") from exc
+    try:
+        # The pairs hook raises directly on duplicate object keys.
+        data = json.loads(text, object_pairs_hook=_reject_duplicate_checkpoint_keys)
+    except json.JSONDecodeError as exc:
+        raise _checkpoint_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("checkpoint must be a JSON object")
+    if set(data.keys()) != _CHECKPOINT_TOP_KEYS:
+        raise _checkpoint_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("checkpoint signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
+        raise _checkpoint_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("checkpoint payload must be a dict")
+    if set(payload.keys()) != _CHECKPOINT_PAYLOAD_KEYS:
+        raise _checkpoint_invalid(
+            "payload must contain exactly the keys 'issuer', 'keyVersion', "
+            "'lastSeq', 'moment', 'tail' and 'version'"
+        )
+    issuer = payload[CP_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("checkpoint issuer must be a str")
+    if issuer == "":
+        raise _checkpoint_invalid("issuer must be non-empty")
+    key_version = payload[CP_KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("checkpoint keyVersion must be an int")
+    if key_version <= 0:
+        raise _checkpoint_invalid("keyVersion must be positive")
+    moment = payload[CP_MOMENT]
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("checkpoint moment must be an int")
+    if moment < 0:
+        raise _checkpoint_invalid("moment must be non-negative")
+    last_seq = payload[CP_LAST_SEQ]
+    if isinstance(last_seq, bool) or not isinstance(last_seq, int):
+        raise TypeError("checkpoint lastSeq must be an int")
+    if last_seq < 0:
+        raise _checkpoint_invalid("lastSeq must be >= 0")
+    tail = payload[CP_TAIL]
+    if not isinstance(tail, str):
+        raise TypeError("checkpoint tail must be a str")
+    if not _is_digest(tail):
+        raise _checkpoint_invalid(
+            "tail must be 64 lowercase hex characters"
+        )
+    if last_seq == 0 and tail != _RECOVERY_AUDIT_ZERO_HASH:
+        raise _checkpoint_invalid(
+            "tail must be the zero hash when lastSeq is 0"
+        )
+    version = payload[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("checkpoint version must be an int")
+    if version != CHECKPOINT_VERSION:
+        raise _checkpoint_invalid("version must be the integer 1")
+
+    # The bytes must be the single canonical compact form with sorted
+    # keys and no trailing byte whatsoever.
+    if _checkpoint_compact(data) != raw:
+        raise _checkpoint_invalid("encoding is not the canonical compact form")
+    return payload, signature
+
+
+def export_recovery_checkpoint(
+    audit: str,
+    keyring: dict,
+    issuer: str,
+    version: int,
+    moment: int,
+) -> bytes:
+    """Export a signed checkpoint anchoring the recovery audit prefix.
+
+    The recovery audit at ``audit`` is read and validated in full but
+    never modified; a missing audit file stands for the empty chain
+    (last seq 0, zero tail hash).  The checkpoint binds the checkpoint
+    format ``version``, the signing ``issuer``, the selected key
+    version, the ``moment``, the chain's last seq and the chain tail
+    (the last record hash, or the zero hash for an empty chain), and
+    carries the lowercase hex HMAC-SHA256 of the canonical compact
+    payload bytes under the key the keyring binds to the exact issuer
+    and version -- with no fallback.
+
+    The result is one canonical compact UTF-8 JSON object -- every
+    object key recursively sorted lexicographically, non-ASCII
+    preserved -- carrying exactly ``payload`` and ``signature``, with
+    no trailing newline or any other trailing byte.
+
+    Type faults in the arguments raise :class:`TypeError` (a
+    :class:`bool` never poses as an int); keyring structure or format
+    faults raise :class:`ValueError`.  Unknown credentials and a
+    revoked, not-yet-valid or expired key at ``moment`` raise
+    :class:`AuthenticationError` (a :class:`ValueError`); a corrupt
+    audit chain raises :class:`CorruptRecoveryAuditError` and an
+    :class:`OSError` while reading propagates unchanged.
+    """
+    if not isinstance(audit, str):
+        raise TypeError("audit must be a str")
+    validated_keyring = _validated_keyring(keyring)
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+
+    entry = _usable_checkpoint_key(validated_keyring, issuer, version, moment)
+
+    records = _read_recovery_audit(audit)
+    last_seq = records[-1]["seq"] if records else 0
+    tail = records[-1]["hash"] if records else _RECOVERY_AUDIT_ZERO_HASH
+
+    payload = {
+        CP_ISSUER: issuer,
+        CP_KEY_VERSION: version,
+        CP_LAST_SEQ: last_seq,
+        CP_MOMENT: moment,
+        CP_TAIL: tail,
+        VERSION: CHECKPOINT_VERSION,
+    }
+    payload_bytes = _checkpoint_payload_bytes(payload)
+    signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        payload_bytes,
+        hashlib.sha256,
+    ).hexdigest()
+    return _checkpoint_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+def _page_field_type_error(message: str) -> TypeError:
+    return TypeError(f"invalid recovery page: {message}")
+
+
+def _validated_page_records(
+    records: list, start_seq: int, opening_prev: str | None
+) -> str:
+    """Validate every record of a page and its full hash chain.
+
+    Records must occupy the contiguous seqs ``start_seq + 1`` through
+    ``start_seq + len(records)``; the first record's ``prev`` must equal
+    ``opening_prev`` when one is supplied (the zero hash on the first
+    page or the cursor tail on later pages) and is only shape-checked
+    when it is ``None``.  Every later record chains to its predecessor's
+    hash and every stored hash is recomputed.
+
+    Field type faults raise :class:`TypeError` (a :class:`bool` never
+    poses as an int); key-set, domain, gap, reordering, duplicate, hash
+    and chain faults raise :class:`InvalidRecoveryPageError`.  Returns
+    the tail hash of the page's last record.
+    """
+    expected_seq = start_seq
+    expected_prev = opening_prev
+    for index, record in enumerate(records):
+        where = f"record {index}"
+        if not isinstance(record, dict):
+            raise _page_field_type_error(f"{where} must be a dict")
+        kind = record.get("kind")
+        if "kind" not in record:
+            raise _page_invalid(f"{where} is missing its kind")
+        if not isinstance(kind, str):
+            raise _page_field_type_error(f"{where} kind must be a str")
+        if kind not in _RECOVERY_AUDIT_KIND_KEYS:
+            raise _page_invalid(
+                f"{where} kind must be 'batch', 'before' or 'after'"
+            )
+        if set(record.keys()) != _RECOVERY_AUDIT_KIND_KEYS[kind]:
+            raise _page_invalid(f"{where} has the wrong keys for its kind")
+        seq = record["seq"]
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            raise _page_field_type_error(f"{where} seq must be an int")
+        prev = record["prev"]
+        digest = record["hash"]
+        if not isinstance(prev, str):
+            raise _page_field_type_error(f"{where} prev must be a str")
+        if not _is_digest(prev):
+            raise _page_invalid(
+                f"{where} prev must be 64 lowercase hex characters"
+            )
+        if not isinstance(digest, str):
+            raise _page_field_type_error(f"{where} hash must be a str")
+        if not _is_digest(digest):
+            raise _page_invalid(
+                f"{where} hash must be 64 lowercase hex characters"
+            )
+        expected_seq += 1
+        if seq != expected_seq:
+            raise _page_invalid(
+                f"{where} seq is {seq}, expected {expected_seq}"
+            )
+        if expected_prev is not None and prev != expected_prev:
+            raise _page_invalid(
+                f"{where} prev does not chain to the previous record hash"
+            )
+        nonce = record[TICKET_NONCE]
+        if not isinstance(nonce, str):
+            raise _page_field_type_error(f"{where} nonce must be a str")
+        if nonce == "":
+            raise _page_invalid(f"{where} nonce must be non-empty")
+        if kind == AUDIT_KIND_BATCH:
+            issuer_value = record[TICKET_ISSUER]
+            if not isinstance(issuer_value, str):
+                raise _page_field_type_error(f"{where} issuer must be a str")
+            if issuer_value == "":
+                raise _page_invalid(f"{where} issuer must be non-empty")
+            ticket_digest = record[TICKET_DIGEST]
+            if not isinstance(ticket_digest, str):
+                raise _page_field_type_error(
+                    f"{where} ticketDigest must be a str"
+                )
+            if not _is_digest(ticket_digest):
+                raise _page_invalid(
+                    f"{where} ticketDigest must be 64 lowercase hex characters"
+                )
+            paths_value = record[TICKET_PATHS]
+            if not isinstance(paths_value, list):
+                raise _page_field_type_error(f"{where} paths must be an array")
+            if not paths_value:
+                raise _page_invalid(f"{where} paths must be a non-empty array")
+            seen_paths: set[str] = set()
+            for element in paths_value:
+                if not isinstance(element, str):
+                    raise _page_field_type_error(
+                        f"{where} paths must hold str"
+                    )
+                if element == "":
+                    raise _page_invalid(
+                        f"{where} paths must hold non-empty str"
+                    )
+                if element in seen_paths:
+                    raise _page_invalid(f"{where} paths must be distinct")
+                seen_paths.add(element)
+        else:
+            path_value = record["path"]
+            if not isinstance(path_value, str):
+                raise _page_field_type_error(f"{where} path must be a str")
+            if path_value == "":
+                raise _page_invalid(f"{where} path must be non-empty")
+            digest_value = record["digest"]
+            if digest_value is not None:
+                if not isinstance(digest_value, str):
+                    raise _page_field_type_error(
+                        f"{where} digest must be a str or null"
+                    )
+                if not _is_digest(digest_value):
+                    raise _page_invalid(
+                        f"{where} digest must be null or 64 lowercase hex "
+                        "characters"
+                    )
+            if kind == AUDIT_KIND_BEFORE:
+                phase = record["phase"]
+                action = record["action"]
+                if phase is not None and not isinstance(phase, str):
+                    raise _page_field_type_error(f"{where} phase must be a str")
+                if action is not None and not isinstance(action, str):
+                    raise _page_field_type_error(f"{where} action must be a str")
+                if phase is not None and phase not in _RECOVERY_AUDIT_PHASES:
+                    raise _page_invalid(
+                        f"{where} phase must be null, 'prepared' or 'installed'"
+                    )
+                if action is not None and action not in _RECOVERY_AUDIT_ACTIONS:
+                    raise _page_invalid(
+                        f"{where} action must be null, 'rollback' or 'complete'"
+                    )
+            else:
+                status_value = record["status"]
+                error_value = record["error"]
+                if not isinstance(status_value, str):
+                    raise _page_field_type_error(f"{where} status must be a str")
+                if status_value not in _RECOVERY_AUDIT_STATUSES:
+                    raise _page_invalid(
+                        f"{where} status is not a known recovery status"
+                    )
+                if error_value is not None and not isinstance(error_value, str):
+                    raise _page_field_type_error(f"{where} error must be a str")
+                if (
+                    error_value is not None
+                    and error_value not in _RECOVERY_AUDIT_ERRORS
+                ):
+                    raise _page_invalid(
+                        f"{where} error must be null, 'corrupt' or 'os-error'"
+                    )
+        without_hash = {
+            key: value for key, value in record.items() if key != "hash"
+        }
+        if digest != _audit_record_hash(without_hash):
+            raise _page_invalid(f"{where} hash does not match its contents")
+        expected_prev = digest
+    return expected_prev if records else (opening_prev or _RECOVERY_AUDIT_ZERO_HASH)
+
+
+def _parse_page(
+    page: dict, start_seq: int, opening_prev: str | None
+) -> tuple[int, int, bool, list, str]:
+    """Validate one offline page against its expected opening position.
+
+    Returns ``(after, next, complete, records, tail)``.  Field type
+    faults raise :class:`TypeError`; key-set, range, gap, reordering,
+    duplicate, boundary and chain faults raise
+    :class:`InvalidRecoveryPageError`.
+    """
+    if set(page.keys()) != _PAGE_KEYS:
+        raise _page_invalid(
+            "page must contain exactly the keys 'after', 'complete', "
+            "'next' and 'records'"
+        )
+    after = page[AFTER]
+    next_seq = page[NEXT]
+    complete = page[COMPLETE]
+    records = page[RECORDS]
+    for key, value in ((AFTER, after), (NEXT, next_seq)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise _page_field_type_error(f"{key} must be an int")
+        if value < 0:
+            raise _page_invalid(f"{key} must be >= 0")
+    if not isinstance(complete, bool):
+        raise _page_field_type_error("complete must be a bool")
+    if not isinstance(records, list):
+        raise _page_field_type_error("records must be an array")
+    if after != start_seq:
+        raise _page_invalid(
+            "page after does not match the expected resume position"
+        )
+
+    tail = _validated_page_records(records, start_seq, opening_prev)
+    expected_next = records[-1]["seq"] if records else after
+    if next_seq != expected_next:
+        raise _page_invalid(
+            "next must be the last record seq, or after when the page is empty"
+        )
+    return after, next_seq, complete, records, tail
+
+
+def _parse_cursor(cursor: dict) -> tuple[str, int, str]:
+    """Validate a resume cursor into ``(checkpoint_digest, next, tail)``."""
+    if set(cursor.keys()) != _CURSOR_KEYS:
+        raise _page_invalid(
+            "cursor must contain exactly the keys 'digest', 'next' and 'tail'"
+        )
+    cursor_digest = cursor[CP_DIGEST]
+    cursor_next = cursor[NEXT]
+    cursor_tail = cursor[CP_TAIL]
+    if not isinstance(cursor_digest, str):
+        raise _page_field_type_error("cursor digest must be a str")
+    if not _is_digest(cursor_digest):
+        raise _page_invalid(
+            "cursor digest must be 64 lowercase hex characters"
+        )
+    if isinstance(cursor_next, bool) or not isinstance(cursor_next, int):
+        raise _page_field_type_error("cursor next must be an int")
+    if cursor_next < 0:
+        raise _page_invalid("cursor next must be >= 0")
+    if not isinstance(cursor_tail, str):
+        raise _page_field_type_error("cursor tail must be a str")
+    if not _is_digest(cursor_tail):
+        raise _page_invalid(
+            "cursor tail must be 64 lowercase hex characters"
+        )
+    return cursor_digest, cursor_next, cursor_tail
+
+
+def verify_recovery_page(
+    checkpoint: bytes,
+    page: dict,
+    keyring: dict,
+    moment: int,
+    cursor: dict | None = None,
+) -> dict:
+    """Verify one recovery audit page against a signed checkpoint, offline.
+
+    Neither the audit nor any other file is read: only the checkpoint
+    bytes, the page dict, the keyring, the current ``moment`` and the
+    optional resume ``cursor`` are consulted.  The checkpoint is parsed
+    and its HMAC-SHA256 is verified against the key the keyring binds
+    to the exact issuer and version named in its payload, with no
+    fallback and authenticated against the *current* keyring: the key
+    must be usable at ``moment``, so a later revocation or expiry
+    rejects a checkpoint just as it does a replay.  The ``moment``
+    bound into the payload is part of the signed anchor itself and
+    needs no equality with the verification time.
+
+    The first call passes no cursor, and the page's ``after`` must be
+    zero.  Every later call passes a cursor built from the previous
+    result -- ``{"digest", "next", "tail"}``: the page's ``after``
+    must equal the cursor's ``next``, its first record must chain to
+    the cursor's ``tail`` and the cursor's ``digest`` must equal this
+    checkpoint's digest, so a cursor can never resume a different
+    checkpoint.  Each page's records must then be contiguous from
+    ``after + 1`` -- a gap, reordering or duplicate is rejected --
+    correctly hash-chained within the page and across the paging
+    boundary, and verification never crosses the signed ``lastSeq``.
+    Before that last seq is reached an empty page or a page whose
+    ``complete`` flag disagrees with the boundary is rejected.
+
+    On success a fresh dict is returned with the key order ``digest``,
+    ``lastSeq``, ``status`` and ``tail``: the checkpoint digest (the
+    lowercase hex SHA-256 of the checkpoint bytes), the seq the
+    verified prefix ends at, its tail hash and the status.  Reaching
+    the signed chain tail yields ``"verified"``; every earlier page
+    yields ``"continue"``.  An empty page presented again once the
+    tail is reached restates the anchored boundary and reports the
+    signed tail.  An empty checkpoint (last seq 0, zero tail) accepts
+    only an empty page starting at zero and directly reports seq 0,
+    the zero hash and ``"verified"``.
+
+    Type faults in the arguments or fields raise :class:`TypeError`
+    (a :class:`bool` never poses as an int); keyring structure or
+    format faults raise :class:`ValueError`.  Checkpoint format
+    faults raise :class:`InvalidRecoveryCheckpointError`; unknown
+    credentials, a revoked, not-yet-valid or expired key at
+    ``moment`` and a signature mismatch raise
+    :class:`AuthenticationError`; page or cursor format and
+    continuity faults raise :class:`InvalidRecoveryPageError`.  The
+    two format errors are :class:`ValueError` subclasses.  No input
+    is modified and no file is read or written.
+    """
+    if not isinstance(checkpoint, bytes):
+        raise TypeError("checkpoint must be bytes")
+    if not isinstance(page, dict):
+        raise TypeError("page must be a dict")
+    if cursor is not None and not isinstance(cursor, dict):
+        raise TypeError("cursor must be a dict or None")
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+
+    cursor_digest: str | None = None
+    cursor_next: int | None = None
+    cursor_tail: str | None = None
+    if cursor is not None:
+        cursor_digest, cursor_next, cursor_tail = _parse_cursor(cursor)
+
+    payload, signature = _parse_checkpoint(checkpoint)
+    checkpoint_digest = hashlib.sha256(checkpoint).hexdigest()
+    issuer = payload[CP_ISSUER]
+    key_version = payload[CP_KEY_VERSION]
+    entry = _usable_checkpoint_key(
+        validated_keyring, issuer, key_version, moment
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _checkpoint_payload_bytes(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError("checkpoint signature does not match")
+
+    if cursor_digest is not None and cursor_digest != checkpoint_digest:
+        raise _page_invalid("cursor is bound to a different checkpoint")
+
+    start_seq = 0 if cursor is None else cursor_next
+    opening_prev = (
+        _RECOVERY_AUDIT_ZERO_HASH if cursor is None else cursor_tail
+    )
+    _after, next_seq, complete, records, page_tail = _parse_page(
+        page, start_seq, opening_prev
+    )
+
+    signed_last_seq = payload[CP_LAST_SEQ]
+    signed_tail = payload[CP_TAIL]
+    if next_seq > signed_last_seq:
+        raise _page_invalid("page must not cross the signed lastSeq")
+
+    at_tail = next_seq == signed_last_seq
+    if complete != at_tail:
+        raise _page_invalid(
+            "complete must be true exactly when the page reaches the "
+            "signed lastSeq"
+        )
+    if not at_tail:
+        # Before the signed tail is reached an empty page is a gap, not
+        # a legitimate boundary: nothing may silently truncate the chain.
+        if not records:
+            raise _page_invalid(
+                "an empty page is not valid before the signed lastSeq"
+            )
+        return {
+            CP_DIGEST: checkpoint_digest,
+            CP_LAST_SEQ: next_seq,
+            STATUS: _VERIFY_CONTINUE,
+            CP_TAIL: page_tail,
+        }
+
+    if records:
+        if page_tail != signed_tail:
+            raise _page_invalid(
+                "the final record hash does not match the signed tail"
+            )
+        current_tail = page_tail
+    else:
+        # An empty page at the tail (after already equals lastSeq) only
+        # restates the anchored boundary; its tail comes from the
+        # checkpoint.  This is also the only form an empty checkpoint
+        # accepts: first round, after zero, no records.
+        if cursor is not None and start_seq != signed_last_seq:
+            raise _page_invalid(
+                "an empty final page must start at the signed lastSeq"
+            )
+        current_tail = signed_tail
+    return {
+        CP_DIGEST: checkpoint_digest,
+        CP_LAST_SEQ: signed_last_seq,
+        STATUS: _VERIFY_VERIFIED,
+        CP_TAIL: current_tail,
     }
