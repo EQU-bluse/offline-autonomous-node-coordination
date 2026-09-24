@@ -90,6 +90,12 @@ expiry cannot be bypassed through a historical request binding.  Audit
 entries committed through :func:`apply_signed_remote` record the verified
 credentials under ``auth``; entries without ``auth`` remain readable and
 :func:`apply_remote` keeps its public behaviour and ledger format.
+
+:func:`export_proof` and :func:`verify_proof` are the offline-copy audit
+proof entry points; their contract lives in
+:mod:`offline_coordination.proof`, which is imported lazily to keep this
+module's import cycle (the proof module reuses this module's ledger
+parser) one-directional at load time.
 """
 
 from __future__ import annotations
@@ -99,6 +105,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 
 from offline_coordination import audit, merge, storage
 
@@ -703,7 +710,7 @@ def _overall_status(decisions: list[str]) -> str:
 def _rollback_ledger_write(
     path: str,
     tmp_path: str,
-    backup_path: str,
+    backup_path: str | None,
     existed: bool,
     stage: str,
 ) -> None:
@@ -732,10 +739,11 @@ def _rollback_ledger_write(
             # The replacement did not run: the predecessor at path is
             # untouched; the backup link and temporary file are internal
             # artifacts to remove.
-            try:
-                os.unlink(backup_path)
-            except FileNotFoundError:
-                pass
+            if backup_path is not None:
+                try:
+                    os.unlink(backup_path)
+                except FileNotFoundError:
+                    pass
             try:
                 os.unlink(tmp_path)
             except FileNotFoundError:
@@ -746,7 +754,7 @@ def _rollback_ledger_write(
                 os.unlink(tmp_path)
             except FileNotFoundError:
                 pass
-            if stage == "link":
+            if stage == "link" and backup_path is not None:
                 try:
                     os.unlink(backup_path)
                 except FileNotFoundError:
@@ -759,34 +767,99 @@ def _rollback_ledger_write(
         pass
 
 
+def _sweep_fixed_artifacts(path: str) -> None:
+    """Best-effort removal of fixed ``.tmp``/``.old`` leftovers.
+
+    Leftovers from an interrupted process are internal artifacts and are
+    never read as a ledger.  They also must never block a later valid
+    commit -- transaction files use unique names (see
+    :func:`_atomic_write`) -- so every removal error other than
+    "already absent" is swallowed rather than propagated.
+    """
+    for leftover in (path + ".tmp", path + ".old"):
+        try:
+            os.unlink(leftover)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _reserve_write(path: str) -> str:
+    """Reserve a fresh, non-conflicting temporary file name for the new ledger.
+
+    The name lives next to ``path`` with a random middle component (for
+    example ``ledger.json.tmp-XXXXXXXX``), so it never equals the fixed
+    ``.tmp``/``.old`` leftover names and never collides with a concurrent
+    transaction.  The empty placeholder is atomically created with
+    ``O_CREAT | O_EXCL`` using mode ``0o666`` (subject to the process
+    umask, exactly like :func:`open`); the caller then opens the name
+    itself with :func:`open`, so the normal write/flush/fsync machinery
+    and its error semantics are unchanged.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    base = os.path.basename(path)
+    for _ in range(16):
+        name = os.path.join(directory, f"{base}.tmp-{secrets.token_hex(8)}")
+        try:
+            fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return name
+    raise OSError("could not reserve a non-conflicting transaction file name")
+
+
+def _reserve_backup_link(path: str) -> str:
+    """Hard-link the predecessor at a fresh, non-conflicting name.
+
+    The random suffix keeps the name (``<path>.old-XXXXXXXX``) distinct
+    from the fixed ``.old`` leftover and from concurrent transactions.
+    :func:`os.link` fails when the target already exists, so a collision
+    simply retries with another name; unlike the temporary file there is
+    no placeholder to remove.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    base = os.path.basename(path)
+    for _ in range(16):
+        name = os.path.join(directory, f"{base}.old-{secrets.token_hex(8)}")
+        try:
+            os.link(path, name)
+        except FileExistsError:
+            continue
+        return name
+    raise OSError("could not reserve a non-conflicting transaction file name")
+
+
 def _atomic_write(path: str, payload: bytes) -> None:
     """Durably replace ``path`` with ``payload`` as a single transaction.
 
     The temporary file's write, flush and file sync, the replacement and
     the following directory sync all lie inside the boundary.  An existing
-    predecessor is retained as a hard link at ``path + ".old"`` -- without
-    ever removing ``path`` -- until the new file is installed and the
-    directory has synced, so any :class:`OSError` rolls back by renaming
-    that link back: the prior file returns byte-for-byte (as the same
-    inode, with no rewriting and therefore no dependence on a working
-    fsync or free space), and a path the call created is removed again.
-    The rollback syncs the directory as well.  The original
-    :class:`OSError` propagates unchanged, no ``.tmp``/``.old`` artifact is
-    left behind and such artifacts (for example from a killed process) are
-    never read as a ledger.  On success both the file and the directory
-    have been synced.
-    """
-    tmp_path = path + ".tmp"
-    backup_path = path + ".old"
-    existed = os.path.exists(path)
-    # Retained artifacts from earlier interrupted calls are internal and
-    # must never stand in the way of a fresh transaction (the temporary
-    # name is overwritten by the open below).
-    try:
-        os.unlink(backup_path)
-    except FileNotFoundError:
-        pass
+    predecessor is retained as a hard link at a *unique* ``.old``-style
+    name -- without ever removing ``path`` -- until the new file is
+    installed and the directory has synced, so any :class:`OSError` rolls
+    back by renaming that link back: the prior file returns byte-for-byte
+    (as the same inode, with no rewriting and therefore no dependence on a
+    working fsync or free space), and a path the call created is removed
+    again.  The rollback syncs the directory as well.  The original
+    :class:`OSError` propagates unchanged and no transaction artifact is
+    left behind.
 
+    Transaction files get unique names through random ``O_EXCL``
+    reservations (``<path>.tmp-XXXXXXXX`` / ``<path>.old-XXXXXXXX``)
+    instead of the fixed ``path + ".tmp"``/``path + ".old"`` slots, so a
+    stale fixed-name leftover (for example from a killed process) never
+    collides with a commit.  Fixed leftovers are never read as a ledger
+    and are removed best-effort before the transaction; a failed cleanup
+    does not block the commit.  On success both the file and the
+    directory have been synced.
+    """
+    existed = os.path.exists(path)
+    _sweep_fixed_artifacts(path)
+
+    tmp_path = _reserve_write(path)
+    backup_path: str | None = None
     stage = "write"
     try:
         with open(tmp_path, "wb") as handle:
@@ -795,7 +868,7 @@ def _atomic_write(path: str, payload: bytes) -> None:
             os.fsync(handle.fileno())
         if existed:
             stage = "link"
-            os.link(path, backup_path)
+            backup_path = _reserve_backup_link(path)
         stage = "install"
         os.replace(tmp_path, path)
         stage = "sync"
@@ -807,7 +880,7 @@ def _atomic_write(path: str, payload: bytes) -> None:
     # The new ledger is durable from this point on; the retained
     # predecessor link is internal cleanup only.  Its removal (and the
     # matching directory sync) is best-effort and never undoes a commit.
-    if existed:
+    if backup_path is not None:
         try:
             os.unlink(backup_path)
             storage._fsync_dir(path)
@@ -1186,3 +1259,40 @@ def apply_signed_remote(
         validated_keyring, node, key_version, request, source, signature, moment
     )
     return _apply(path, request, {KEY_VERSION: key_version, NODE: node})
+
+
+# --- Offline-copy audit proofs (lazy import, see module docstring) ----------
+
+# export_proof/verify_proof are defined below as thin wrappers; the error
+# type is re-exported lazily because offline_coordination.proof imports
+# this module at load time, so a top-level import would be circular.
+def __getattr__(name: str):
+    if name == "InvalidProofError":
+        from offline_coordination.proof import InvalidProofError
+
+        return InvalidProofError
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def export_proof(path: str, start: int, end: int | None = None) -> bytes:
+    """Return canonical audit-proof bytes for a ledger audit seq range.
+
+    Delegates to :func:`offline_coordination.proof.export_proof`; see that
+    module for the byte contract and the full set of raised exceptions.
+    """
+    from offline_coordination.proof import export_proof as _export_proof
+
+    return _export_proof(path, start, end)
+
+
+def verify_proof(
+    proof: bytes,
+) -> tuple[tuple[int, int], tuple[str, str], tuple[int, int]]:
+    """Verify audit-proof bytes without reading any ledger or keyring.
+
+    Delegates to :func:`offline_coordination.proof.verify_proof`; see that
+    module for the byte contract and the full set of raised exceptions.
+    """
+    from offline_coordination.proof import verify_proof as _verify_proof
+
+    return _verify_proof(proof)

@@ -2034,6 +2034,206 @@ class ApplySignedRemoteLedgerCompatTest(unittest.TestCase):
             self.assertEqual(ledger_raw(path), raw)
 
 
+class TransactionArtifactResilienceTest(unittest.TestCase):
+    """Fixed .tmp/.old leftovers never block a commit or get read.
+
+    Commits reserve unique transaction file names, so a stale fixed-name
+    leftover from a killed process cannot collide; sweeping the fixed
+    leftovers is best-effort and must not turn into a raised error.
+    """
+
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.s1 = state({"a": 1}, {"k": record("v", False, {"a": 1}, "a")})
+        self.s2 = state({"a": 2}, {"k": record("w", False, {"a": 2}, "a")})
+
+    def seed(self, path):
+        replication.apply_remote(path, request(remote=self.s1))
+
+    def advance(self, path, rid="r2"):
+        return replication.apply_remote(
+            path, request(rid=rid, base=self.s1, remote=self.s2)
+        )
+
+    def leave_fixed(self, path) -> None:
+        with open(path + ".tmp", "wb") as handle:
+            handle.write(b"stale temporary file\n")
+        with open(path + ".old", "wb") as handle:
+            handle.write(b"stale predecessor link\n")
+
+    def test_fixed_leftovers_are_never_read_as_ledger(self) -> None:
+        path = os.path.join(self.dir, "ledger.json")
+        self.seed(path)
+        before = ledger_raw(path)
+        self.leave_fixed(path)
+        self.advance(path)
+        # The ledger advanced normally; the garbage leftovers were not
+        # consulted as predecessor or state.
+        self.assertEqual(read_ledger(path)["state"], self.s2)
+        self.assertNotEqual(ledger_raw(path), before)
+
+    def test_sweep_failure_does_not_block_commit_on_missing_path(self) -> None:
+        path = os.path.join(self.dir, "fresh.json")
+        self.leave_fixed(path)
+        with mock.patch("os.unlink", side_effect=OSError("immutable")):
+            result = replication.apply_remote(path, request(remote=self.s1))
+        self.assertEqual(result["status"], "applied")
+        # The fixed leftovers could not be removed, but the ledger exists.
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(read_ledger(path)["state"], self.s1)
+
+    def test_sweep_failure_does_not_block_commit_on_existing_path(self) -> None:
+        path = os.path.join(self.dir, "ledger.json")
+        self.seed(path)
+        self.leave_fixed(path)
+        with mock.patch("os.unlink", side_effect=OSError("immutable")):
+            result = self.advance(path)
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(read_ledger(path)["state"], self.s2)
+
+    def test_successful_commit_sweeps_fixed_leftovers(self) -> None:
+        path = os.path.join(self.dir, "ledger.json")
+        self.seed(path)
+        self.leave_fixed(path)
+        self.advance(path)
+        self.assertFalse(os.path.exists(path + ".tmp"))
+        self.assertFalse(os.path.exists(path + ".old"))
+
+    def test_transaction_files_use_unique_non_conflicting_names(self) -> None:
+        path = os.path.join(self.dir, "ledger.json")
+        self.seed(path)
+        seen = []
+
+        real_token_hex = replication.secrets.token_hex
+
+        def recording_token_hex(nbytes):
+            value = real_token_hex(nbytes)
+            seen.append(value)
+            return value
+
+        with mock.patch("offline_coordination.replication.secrets.token_hex",
+                        side_effect=recording_token_hex):
+            self.advance(path)
+        self.assertTrue(seen)
+        for value in seen:
+            self.assertTrue(
+                os.path.basename(path) + ".tmp-" + value
+                != os.path.basename(path) + ".tmp"
+            )
+        # No internal artifacts survive success and the fixed slots were
+        # never the transaction files.
+        listing = os.listdir(self.dir)
+        self.assertEqual(
+            [n for n in listing if ".tmp-" in n or ".old-" in n],
+            [],
+        )
+
+    def test_reservation_retries_on_name_collision(self) -> None:
+        path = os.path.join(self.dir, "ledger.json")
+        self.seed(path)
+        collision = os.path.join(
+            self.dir, os.path.basename(path) + ".tmp-once"
+        )
+        with open(collision, "wb") as handle:
+            handle.write(b"untouched")
+        names = iter(["once", "twice", "thrice"])
+        with mock.patch("offline_coordination.replication.secrets.token_hex",
+                        side_effect=lambda n: next(names)):
+            result = self.advance(path)
+        self.assertEqual(result["status"], "applied")
+        # O_EXCL reservation skipped the occupied name rather than
+        # truncating it; the transaction used another name and cleaned it.
+        with open(collision, "rb") as handle:
+            self.assertEqual(handle.read(), b"untouched")
+        self.assertFalse(os.path.exists(
+            os.path.join(self.dir, os.path.basename(path) + ".tmp-twice")
+        ))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.dir, os.path.basename(path) + ".old-thrice")
+        ))
+
+    def test_backup_link_name_is_unique_too(self) -> None:
+        path = os.path.join(self.dir, "ledger.json")
+        self.seed(path)
+        names = []
+        real_link = os.link
+
+        def recording_link(src, dst):
+            names.append(os.path.basename(dst))
+            return real_link(src, dst)
+
+        with mock.patch("os.link", side_effect=recording_link):
+            self.advance(path)
+        self.assertEqual(len(names), 1)
+        self.assertTrue(names[0].startswith(os.path.basename(path) + ".old-"))
+        self.assertNotEqual(names[0], os.path.basename(path) + ".old")
+        self.assertEqual(
+            [n for n in os.listdir(self.dir) if n.endswith(".old")],
+            [],
+        )
+
+    def test_repeated_commits_use_distinct_transaction_names(self) -> None:
+        path = os.path.join(self.dir, "ledger.json")
+        self.seed(path)
+        used = set()
+        real_token_hex = replication.secrets.token_hex
+
+        def tracking_token_hex(nbytes):
+            value = real_token_hex(nbytes)
+            used.add(value)
+            return value
+
+        s3 = state({"a": 3}, {"k": record("z", False, {"a": 3}, "a")})
+        with mock.patch("offline_coordination.replication.secrets.token_hex",
+                        side_effect=tracking_token_hex):
+            self.advance(path, rid="r2")
+            replication.apply_remote(
+                path, request(rid="r3", base=self.s2, remote=s3)
+            )
+        self.assertGreaterEqual(len(used), 2)
+
+    def test_write_failure_with_blocked_sweep_restores_and_reraises(self) -> None:
+        path = os.path.join(self.dir, "ledger.json")
+        self.seed(path)
+        before = ledger_raw(path)
+        real_open = open
+
+        class FailingFile:
+            def __init__(self, *args, **kwargs):
+                self._handle = real_open(*args, **kwargs)
+
+            def write(self, data):
+                raise OSError("write fail")
+
+            def __getattr__(self, name):
+                return getattr(self._handle, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self._handle.close()
+                return False
+
+        with mock.patch("os.unlink", side_effect=OSError("immutable")):
+            with mock.patch("builtins.open",
+                            side_effect=lambda *a, **k: FailingFile(*a, **k)):
+                with self.assertRaises(OSError):
+                    self.advance(path)
+        self.assertEqual(ledger_raw(path), before)
+
+    def test_leftovers_do_not_affect_replication_status_behaviour(self) -> None:
+        path = os.path.join(self.dir, "ledger.json")
+        self.seed(path)
+        self.leave_fixed(path)
+        # An exact replay is still a duplicate despite the leftovers.
+        result = replication.apply_remote(path, request(remote=self.s1))
+        self.assertEqual(result["status"], "duplicate")
+        self.leave_fixed(path)
+        # Advancing still applies.
+        self.assertEqual(self.advance(path)["status"], "applied")
+
+
 class ApplySignedRemoteAtomicityTest(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = tempfile.mkdtemp()
