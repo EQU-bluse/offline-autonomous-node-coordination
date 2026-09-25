@@ -321,7 +321,7 @@ class AcceptedTest(unittest.TestCase):
     def test_extra_same_site_packets_are_duplicates_and_do_not_add_votes(self):
         items = [
             make_item("i1", site="a", result=verification_result(rid="r1")),
-            make_item("i2", site="a", result=verification_result(rid="r1b")),
+            make_item("i2", site="a", result=verification_result(rid="r1")),
             make_item("i3", site="b", secret=SECRET_B,
                       result=verification_result(rid="r2")),
         ]
@@ -337,10 +337,24 @@ class AcceptedTest(unittest.TestCase):
         self.assertEqual(duplicate["digest"], DIGEST)
         self.assertEqual(duplicate["boundary"], BOUNDARY)
 
-    def test_one_site_below_threshold_is_insufficient(self):
+    def test_same_digest_and_boundary_but_different_field_contradicts(self):
+        # A differing embedded field (here the result id) is a different
+        # full result even when digest and boundary agree.
         items = [
             make_item("i1", site="a", result=verification_result(rid="r1")),
             make_item("i2", site="a", result=verification_result(rid="r2")),
+        ]
+        data = adjudicate(items)
+        self.assertEqual(data["status"], "conflicted")
+        self.assertEqual(
+            sorted(i["conclusion"] for i in data["items"]),
+            ["contradiction", "contradiction"],
+        )
+
+    def test_one_site_below_threshold_is_insufficient(self):
+        items = [
+            make_item("i1", site="a", result=verification_result(rid="r1")),
+            make_item("i2", site="a", result=verification_result(rid="r1")),
         ]
         data = adjudicate(items)
         self.assertEqual(data["status"], "insufficient")
@@ -571,7 +585,7 @@ class ContradictionAndConflictTest(unittest.TestCase):
     def test_duplicate_beside_a_contradiction_stays_duplicate(self):
         items = [
             make_item("i1", site="a", result=verification_result(rid="r1")),
-            make_item("i2", site="a", result=verification_result(rid="r2")),
+            make_item("i2", site="a", result=verification_result(rid="r1")),
             make_item("i3", site="a",
                       result=verification_result(rid="r3",
                                                  digest=OTHER_DIGEST,
