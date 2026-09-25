@@ -8023,3 +8023,954 @@ def verify_batch_receipt_chains(
         ITEMS: reports,
         VERSION: RECEIPT_CHAINS_VERSION,
     }
+
+# --- Offline signed evidence of a receipt delegation fork --------------------
+
+RECEIPT_FORK_PROOF_VERSION = 1
+
+FORK_PROOF_REPORT = "report"
+FORK_PROOF_CHAINS = "chains"
+
+_FORK_PROOF_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_FORK_PROOF_PAYLOAD_KEYS = frozenset((
+    VD_ISSUER,
+    KEY_VERSION,
+    CP_MOMENT,
+    VD_POLICY_DIGEST,
+    FORK_PROOF_REPORT,
+    FORK_PROOF_CHAINS,
+    VERSION,
+))
+_FORK_PROOF_CHAIN_KEYS = frozenset((
+    ID,
+    DELEGATION_RECEIPT_DIGEST,
+    DELEGATION_TARGET,
+    DELEGATION_HOPS,
+))
+_FORK_PROOF_REPORT_TOP_KEYS = frozenset((CHAINS_FORKS, ITEMS, VERSION))
+_FORK_PROOF_FORK_KEYS = frozenset((
+    DELEGATION_RECEIPT_DIGEST,
+    DELEGATION_UPSTREAM,
+    _FORK_AUDIENCES,
+    _FORK_IDS,
+))
+_FORK_PROOF_ITEM_KEYS = frozenset((
+    CHECKPOINT_ITEM_ERROR,
+    ID,
+    VERDICT_ITEM_RESULT,
+    STATUS,
+))
+_FORK_PROOF_RESULT_KEYS = frozenset((
+    DELEGATION_HOPS,
+    RECEIPT,
+    DELEGATION_RECEIPT_DIGEST,
+    DELEGATION_TARGET,
+    VERSION,
+))
+_FORK_PROOF_RESULT_ORDER = (
+    FORK_PROOF_CHAINS,
+    CP_DIGEST,
+    VD_ISSUER,
+    KEY_VERSION,
+    CP_MOMENT,
+    VD_POLICY_DIGEST,
+    FORK_PROOF_REPORT,
+    VERSION,
+)
+_FORK_PROOF_REPORT_STATUSES = frozenset((
+    CHAINS_VERIFIED,
+    CHAINS_CONFLICTED,
+    CHAINS_INVALID_RECEIPT,
+    CHAINS_INVALID_DELEGATION,
+    CHAINS_UNAUTHENTICATED,
+))
+_FORK_PROOF_RESULT_STATUSES = frozenset((
+    CHAINS_VERIFIED,
+    CHAINS_CONFLICTED,
+))
+
+
+class InvalidReceiptForkProofError(ValueError):
+    """A signed receipt fork proof fails its canonical contract."""
+
+
+def _fork_proof_invalid(message: str) -> InvalidReceiptForkProofError:
+    return InvalidReceiptForkProofError(
+        f"invalid receipt fork proof: {message}"
+    )
+
+
+def _reject_duplicate_fork_proof_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate proof keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _fork_proof_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _fork_chain_summaries(validated_items: list[dict]) -> list[dict]:
+    """Summarize each input chain's material in strict input order.
+
+    Every summary carries exactly the item ``id``, the lowercase hex
+    SHA-256 ``receiptDigest`` of the base receipt bytes, the receiving
+    ``target`` domain and, one per hop in chain order with no reordering
+    or omission, the lowercase hex SHA-256 of that hop's complete bytes.
+    """
+    return [
+        {
+            ID: item[ID],
+            DELEGATION_RECEIPT_DIGEST: hashlib.sha256(
+                item[CHAIN_ITEM_RECEIPT]
+            ).hexdigest(),
+            DELEGATION_TARGET: item[DELEGATION_TARGET],
+            DELEGATION_HOPS: [
+                hashlib.sha256(hop_bytes).hexdigest()
+                for hop_bytes in item[CHAIN_ITEM_HOPS]
+            ],
+        }
+        for item in validated_items
+    ]
+
+
+def _validated_fork_hop_result(hop: object, where: str) -> dict:
+    """Validate one delegation hop payload embedded in a bound result.
+
+    Only the fields the fork recomputation follows are needed, but the
+    full delegation payload key set is required so a proof cannot smuggle
+    extra signed material.  A field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    key-set or value-format fault raises
+    :class:`InvalidReceiptForkProofError`.
+    """
+    if not isinstance(hop, dict):
+        raise TypeError(f"{where} must be an object")
+    if set(hop.keys()) != _DELEGATION_PAYLOAD_KEYS:
+        raise _fork_proof_invalid(
+            f"{where} must contain exactly the keys 'issuer', 'keyVersion', "
+            "'moment', 'audience', 'upstream' and 'version'"
+        )
+    issuer = hop[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError(f"{where} issuer must be a str")
+    if issuer == "":
+        raise _fork_proof_invalid(f"{where} issuer must be a non-empty str")
+    key_version = hop[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError(f"{where} keyVersion must be an int")
+    if key_version <= 0:
+        raise _fork_proof_invalid(f"{where} keyVersion must be positive")
+    hop_moment = hop[CP_MOMENT]
+    if isinstance(hop_moment, bool) or not isinstance(hop_moment, int):
+        raise TypeError(f"{where} moment must be an int")
+    if hop_moment < 0:
+        raise _fork_proof_invalid(f"{where} moment must be non-negative")
+    audience = hop[DELEGATION_AUDIENCE]
+    if not isinstance(audience, str):
+        raise TypeError(f"{where} audience must be a str")
+    if audience == "":
+        raise _fork_proof_invalid(f"{where} audience must be a non-empty str")
+    upstream = hop[DELEGATION_UPSTREAM]
+    if not isinstance(upstream, str):
+        raise TypeError(f"{where} upstream must be a str")
+    if not _is_digest(upstream):
+        raise _fork_proof_invalid(
+            f"{where} upstream must be 64 lowercase hex characters"
+        )
+    version = hop[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError(f"{where} version must be an int")
+    if version != RECEIPT_DELEGATION_VERSION:
+        raise _fork_proof_invalid(f"{where} version must be the integer 1")
+    return hop
+
+
+def _validated_fork_receipt_payload(receipt: object, where: str) -> None:
+    """Validate the base receipt payload embedded in a bound result.
+
+    Only its structural contract -- the fixed payload key set, positive
+    non-bool ``keyVersion``, non-negative ``moment``, ``policy`` digest
+    format, version ``1`` and one-or-more ``id``/``digest``/``report``
+    items -- is checked; the nested per-verdict reports stay opaque to
+    fork recomputation but cannot smuggle extra payload keys or wrong
+    field types.  A field of the wrong type raises :class:`TypeError`;
+    every key-set or value-format fault raises
+    :class:`InvalidReceiptForkProofError`.
+    """
+    if not isinstance(receipt, dict):
+        raise TypeError(f"{where} receipt must be an object")
+    if set(receipt.keys()) != _BATCH_RECEIPT_PAYLOAD_KEYS:
+        raise _fork_proof_invalid(
+            f"{where} receipt must contain exactly the keys 'issuer', "
+            "'keyVersion', 'moment', 'policy', 'items' and 'version'"
+        )
+    issuer = receipt[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError(f"{where} receipt issuer must be a str")
+    if issuer == "":
+        raise _fork_proof_invalid(f"{where} receipt issuer must be non-empty")
+    key_version = receipt[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError(f"{where} receipt keyVersion must be an int")
+    if key_version <= 0:
+        raise _fork_proof_invalid(f"{where} receipt keyVersion must be positive")
+    signed_moment = receipt[CP_MOMENT]
+    if isinstance(signed_moment, bool) or not isinstance(signed_moment, int):
+        raise TypeError(f"{where} receipt moment must be an int")
+    if signed_moment < 0:
+        raise _fork_proof_invalid(f"{where} receipt moment must be non-negative")
+    if not isinstance(receipt[RECEIPT_POLICY], str):
+        raise TypeError(f"{where} receipt policy digest must be a str")
+    if not _is_digest(receipt[RECEIPT_POLICY]):
+        raise _fork_proof_invalid(
+            f"{where} receipt policy digest must be 64 lowercase hex "
+            "characters"
+        )
+    version = receipt[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError(f"{where} receipt version must be an int")
+    if version != BATCH_RECEIPT_VERSION:
+        raise _fork_proof_invalid(
+            f"{where} receipt version must be the integer 1"
+        )
+    receipt_items = receipt[ITEMS]
+    if not isinstance(receipt_items, list):
+        raise TypeError(f"{where} receipt items must be a list")
+    if not receipt_items:
+        raise _fork_proof_invalid(f"{where} receipt items must be non-empty")
+    for item_index, bound_item in enumerate(receipt_items):
+        item_where = f"{where} receipt item {item_index}"
+        if not isinstance(bound_item, dict):
+            raise TypeError(f"{item_where} must be an object")
+        if set(bound_item.keys()) != _BATCH_RECEIPT_ITEM_KEYS:
+            raise _fork_proof_invalid(
+                f"{item_where} must contain exactly the keys 'id', 'digest' "
+                "and 'report'"
+            )
+        bound_id = bound_item[ID]
+        if not isinstance(bound_id, str):
+            raise TypeError(f"{item_where} id must be a str")
+        if bound_id == "":
+            raise _fork_proof_invalid(f"{item_where} id must be non-empty")
+        bound_digest = bound_item[CP_DIGEST]
+        if not isinstance(bound_digest, str):
+            raise TypeError(f"{item_where} digest must be a str")
+        if not _is_digest(bound_digest):
+            raise _fork_proof_invalid(
+                f"{item_where} digest must be 64 lowercase hex characters"
+            )
+        if not isinstance(bound_item[RECEIPT_ITEM_REPORT], dict):
+            raise TypeError(f"{item_where} report must be an object")
+
+
+def _validated_fork_report(report: object, chains: list[dict]) -> dict:
+    """Validate the complete batch summary report bound into a proof.
+
+    The report must have the exact :func:`verify_batch_receipt_chains`
+    shape -- ``forks``, ``items`` and ``version`` (the integer 1) -- and
+    must be self-consistent with the bound per-chain material summaries:
+    the items line up one-for-one and in order with the chains, each
+    result's receipt digest, target and hop references match its chain,
+    and the fork table is exactly the delegation-fork aggregation
+    re-derived from the authenticated per-chain results walked over the
+    bound hop-byte digests (so the conflicted chains, fork audiences and
+    fork ids cannot disagree).  A field of the wrong type raises
+    :class:`TypeError`; every key-set, ordering, digest, reference or
+    report-binding fault raises :class:`InvalidReceiptForkProofError`.
+    """
+    if not isinstance(report, dict):
+        raise TypeError("proof report must be an object")
+    if set(report.keys()) != _FORK_PROOF_REPORT_TOP_KEYS:
+        raise _fork_proof_invalid(
+            "report must contain exactly the keys 'forks', 'items' and "
+            "'version'"
+        )
+    version = report[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("proof report version must be an int")
+    if version != RECEIPT_CHAINS_VERSION:
+        raise _fork_proof_invalid("report version must be the integer 1")
+
+    raw_items = report[ITEMS]
+    if not isinstance(raw_items, list):
+        raise TypeError("proof report items must be a list")
+    if not raw_items:
+        raise _fork_proof_invalid("report items must be non-empty")
+    if len(raw_items) != len(chains):
+        raise _fork_proof_invalid(
+            "report items must line up one-for-one with the chain summaries"
+        )
+
+    seen_ids: set[str] = set()
+    walks: list[list[tuple[str, str]] | None] = []
+    for position, (item, chain) in enumerate(zip(raw_items, chains)):
+        where = f"report item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(item.keys()) != _FORK_PROOF_ITEM_KEYS:
+            raise _fork_proof_invalid(
+                f"{where} must contain exactly the keys 'error', 'id', "
+                "'result' and 'status'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise _fork_proof_invalid(f"{where} id must be a non-empty str")
+        if item_id in seen_ids:
+            raise _fork_proof_invalid(f"duplicate report item id {item_id!r}")
+        if item_id != chain[ID]:
+            raise _fork_proof_invalid(
+                f"{where} id does not match the chain summary at that position"
+            )
+        seen_ids.add(item_id)
+        status = item[STATUS]
+        if not isinstance(status, str):
+            raise TypeError(f"{where} status must be a str")
+        if status not in _FORK_PROOF_REPORT_STATUSES:
+            raise _fork_proof_invalid(f"{where} status is not a known status")
+        error = item[CHECKPOINT_ITEM_ERROR]
+        result = item[VERDICT_ITEM_RESULT]
+        walk: list[tuple[str, str]] | None = None
+        if status in _FORK_PROOF_RESULT_STATUSES:
+            if status == CHAINS_CONFLICTED:
+                if error != _CHAIN_ITEM_ERROR:
+                    raise _fork_proof_invalid(
+                        f"{where} conflicted error must be 'forked-delegation'"
+                    )
+            elif error is not None:
+                raise _fork_proof_invalid(
+                    f"{where} error must be null when verified"
+                )
+            if not isinstance(result, dict):
+                raise TypeError(f"{where} result must be an object")
+            if set(result.keys()) != _FORK_PROOF_RESULT_KEYS:
+                raise _fork_proof_invalid(
+                    f"{where} result must contain exactly the keys 'hops', "
+                    "'receipt', 'receiptDigest', 'target' and 'version'"
+                )
+            result_version = result[VERSION]
+            if isinstance(result_version, bool) or not isinstance(
+                result_version, int
+            ):
+                raise TypeError(f"{where} result version must be an int")
+            if result_version != RECEIPT_DELEGATION_VERSION:
+                raise _fork_proof_invalid(
+                    f"{where} result version must be the integer 1"
+                )
+            receipt_digest = result[DELEGATION_RECEIPT_DIGEST]
+            if not isinstance(receipt_digest, str):
+                raise TypeError(f"{where} result receiptDigest must be a str")
+            if not _is_digest(receipt_digest):
+                raise _fork_proof_invalid(
+                    f"{where} result receiptDigest must be 64 lowercase hex "
+                    "characters"
+                )
+            target = result[DELEGATION_TARGET]
+            if not isinstance(target, str):
+                raise TypeError(f"{where} result target must be a str")
+            if target == "":
+                raise _fork_proof_invalid(
+                    f"{where} result target must be a non-empty str"
+                )
+            if not isinstance(result[RECEIPT], dict):
+                raise TypeError(f"{where} result receipt must be an object")
+            _validated_fork_receipt_payload(result[RECEIPT], where)
+            result_hops = result[DELEGATION_HOPS]
+            if not isinstance(result_hops, list):
+                raise TypeError(f"{where} result hops must be a list")
+            chain_hops = chain[DELEGATION_HOPS]
+            if len(result_hops) != len(chain_hops):
+                raise _fork_proof_invalid(
+                    f"{where} result hop count does not match its chain "
+                    "summary"
+                )
+            if receipt_digest != chain[DELEGATION_RECEIPT_DIGEST]:
+                raise _fork_proof_invalid(
+                    f"{where} receiptDigest does not match its chain summary"
+                )
+            if target != chain[DELEGATION_TARGET]:
+                raise _fork_proof_invalid(
+                    f"{where} target does not match its chain summary"
+                )
+            walk = []
+            node = receipt_digest
+            for hop_index, hop in enumerate(result_hops):
+                hop_where = f"{where} result hop {hop_index}"
+                _validated_fork_hop_result(hop, hop_where)
+                if hop[DELEGATION_UPSTREAM] != node:
+                    raise _fork_proof_invalid(
+                        f"{hop_where} upstream does not chain to the base "
+                        "receipt or previous hop digest"
+                    )
+                walk.append((receipt_digest, node))
+                node = chain_hops[hop_index]
+        else:
+            if not isinstance(error, str):
+                raise TypeError(f"{where} error must be a str for a failure")
+            if error == "":
+                raise _fork_proof_invalid(
+                    f"{where} error must be a non-empty str for a failure"
+                )
+            if result is not None:
+                raise _fork_proof_invalid(
+                    f"{where} result must be null for a failure"
+                )
+        walks.append(walk)
+
+    # Re-derive the fork table from the authenticated results and the
+    # bound hop-byte digests, exactly the way the batch summary built it.
+    groups: dict[str, dict[str, set[str]]] = {}
+    for item, walk in zip(raw_items, walks):
+        if walk is None:
+            continue
+        result = item[VERDICT_ITEM_RESULT]
+        receipt_digest = result[DELEGATION_RECEIPT_DIGEST]
+        edges = groups.setdefault(receipt_digest, {})
+        result_hops = result[DELEGATION_HOPS]
+        for hop_index, (_, node) in enumerate(walk):
+            edges.setdefault(node, set()).add(
+                result_hops[hop_index][DELEGATION_AUDIENCE]
+            )
+    expected: dict[tuple[str, str], set[str]] = {}
+    for receipt_digest, receipt_edges in groups.items():
+        for upstream, audiences in receipt_edges.items():
+            if len(audiences) > 1:
+                expected[(receipt_digest, upstream)] = audiences
+    if not expected:
+        raise _fork_proof_invalid(
+            "report must contain at least one fork"
+        )
+
+    crossing: dict[tuple[str, str], list[str]] = {
+        edge: [] for edge in expected
+    }
+    conflicted_ids: set[str] = set()
+    for item, walk in zip(raw_items, walks):
+        if walk is None:
+            continue
+        item_id = item[ID]
+        crosses = False
+        for edge in walk:
+            if edge in crossing:
+                crossing[edge].append(item_id)
+                crosses = True
+        if crosses:
+            conflicted_ids.add(item_id)
+
+    bound_forks = report[CHAINS_FORKS]
+    if not isinstance(bound_forks, list):
+        raise TypeError("proof report forks must be a list")
+    if not bound_forks:
+        raise _fork_proof_invalid("report forks must be non-empty")
+    bound_edges: set[tuple[str, str]] = set()
+    previous_key: tuple[str, str] | None = None
+    for position, fork in enumerate(bound_forks):
+        where = f"report fork {position}"
+        if not isinstance(fork, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(fork.keys()) != _FORK_PROOF_FORK_KEYS:
+            raise _fork_proof_invalid(
+                f"{where} must contain exactly the keys 'receiptDigest', "
+                "'upstream', 'audiences' and 'ids'"
+            )
+        receipt_digest = fork[DELEGATION_RECEIPT_DIGEST]
+        upstream = fork[DELEGATION_UPSTREAM]
+        for label, value in (
+            ("receiptDigest", receipt_digest),
+            ("upstream", upstream),
+        ):
+            if not isinstance(value, str):
+                raise TypeError(f"{where} {label} must be a str")
+            if not _is_digest(value):
+                raise _fork_proof_invalid(
+                    f"{where} {label} must be 64 lowercase hex characters"
+                )
+        edge = (receipt_digest, upstream)
+        if edge in bound_edges:
+            raise _fork_proof_invalid(f"{where} repeats a fork edge")
+        bound_edges.add(edge)
+        if previous_key is not None and edge < previous_key:
+            raise _fork_proof_invalid(
+                "report forks must be sorted by receiptDigest then upstream"
+            )
+        previous_key = edge
+        audiences = fork[_FORK_AUDIENCES]
+        if not isinstance(audiences, list) or not audiences:
+            raise TypeError(f"{where} audiences must be a non-empty list")
+        if any(not isinstance(audience, str) for audience in audiences):
+            raise TypeError(f"{where} audiences must be strs")
+        if any(audience == "" for audience in audiences):
+            raise _fork_proof_invalid(
+                f"{where} audiences must be non-empty strs"
+            )
+        if audiences != sorted(audiences) or len(set(audiences)) != len(
+            audiences
+        ):
+            raise _fork_proof_invalid(
+                f"{where} audiences must be unique and ascending"
+            )
+        fork_ids = fork[_FORK_IDS]
+        if not isinstance(fork_ids, list) or not fork_ids:
+            raise TypeError(f"{where} ids must be a non-empty list")
+        if any(not isinstance(fork_id, str) for fork_id in fork_ids):
+            raise TypeError(f"{where} ids must be strs")
+        if fork_ids != sorted(fork_ids) or len(set(fork_ids)) != len(
+            fork_ids
+        ):
+            raise _fork_proof_invalid(
+                f"{where} ids must be unique and ascending"
+            )
+        if any(fork_id not in seen_ids for fork_id in fork_ids):
+            raise _fork_proof_invalid(
+                f"{where} ids must name report items"
+            )
+        if edge not in expected:
+            raise _fork_proof_invalid(
+                f"{where} is not a fork derived from the bound results"
+            )
+        if set(audiences) != expected[edge]:
+            raise _fork_proof_invalid(
+                f"{where} audiences do not match the derived fork"
+            )
+        if fork_ids != sorted(crossing[edge]):
+            raise _fork_proof_invalid(
+                f"{where} ids do not match the chains crossing that fork"
+            )
+    if bound_edges != set(expected):
+        raise _fork_proof_invalid(
+            "report forks do not match the forks derived from the bound "
+            "results"
+        )
+
+    reported_conflicts = {
+        item[ID]
+        for item in raw_items
+        if item[STATUS] == CHAINS_CONFLICTED
+    }
+    if reported_conflicts != conflicted_ids:
+        raise _fork_proof_invalid(
+            "conflicted items must be exactly the chains crossing a fork"
+        )
+    return report
+
+
+def _parse_receipt_fork_proof(raw: object) -> tuple[dict, str]:
+    """Validate fork proof bytes structurally into ``(payload, signature)``.
+
+    A non-bytes argument or a public field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, digest, ordering, reference or
+    report-binding fault raises
+    :class:`InvalidReceiptForkProofError`.  The policy, moment-window,
+    credential and signature bindings are checked by
+    :func:`verify_receipt_fork_proof`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("proof must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _fork_proof_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _fork_proof_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_fork_proof_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _fork_proof_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("proof must be a JSON object")
+    if set(data.keys()) != _FORK_PROOF_TOP_KEYS:
+        raise _fork_proof_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("proof signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
+        raise _fork_proof_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("proof payload must be an object")
+    if set(payload.keys()) != _FORK_PROOF_PAYLOAD_KEYS:
+        raise _fork_proof_invalid(
+            "payload must contain exactly the keys 'issuer', 'keyVersion', "
+            "'moment', 'policyDigest', 'report', 'chains' and 'version'"
+        )
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("proof payload issuer must be a str")
+    if issuer == "":
+        raise _fork_proof_invalid("payload issuer must be a non-empty str")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("proof payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _fork_proof_invalid("payload keyVersion must be positive")
+    signed_moment = payload[CP_MOMENT]
+    if isinstance(signed_moment, bool) or not isinstance(signed_moment, int):
+        raise TypeError("proof payload moment must be an int")
+    if signed_moment < 0:
+        raise _fork_proof_invalid("payload moment must be non-negative")
+    policy_digest = payload[VD_POLICY_DIGEST]
+    if not isinstance(policy_digest, str):
+        raise TypeError("proof payload policyDigest must be a str")
+    if not _is_digest(policy_digest):
+        raise _fork_proof_invalid(
+            "payload policyDigest must be 64 lowercase hex characters"
+        )
+    version = payload[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("proof payload version must be an int")
+    if version != RECEIPT_FORK_PROOF_VERSION:
+        raise _fork_proof_invalid("payload version must be the integer 1")
+
+    chains = payload[FORK_PROOF_CHAINS]
+    if not isinstance(chains, list):
+        raise TypeError("proof payload chains must be a list")
+    if not chains:
+        raise _fork_proof_invalid("payload chains must be non-empty")
+    seen_chain_ids: set[str] = set()
+    for position, chain in enumerate(chains):
+        where = f"chain {position}"
+        if not isinstance(chain, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(chain.keys()) != _FORK_PROOF_CHAIN_KEYS:
+            raise _fork_proof_invalid(
+                f"{where} must contain exactly the keys 'id', "
+                "'receiptDigest', 'target' and 'hops'"
+            )
+        chain_id = chain[ID]
+        if not isinstance(chain_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if chain_id == "":
+            raise _fork_proof_invalid(f"{where} id must be a non-empty str")
+        if chain_id in seen_chain_ids:
+            raise _fork_proof_invalid(f"duplicate chain id {chain_id!r}")
+        seen_chain_ids.add(chain_id)
+        receipt_digest = chain[DELEGATION_RECEIPT_DIGEST]
+        if not isinstance(receipt_digest, str):
+            raise TypeError(f"{where} receiptDigest must be a str")
+        if not _is_digest(receipt_digest):
+            raise _fork_proof_invalid(
+                f"{where} receiptDigest must be 64 lowercase hex characters"
+            )
+        target = chain[DELEGATION_TARGET]
+        if not isinstance(target, str):
+            raise TypeError(f"{where} target must be a str")
+        if target == "":
+            raise _fork_proof_invalid(f"{where} target must be a non-empty str")
+        hop_digests = chain[DELEGATION_HOPS]
+        if not isinstance(hop_digests, list):
+            raise TypeError(f"{where} hops must be a list")
+        if not hop_digests:
+            raise _fork_proof_invalid(f"{where} hops must be a non-empty list")
+        for hop_index, hop_digest in enumerate(hop_digests):
+            if not isinstance(hop_digest, str):
+                raise TypeError(f"{where} hop {hop_index} digest must be a str")
+            if not _is_digest(hop_digest):
+                raise _fork_proof_invalid(
+                    f"{where} hop {hop_index} digest must be 64 lowercase "
+                    "hex characters"
+                )
+
+    _validated_fork_report(payload[FORK_PROOF_REPORT], chains)
+
+    if _checkpoint_compact(data) != raw:
+        raise _fork_proof_invalid("encoding is not the canonical compact form")
+    return payload, signature
+
+
+def sign_receipt_fork_proof(
+    items: list,
+    policy: dict,
+    keyring: dict,
+    moment: int,
+    issuer: str,
+    version: int,
+) -> bytes:
+    """Sign offline-handover evidence of a receipt delegation fork.
+
+    ``items`` is the same non-empty list of ``{"id", "receipt", "hops",
+    "target"}`` dicts :func:`verify_batch_receipt_chains` takes,
+    ``policy`` is the same ``{"batch", "sites", "threshold"}`` object,
+    ``keyring`` follows the :func:`apply_signed_remote` rules, ``moment``
+    is the signing time and ``issuer``/``version`` name the signing
+    credentials.  The existing batch verification runs first, reading and
+    writing no file and leaving the original items and its report
+    unmodified; a proof is issued only when the summary contains at
+    least one fork.
+
+    The proof is one canonical compact UTF-8 JSON object -- every object
+    key recursively sorted, non-ASCII preserved, no trailing newline or
+    any other trailing byte -- carrying exactly ``payload`` and
+    ``signature``.  The payload binds exactly ``issuer``,
+    ``keyVersion``, ``moment``, ``policyDigest`` (the lowercase hex
+    SHA-256 of the canonical compact policy encoding), the complete
+    ``report`` and ``chains``, and ``version`` (the integer 1).  The
+    chain summaries strictly preserve input order with no reordering or
+    omission; each carries exactly ``id``, ``receiptDigest`` (the
+    lowercase hex SHA-256 of that chain's base receipt bytes), ``target``
+    and ``hops`` (the lowercase hex SHA-256 of each hop's complete
+    bytes, in chain order).  ``signature`` is the lowercase hex
+    HMAC-SHA256 of the canonical compact payload bytes under the key the
+    keyring binds to the exact issuer and version, with no fallback;
+    unknown, revoked, not-yet-valid or expired credentials raise
+    :class:`AuthenticationError`.
+
+    A wrong parameter or public field type raises :class:`TypeError` (a
+    :class:`bool` never poses as an int); an empty issuer, a non-positive
+    version, a negative moment, an illegal policy or a summary without a
+    fork raises :class:`ValueError`; the batch verification keeps its
+    own :func:`verify_batch_receipt_chains` classification.
+    """
+    validated_items = _validated_chain_items(items)
+    validated_policy = _validated_adjudication_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+
+    # The existing batch verification runs first and the original items
+    # and its report are left unmodified; a proof is only issued when the
+    # summary contains at least one fork.
+    report = verify_batch_receipt_chains(items, policy, keyring, moment)
+    if not report[CHAINS_FORKS]:
+        raise ValueError(
+            "a receipt fork proof is only issued when the batch summary "
+            "contains at least one fork"
+        )
+
+    entry = _usable_checkpoint_key(validated_keyring, issuer, version, moment)
+    payload = {
+        VD_ISSUER: issuer,
+        KEY_VERSION: version,
+        CP_MOMENT: moment,
+        VD_POLICY_DIGEST: hashlib.sha256(
+            _verdict_policy_bytes(validated_policy)
+        ).hexdigest(),
+        FORK_PROOF_REPORT: copy.deepcopy(report),
+        FORK_PROOF_CHAINS: _fork_chain_summaries(validated_items),
+        VERSION: RECEIPT_FORK_PROOF_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _checkpoint_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+def verify_receipt_fork_proof(
+    proof: bytes, policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify a signed receipt fork proof entirely offline.
+
+    Only the proof bytes, the expected ``policy``, the current
+    ``keyring`` and the verification ``moment`` are consulted -- no file
+    is read or written and no argument is modified.  Verification parses
+    the canonical compact proof, recomputes the policy digest over the
+    canonical compact policy encoding, validates the complete bound
+    report against the chain summaries (item order and ids, receipt
+    digest, target and hop references, and the fork table re-derived
+    from the authenticated results), requires the signing moment not to
+    be later than the verification moment, and checks the HMAC-SHA256
+    signature against the key the *current* keyring binds to the
+    payload's exact issuer and version, usable at the verification
+    moment with no fallback, so a later revocation or expiry rejects the
+    proof just as it does a replay.
+
+    A non-bytes proof or a public field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); an
+    illegal policy, keyring or moment raises :class:`ValueError`; an
+    illegal encoding, key set, version, digest, ordering, reference or
+    report binding raises :class:`InvalidReceiptForkProofError` (a
+    :class:`ValueError` subclass); and unknown, revoked, not-yet-valid
+    or expired credentials or a signature mismatch raise
+    :class:`AuthenticationError`.
+
+    On success it returns a fresh mapping with the fixed keys ``chains``,
+    ``digest`` (the lowercase hex SHA-256 of the proof bytes),
+    ``issuer``, ``keyVersion``, ``moment``, ``policyDigest``, ``report``
+    (the complete summary report) and ``version`` (the integer 1);
+    repeated calls return equal but mutually independent results.
+    """
+    if not isinstance(proof, bytes):
+        raise TypeError("proof must be bytes")
+    validated_policy = _validated_adjudication_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+    return _verify_receipt_fork_proof(
+        proof, validated_policy, validated_keyring, moment
+    )
+
+
+def _verify_receipt_fork_proof(
+    proof: bytes,
+    validated_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one fork proof against already-validated shared arguments.
+
+    This is the shared core of :func:`verify_receipt_fork_proof` and the
+    batch :func:`verify_receipt_fork_proofs`; the caller owns the
+    argument-type and batch-structure validation.  The returned dict is
+    freshly built solely from authenticated proof material.
+    """
+    payload, signature = _parse_receipt_fork_proof(proof)
+    issuer = payload[VD_ISSUER]
+    key_version = payload[KEY_VERSION]
+    signed_moment = payload[CP_MOMENT]
+    policy_digest = payload[VD_POLICY_DIGEST]
+
+    recomputed_policy = hashlib.sha256(
+        _verdict_policy_bytes(validated_policy)
+    ).hexdigest()
+    if policy_digest != recomputed_policy:
+        raise _fork_proof_invalid("policyDigest does not match the policy")
+    if signed_moment > moment:
+        raise _fork_proof_invalid(
+            "moment must not be later than the verification moment"
+        )
+
+    key_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, key_version, moment
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(key_entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError("receipt fork proof signature does not match")
+
+    result = {
+        FORK_PROOF_CHAINS: copy.deepcopy(payload[FORK_PROOF_CHAINS]),
+        CP_DIGEST: hashlib.sha256(proof).hexdigest(),
+        VD_ISSUER: issuer,
+        KEY_VERSION: key_version,
+        CP_MOMENT: signed_moment,
+        VD_POLICY_DIGEST: policy_digest,
+        FORK_PROOF_REPORT: copy.deepcopy(payload[FORK_PROOF_REPORT]),
+        VERSION: RECEIPT_FORK_PROOF_VERSION,
+    }
+    return {key: result[key] for key in _FORK_PROOF_RESULT_ORDER}
+
+
+def _fork_proof_item_report(
+    item_id: str, status: str, error: str | None, result: dict | None
+) -> dict:
+    """One fork-proof batch report with the fixed key order."""
+    return {
+        CHECKPOINT_ITEM_ERROR: error,
+        ID: item_id,
+        VERDICT_ITEM_RESULT: result,
+        STATUS: status,
+    }
+
+
+def _verify_fork_proof_item(
+    item: dict,
+    validated_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one fork proof in isolation and report its outcome.
+
+    Current but revoked, not-yet-valid, expired or missing credentials
+    and a wrong signature make the item ``unauthenticated``; every
+    encoding, key-set, field, digest, ordering, reference or report
+    fault makes it ``invalid-proof``; a passing proof is ``verified``.
+    """
+    item_id = item[ID]
+    proof = item[VERDICT_ITEM_PROOF]
+    try:
+        result = _verify_receipt_fork_proof(
+            proof, validated_policy, validated_keyring, moment
+        )
+    except AuthenticationError as exc:
+        return _fork_proof_item_report(
+            item_id, VERIFY_UNAUTHENTICATED, str(exc), None
+        )
+    except (InvalidReceiptForkProofError, TypeError) as exc:
+        # A TypeError here can only come from a wrong JSON field type
+        # *inside* the proof bytes; the argument types were all validated
+        # before the batch ran.
+        return _fork_proof_item_report(
+            item_id, VERIFY_INVALID_PROOF, str(exc), None
+        )
+    return _fork_proof_item_report(item_id, _VERIFY_VERIFIED, None, result)
+
+
+def verify_receipt_fork_proofs(
+    items: list, policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify a batch of signed receipt fork proofs entirely offline.
+
+    ``items`` is a non-empty list; each item is a dict with exactly the
+    keys ``id`` (a non-empty str, unique across the batch) and ``proof``
+    (the proof bytes :func:`sign_receipt_fork_proof` produced).
+    ``policy`` is the same ``{"batch", "sites", "threshold"}`` object,
+    ``keyring`` follows the :func:`apply_signed_remote` rules and
+    ``moment`` is the current time as a non-negative integer.  The whole
+    batch structure and the shared policy, keyring and moment are
+    validated before any proof is verified, and no file is read or
+    written or input modified.  Container, element or field type faults
+    raise :class:`TypeError` (a :class:`bool` never poses as an int) and
+    an empty list, an empty or duplicate id or a wrong item key set
+    raises :class:`ValueError`; only such a batch-level fault raises.
+
+    Each proof is then verified independently in strict input order
+    through the exact :func:`verify_receipt_fork_proof` rules, each
+    selecting its key by its own exact issuer and version with no
+    fallback: one proof's failure never stops a later item or changes an
+    earlier report.  A currently revoked, not-yet-valid, expired or
+    missing credential or a wrong signature makes that item
+    ``unauthenticated``; an illegal encoding, key set, field, digest,
+    ordering, reference or report makes it ``invalid-proof``; a passing
+    proof is ``verified``.
+
+    The top-level result is a fresh dict with the fixed keys ``items``
+    and ``version`` (the integer 1); each item report carries, in this
+    key order, ``error`` (null exactly when verified), ``id``, ``result``
+    (a fresh independent copy of the single-entry result when verified,
+    otherwise null) and ``status``.  Repeated calls return equal but
+    mutually independent results.
+    """
+    validated_items = _validated_verdict_items(items)
+    validated_policy = _validated_adjudication_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+    return {
+        ITEMS: [
+            _verify_fork_proof_item(
+                item, validated_policy, validated_keyring, moment
+            )
+            for item in validated_items
+        ],
+        VERSION: RECEIPT_FORK_PROOF_VERSION,
+    }
