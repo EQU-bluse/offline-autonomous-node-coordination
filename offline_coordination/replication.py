@@ -465,13 +465,31 @@ as it does a replay.  It returns a fresh dict with the fixed keys
 ``version`` (the integer 1).  A non-bytes argument or a field of the
 wrong type raises :class:`TypeError` (a :class:`bool` never poses as
 an int); an invalid policy, identifier, version or moment raises
-:class:`ValueError`; a bound verdict that fails its canonical contract
-raises :class:`InvalidRecoveryVerdictError`; a proof with a bad
-structure, a recomputed digest mismatch or a wrong batch/threshold
-binding raises :class:`InvalidRecoveryVerdictProofError` (both format
-errors subclass :class:`ValueError`); unknown, revoked, not-yet-valid
-or expired credentials or a signature mismatch raise
+:class:`ValueError`; a proof with a bad structure, a bound verdict
+that fails its canonical contract, a recomputed digest mismatch or a
+wrong batch/threshold binding raises
+:class:`InvalidRecoveryVerdictProofError` (both format errors subclass
+:class:`ValueError`); unknown, revoked, not-yet-valid or expired
+credentials or a signature mismatch raise
 :class:`AuthenticationError`.
+
+:func:`verify_recovery_verdicts` verifies a whole batch of such proofs
+offline against a shared policy, keyring and moment, reading no file
+and modifying no input.  ``items`` is a non-empty list; each item
+contains exactly a non-empty, batch-unique ``id`` and the ``proof``
+bytes.  The batch is validated in full before any item is verified --
+container, field or element type faults raise :class:`TypeError` and
+an empty list, an empty or duplicate id or a wrong item key set raises
+:class:`ValueError`.  Each item is then verified in input order and in
+isolation through the exact :func:`verify_recovery_verdict` rules,
+with the key selected by the proof's own exact issuer and version and
+no fallback, so one item's failure never stops the later items.  The
+result is a fresh dict with the fixed keys ``items`` and ``version``
+(the integer 1); each item report carries ``error``, ``id``, ``result``
+and ``status``, where the status is ``verified`` (with the single-entry
+result mapping and a null error), ``invalid-proof`` or
+``unauthenticated`` (both with a null result and the original exception
+text).
 """
 
 from __future__ import annotations
@@ -5978,17 +5996,18 @@ _VERDICT_PAYLOAD_KEYS = frozenset((
     VD_POLICY_DIGEST,
     VD_VERDICT,
 ))
+# The public ``verify_recovery_verdict`` result key order, as documented.
 _VERDICT_RESULT_KEYS = (
     ADJ_BATCH,
-    CHECKPOINT_ITEM_BOUNDARY,
-    CP_DIGEST,
     VD_ISSUER,
-    ITEMS,
     KEY_VERSION,
-    VD_POLICY_DIGEST,
     VD_SIGNED_AT,
-    STATUS,
+    VD_POLICY_DIGEST,
     VD_VERDICT_DIGEST,
+    STATUS,
+    CP_DIGEST,
+    CHECKPOINT_ITEM_BOUNDARY,
+    ITEMS,
     VERSION,
 )
 _VERDICT_TOP_KEYS = frozenset((
@@ -6448,23 +6467,22 @@ def verify_recovery_verdict(
     or expiry rejects the proof just as it does a replay.
 
     The result is a fresh dict with the fixed keys ``batch``,
-    ``boundary``, ``digest``, ``issuer``, ``items``, ``keyVersion``,
-    ``policyDigest``, ``signedAt``, ``status``, ``verdictDigest`` and
-    ``version`` (the integer 1), where ``status``, ``digest``,
+    ``issuer``, ``keyVersion``, ``signedAt``, ``policyDigest``,
+    ``verdictDigest``, ``status``, ``digest``, ``boundary``, ``items``
+    and ``version`` (the integer 1), where ``status``, ``digest``,
     ``boundary`` and ``items`` come from the authenticated verdict.
 
     A non-bytes proof or a field of the wrong type raises
     :class:`TypeError` (a :class:`bool` never poses as an int); an
     invalid policy, identifier, version or moment raises
     :class:`ValueError`; keyring structure or format faults raise
-    :class:`ValueError`; a verdict bound into the proof that fails its
-    canonical contract raises :class:`InvalidRecoveryVerdictError`; a
-    proof with a bad structure, a recomputed digest mismatch or a
-    payload that binds the wrong batch or threshold raises
-    :class:`InvalidRecoveryVerdictProofError` (both format errors are
-    :class:`ValueError` subclasses); and unknown, revoked, not-yet-valid
-    or expired credentials or a signature mismatch raise
-    :class:`AuthenticationError`.
+    :class:`ValueError`; a proof with a bad structure, a verdict bound
+    into the proof that fails its canonical contract, a recomputed
+    digest mismatch or a payload that binds the wrong batch or
+    threshold raises :class:`InvalidRecoveryVerdictProofError` (both
+    format errors are :class:`ValueError` subclasses); and unknown,
+    revoked, not-yet-valid or expired credentials or a signature
+    mismatch raise :class:`AuthenticationError`.
     """
     if not isinstance(proof, bytes):
         raise TypeError("proof must be bytes")
@@ -6474,7 +6492,25 @@ def verify_recovery_verdict(
         raise TypeError("moment must be an int")
     if moment < 0:
         raise ValueError("moment must be non-negative")
+    return _verify_recovery_verdict(
+        proof, validated_policy, validated_keyring, moment
+    )
 
+
+def _verify_recovery_verdict(
+    proof: bytes, validated_policy: dict, validated_keyring: dict, moment: int
+) -> dict:
+    """Verify one proof against already-validated shared inputs.
+
+    This is the :func:`verify_recovery_verdict` core with the policy,
+    keyring and moment validation factored out, so the batch entry
+    point validates them once for the whole batch.  Only proof-level
+    faults remain: :class:`TypeError` and
+    :class:`InvalidRecoveryVerdictProofError` for structural,
+    field-type, encoding, digest or binding faults (a bound verdict
+    that fails its canonical contract included) and
+    :class:`AuthenticationError` for credential or signature faults.
+    """
     payload, signature = _parse_verdict_proof(proof)
     issuer = payload[VD_ISSUER]
     key_version = payload[KEY_VERSION]
@@ -6483,9 +6519,15 @@ def verify_recovery_verdict(
     verdict = payload[VD_VERDICT]
 
     # The verdict bound into the payload must be a structurally valid
-    # canonical verdict on its own.
+    # canonical verdict on its own; any structural, type or canonical
+    # encoding fault inside it is a proof fault.
     verdict_bytes = _checkpoint_compact(verdict)
-    parsed_verdict = _parse_verdict(verdict_bytes)
+    try:
+        parsed_verdict = _parse_verdict(verdict_bytes)
+    except (InvalidRecoveryVerdictError, TypeError) as exc:
+        raise _verdict_proof_invalid(
+            f"the bound verdict is invalid: {exc}"
+        ) from exc
 
     recomputed_policy_digest = hashlib.sha256(
         _verdict_policy_bytes(validated_policy)
@@ -6531,3 +6573,154 @@ def verify_recovery_verdict(
         VERSION: RECOVERY_VERDICT_VERSION,
     }
     return {key: result[key] for key in _VERDICT_RESULT_KEYS}
+
+
+# --- Offline batch verification of recovery verdict proofs -------------------
+
+RECOVERY_VERDICTS_VERSION = 1
+
+VERIFY_INVALID_PROOF = "invalid-proof"
+
+VD_PROOF = "proof"
+
+_VERDICT_PROOF_ITEM_KEYS = frozenset((ID, VD_PROOF))
+
+
+def _validated_verdict_proof_items(items: object) -> list[dict]:
+    """Validate the batch structure before any proof is verified.
+
+    The argument must be a non-empty list of dicts each holding exactly
+    ``id`` (a non-empty str, unique across the batch) and ``proof``
+    (bytes).  Container, field and element type faults raise
+    :class:`TypeError`; an empty list, an empty or duplicate id or a
+    wrong item key set raises :class:`ValueError`.  Only a fully
+    validated batch comes back -- as fresh item dicts, so the
+    verification below never mutates the caller's objects.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _VERDICT_PROOF_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'id' and 'proof'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        proof = item[VD_PROOF]
+        if not isinstance(proof, bytes):
+            raise TypeError(f"{where} proof must be bytes")
+        validated.append({ID: item_id, VD_PROOF: proof})
+    return validated
+
+
+def _verdicts_item_report(
+    item_id: str, result: dict | None, status: str, error: str | None
+) -> dict:
+    """One batch report entry with the fixed key order."""
+    return {
+        CHECKPOINT_ITEM_ERROR: error,
+        ID: item_id,
+        ADJ_RESULT: result,
+        STATUS: status,
+    }
+
+
+def _verify_verdict_proof_item(
+    item: dict, policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify one batch item in isolation and report its outcome.
+
+    The proof runs through the exact :func:`verify_recovery_verdict`
+    core against the shared, already-validated policy, keyring and
+    moment; the key is selected by the proof's own exact issuer and
+    version with no fallback.  No file is ever read and no input is
+    modified.
+    """
+    item_id = item[ID]
+    try:
+        result = _verify_recovery_verdict(
+            item[VD_PROOF], policy, keyring, moment
+        )
+    except AuthenticationError as exc:
+        return _verdicts_item_report(
+            item_id, None, VERIFY_UNAUTHENTICATED, str(exc)
+        )
+    except (InvalidRecoveryVerdictProofError, TypeError) as exc:
+        return _verdicts_item_report(
+            item_id, None, VERIFY_INVALID_PROOF, str(exc)
+        )
+    return _verdicts_item_report(item_id, result, _VERIFY_VERIFIED, None)
+
+
+def verify_recovery_verdicts(
+    items: list, policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify a batch of signed recovery verdict proofs, entirely offline.
+
+    ``items`` is a non-empty list of batch items, each a dict with
+    exactly the keys ``id`` (a non-empty str, unique across the batch)
+    and ``proof`` (the proof bytes produced by
+    :func:`export_recovery_verdict`).  ``policy`` is the shared
+    ``{"batch", "sites", "threshold"}`` adjudication policy,
+    ``keyring`` follows the :func:`apply_signed_remote` rules and
+    ``moment`` is the verification time as a non-negative integer.  No
+    file is ever read and no input is modified.
+
+    The whole batch structure is validated before any item is
+    verified: container, field or element type faults raise
+    :class:`TypeError` (a :class:`bool` never poses as an int) and an
+    empty list, an empty or duplicate id or a wrong item key set raises
+    :class:`ValueError`; policy, keyring and ``moment`` faults follow
+    the :func:`verify_recovery_verdict` classification.  Only these
+    batch-level faults raise -- one item's verification failure never
+    stops the later items nor alters the reports already produced.
+
+    Each item is then verified in isolation, in input order, through
+    the exact :func:`verify_recovery_verdict` rules, with the key
+    selected by the proof's own exact issuer and version (no fallback,
+    so proofs from different issuers and key versions verify
+    independently in one batch).  Unknown, revoked, not-yet-valid or
+    expired credentials and a bad signature mark the item
+    ``unauthenticated``; an illegal encoding, key set, field, digest,
+    batch, threshold, signing moment or bound verdict marks it
+    ``invalid-proof``; a proof that passes is ``verified``.
+
+    The result is a fresh dict with the fixed key order ``items``,
+    ``version`` (the integer 1).  Every item reports, in this key
+    order, ``error``, ``id``, ``result`` and ``status``: a verified
+    item carries a ``None`` error and the fresh
+    :func:`verify_recovery_verdict` result mapping, while a failed
+    item carries a ``None`` result and the deterministic, non-empty
+    text of the original exception.  Repeated calls return equal but
+    fully independent results that share no mutable object with the
+    inputs.
+    """
+    validated_items = _validated_verdict_proof_items(items)
+    validated_policy = _validated_adjudication_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+    return {
+        ITEMS: [
+            _verify_verdict_proof_item(
+                item, validated_policy, validated_keyring, moment
+            )
+            for item in validated_items
+        ],
+        VERSION: RECOVERY_VERDICTS_VERSION,
+    }

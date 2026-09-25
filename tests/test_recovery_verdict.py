@@ -40,8 +40,8 @@ BOUNDARY = {"lastSeq": 5, "tail": "aa" * 32}
 OTHER_BOUNDARY = {"lastSeq": 6, "tail": "dd" * 32}
 
 RESULT_KEYS = [
-    "batch", "boundary", "digest", "issuer", "items", "keyVersion",
-    "policyDigest", "signedAt", "status", "verdictDigest", "version",
+    "batch", "issuer", "keyVersion", "signedAt", "policyDigest",
+    "verdictDigest", "status", "digest", "boundary", "items", "version",
 ]
 
 
@@ -539,10 +539,18 @@ class ProofStructureTest(unittest.TestCase):
                 text.encode("utf-8"), policy(), keyring(), MOMENT
             )
 
-    def test_illegal_verdict_inside_proof_is_a_verdict_error(self):
+    def test_illegal_verdict_inside_proof_is_a_proof_error(self):
         data = json.loads(self.proof)
         data["payload"]["verdict"] = {"unexpected": True}
-        with self.assertRaises(InvalidRecoveryVerdictError):
+        with self.assertRaises(InvalidRecoveryVerdictProofError):
+            verify_recovery_verdict(
+                compact(data), policy(), keyring(), MOMENT
+            )
+
+    def test_verdict_field_type_fault_inside_proof_is_a_proof_error(self):
+        data = json.loads(self.proof)
+        data["payload"]["verdict"]["threshold"] = "2"
+        with self.assertRaises(InvalidRecoveryVerdictProofError):
             verify_recovery_verdict(
                 compact(data), policy(), keyring(), MOMENT
             )
