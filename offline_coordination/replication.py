@@ -6776,21 +6776,29 @@ def _receipt_invalid(message: str) -> InvalidBatchReceiptError:
 
 
 def _validated_receipt_boundary(boundary: object, where: str) -> None:
-    """Require a receipt boundary to be null or a ``lastSeq``/``tail`` pair."""
+    """Require a receipt boundary to be null or a ``lastSeq``/``tail`` pair.
+
+    A field of the wrong type raises :class:`TypeError` (a :class:`bool`
+    never poses as an int); every key-set or value-format fault raises
+    :class:`InvalidBatchReceiptError`.
+    """
     if boundary is None:
         return
     if not isinstance(boundary, dict):
-        raise _receipt_invalid(f"{where} boundary must be an object or null")
+        raise TypeError(f"{where} boundary must be an object or null")
     if set(boundary.keys()) != _ADJ_BOUNDARY_KEYS:
         raise _receipt_invalid(
             f"{where} boundary must be null or {{'lastSeq', 'tail'}}"
         )
     last_seq = boundary[CP_LAST_SEQ]
     if isinstance(last_seq, bool) or not isinstance(last_seq, int):
-        raise _receipt_invalid(f"{where} boundary lastSeq must be an int")
+        raise TypeError(f"{where} boundary lastSeq must be an int")
     if last_seq < 0:
         raise _receipt_invalid(f"{where} boundary lastSeq must be >= 0")
-    if not _is_digest(boundary[CP_TAIL]):
+    tail = boundary[CP_TAIL]
+    if not isinstance(tail, str):
+        raise TypeError(f"{where} boundary tail must be a str")
+    if not _is_digest(tail):
         raise _receipt_invalid(
             f"{where} boundary tail must be 64 lowercase hex characters"
         )
@@ -6801,9 +6809,12 @@ def _validated_receipt_verdict_item(item: object, where: str) -> None:
 
     Mirrors the per-item rules a verdict carries, so a receipt only ever
     binds a result :func:`verify_recovery_verdict` could have produced.
+    A field of the wrong type raises :class:`TypeError` (a :class:`bool`
+    never poses as an int); every key-set or value-format fault raises
+    :class:`InvalidBatchReceiptError`.
     """
     if not isinstance(item, dict):
-        raise _receipt_invalid(f"{where} must be an object")
+        raise TypeError(f"{where} must be an object")
     if set(item.keys()) != _ADJ_ITEM_REPORT_KEYS:
         raise _receipt_invalid(
             f"{where} must contain exactly the keys 'boundary', "
@@ -6811,30 +6822,38 @@ def _validated_receipt_verdict_item(item: object, where: str) -> None:
             "'site' and 'status'"
         )
     item_id = item[ID]
-    if not isinstance(item_id, str) or item_id == "":
+    if not isinstance(item_id, str):
+        raise TypeError(f"{where} id must be a str")
+    if item_id == "":
         raise _receipt_invalid(f"{where} id must be a non-empty str")
     site = item[ADJ_SITE]
-    if site is not None and (not isinstance(site, str) or site == ""):
+    if site is not None and not isinstance(site, str):
+        raise TypeError(f"{where} site must be a str or null")
+    if site is not None and site == "":
         raise _receipt_invalid(f"{where} site must be a non-empty str or null")
     key_version = item[CP_KEY_VERSION]
     if key_version is not None:
         if isinstance(key_version, bool) or not isinstance(key_version, int):
-            raise _receipt_invalid(f"{where} keyVersion must be an int or null")
+            raise TypeError(f"{where} keyVersion must be an int or null")
         if key_version <= 0:
             raise _receipt_invalid(f"{where} keyVersion must be positive")
     digest = item[CP_DIGEST]
+    if digest is not None and not isinstance(digest, str):
+        raise TypeError(f"{where} digest must be a str or null")
     if digest is not None and not _is_digest(digest):
         raise _receipt_invalid(
             f"{where} digest must be null or 64 lowercase hex characters"
         )
     status = item[STATUS]
-    if status is not None and (
-        not isinstance(status, str) or status not in _ADJ_RESULT_STATUSES
-    ):
+    if status is not None and not isinstance(status, str):
+        raise TypeError(f"{where} status must be a str or null")
+    if status is not None and status not in _ADJ_RESULT_STATUSES:
         raise _receipt_invalid(f"{where} status is not a known result status")
     _validated_receipt_boundary(item[CHECKPOINT_ITEM_BOUNDARY], where)
     conclusion = item[ADJ_CONCLUSION]
-    if not isinstance(conclusion, str) or conclusion not in (
+    if not isinstance(conclusion, str):
+        raise TypeError(f"{where} conclusion must be a str")
+    if conclusion not in (
         ADJ_CONCLUSION_VALID,
         ADJ_CONCLUSION_INVALID,
         ADJ_CONCLUSION_DUPLICATE,
@@ -6847,7 +6866,9 @@ def _validated_receipt_verdict_item(item: object, where: str) -> None:
             raise _receipt_invalid(
                 f"{where} reason must be null for a valid packet"
             )
-    elif not isinstance(reason, str) or reason == "":
+    elif not isinstance(reason, str):
+        raise TypeError(f"{where} reason must be a str")
+    elif reason == "":
         raise _receipt_invalid(f"{where} reason must be a non-empty str")
 
 
@@ -6860,9 +6881,13 @@ def _validated_receipt_result(result: object, where: str) -> None:
     ``digest``, ``boundary``, ``items`` and ``version`` (the integer 1),
     with the accepted-only digest and boundary pairing the verdict
     itself enforces.
+
+    A field of the wrong type raises :class:`TypeError` (a
+    :class:`bool` never poses as an int); every key-set or
+    value-format fault raises :class:`InvalidBatchReceiptError`.
     """
     if not isinstance(result, dict):
-        raise _receipt_invalid(f"{where} result must be an object")
+        raise TypeError(f"{where} result must be an object")
     if set(result.keys()) != frozenset(_VERDICT_RESULT_KEYS):
         raise _receipt_invalid(
             f"{where} result must contain exactly the keys 'batch', "
@@ -6870,38 +6895,46 @@ def _validated_receipt_result(result: object, where: str) -> None:
             "'verdictDigest', 'status', 'digest', 'boundary', 'items' "
             "and 'version'"
         )
-    if not isinstance(result[ADJ_BATCH], str) or result[ADJ_BATCH] == "":
+    if not isinstance(result[ADJ_BATCH], str):
+        raise TypeError(f"{where} result batch must be a str")
+    if result[ADJ_BATCH] == "":
         raise _receipt_invalid(f"{where} result batch must be a non-empty str")
-    if not isinstance(result[VD_ISSUER], str) or result[VD_ISSUER] == "":
+    if not isinstance(result[VD_ISSUER], str):
+        raise TypeError(f"{where} result issuer must be a str")
+    if result[VD_ISSUER] == "":
         raise _receipt_invalid(
             f"{where} result issuer must be a non-empty str"
         )
     key_version = result[KEY_VERSION]
     if isinstance(key_version, bool) or not isinstance(key_version, int):
-        raise _receipt_invalid(f"{where} result keyVersion must be an int")
+        raise TypeError(f"{where} result keyVersion must be an int")
     if key_version <= 0:
         raise _receipt_invalid(f"{where} result keyVersion must be positive")
     signed_at = result[VD_SIGNED_AT]
     if isinstance(signed_at, bool) or not isinstance(signed_at, int):
-        raise _receipt_invalid(f"{where} result signedAt must be an int")
+        raise TypeError(f"{where} result signedAt must be an int")
     if signed_at < 0:
         raise _receipt_invalid(f"{where} result signedAt must be non-negative")
+    if not isinstance(result[VD_POLICY_DIGEST], str):
+        raise TypeError(f"{where} result policyDigest must be a str")
     if not _is_digest(result[VD_POLICY_DIGEST]):
         raise _receipt_invalid(
             f"{where} result policyDigest must be 64 lowercase hex characters"
         )
+    if not isinstance(result[VD_VERDICT_DIGEST], str):
+        raise TypeError(f"{where} result verdictDigest must be a str")
     if not _is_digest(result[VD_VERDICT_DIGEST]):
         raise _receipt_invalid(
             f"{where} result verdictDigest must be 64 lowercase hex characters"
         )
     version = result[VERSION]
-    if (
-        isinstance(version, bool)
-        or not isinstance(version, int)
-        or version != RECOVERY_VERDICT_VERSION
-    ):
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError(f"{where} result version must be an int")
+    if version != RECOVERY_VERDICT_VERSION:
         raise _receipt_invalid(f"{where} result version must be the integer 1")
     status = result[STATUS]
+    if not isinstance(status, str):
+        raise TypeError(f"{where} result status must be a str")
     if status not in (
         ADJ_STATUS_ACCEPTED,
         ADJ_STATUS_CONFLICTED,
@@ -6911,6 +6944,8 @@ def _validated_receipt_result(result: object, where: str) -> None:
             f"{where} result status is not a known verdict status"
         )
     digest = result[CP_DIGEST]
+    if digest is not None and not isinstance(digest, str):
+        raise TypeError(f"{where} result digest must be a str or null")
     if digest is not None and not _is_digest(digest):
         raise _receipt_invalid(
             f"{where} result digest must be null or 64 lowercase hex "
@@ -6928,7 +6963,7 @@ def _validated_receipt_result(result: object, where: str) -> None:
         )
     items = result[ITEMS]
     if not isinstance(items, list):
-        raise _receipt_invalid(f"{where} result items must be a list")
+        raise TypeError(f"{where} result items must be a list")
     for position, item in enumerate(items):
         _validated_receipt_verdict_item(item, f"{where} result item {position}")
 
@@ -6941,25 +6976,31 @@ def _validated_receipt_report(report: object, item_id: str, where: str) -> None:
     ``error`` null and ``result`` present exactly when ``verified``, and
     its ``id`` must equal the receipt item's ``id``, keeping the
     positional binding between the ordered items and their reports.
+
+    A field of the wrong type raises :class:`TypeError`; every key-set
+    or value-format fault, including an id mismatch, raises
+    :class:`InvalidBatchReceiptError`.
     """
     if not isinstance(report, dict):
-        raise _receipt_invalid(f"{where} report must be an object")
+        raise TypeError(f"{where} report must be an object")
     if set(report.keys()) != _BATCH_RECEIPT_REPORT_KEYS:
         raise _receipt_invalid(
             f"{where} report must contain exactly the keys 'error', 'id', "
             "'result' and 'status'"
         )
     report_id = report[ID]
-    if not isinstance(report_id, str) or report_id == "":
+    if not isinstance(report_id, str):
+        raise TypeError(f"{where} report id must be a str")
+    if report_id == "":
         raise _receipt_invalid(f"{where} report id must be a non-empty str")
     if report_id != item_id:
         raise _receipt_invalid(
             f"{where} report id does not match the item id"
         )
     status = report[STATUS]
-    if not isinstance(status, str) or status not in (
-        _BATCH_RECEIPT_REPORT_STATUSES
-    ):
+    if not isinstance(status, str):
+        raise TypeError(f"{where} report status must be a str")
+    if status not in _BATCH_RECEIPT_REPORT_STATUSES:
         raise _receipt_invalid(f"{where} report status is not a known status")
     error = report[CHECKPOINT_ITEM_ERROR]
     result = report[VERDICT_ITEM_RESULT]
@@ -6970,7 +7011,9 @@ def _validated_receipt_report(report: object, item_id: str, where: str) -> None:
             )
         _validated_receipt_result(result, where)
     else:
-        if not isinstance(error, str) or error == "":
+        if not isinstance(error, str):
+            raise TypeError(f"{where} report error must be a str for a failure")
+        if error == "":
             raise _receipt_invalid(
                 f"{where} report error must be a non-empty str for a failure"
             )
@@ -6983,10 +7026,11 @@ def _validated_receipt_report(report: object, item_id: str, where: str) -> None:
 def _parse_batch_receipt(raw: object) -> tuple[dict, str]:
     """Validate receipt bytes structurally into ``(payload, signature)``.
 
-    A non-bytes argument raises :class:`TypeError`; every encoding,
-    key-set, version, digest, report-shape or canonical-form fault
-    raises :class:`InvalidBatchReceiptError`.  The policy, moment,
-    credential and signature bindings are checked by
+    A non-bytes argument or a public field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, value, digest, report-shape or
+    canonical-form fault raises :class:`InvalidBatchReceiptError`.  The
+    policy, moment, credential and signature bindings are checked by
     :func:`verify_batch_receipt`.
     """
     if not isinstance(raw, bytes):
@@ -7014,63 +7058,73 @@ def _parse_batch_receipt(raw: object) -> tuple[dict, str]:
         raise _receipt_invalid("is not valid JSON") from exc
 
     if not isinstance(data, dict):
-        raise _receipt_invalid("must be a JSON object")
+        raise TypeError("receipt must be a JSON object")
     if set(data.keys()) != _BATCH_RECEIPT_TOP_KEYS:
         raise _receipt_invalid(
             "must contain exactly the keys 'payload' and 'signature'"
         )
     signature = data[SIGNATURE]
-    if not isinstance(signature, str) or _HEX64.fullmatch(signature) is None:
+    if not isinstance(signature, str):
+        raise TypeError("receipt signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
         raise _receipt_invalid(
             "signature must be 64 lowercase hex characters"
         )
     payload = data[TICKET_PAYLOAD]
     if not isinstance(payload, dict):
-        raise _receipt_invalid("payload must be an object")
+        raise TypeError("receipt payload must be an object")
     if set(payload.keys()) != _BATCH_RECEIPT_PAYLOAD_KEYS:
         raise _receipt_invalid(
             "payload must contain exactly the keys 'issuer', 'keyVersion', "
             "'moment', 'policy', 'items' and 'version'"
         )
     issuer = payload[VD_ISSUER]
-    if not isinstance(issuer, str) or issuer == "":
+    if not isinstance(issuer, str):
+        raise TypeError("receipt payload issuer must be a str")
+    if issuer == "":
         raise _receipt_invalid("payload issuer must be a non-empty str")
     key_version = payload[KEY_VERSION]
     if isinstance(key_version, bool) or not isinstance(key_version, int):
-        raise _receipt_invalid("payload keyVersion must be an int")
+        raise TypeError("receipt payload keyVersion must be an int")
     if key_version <= 0:
         raise _receipt_invalid("payload keyVersion must be positive")
     moment = payload[CP_MOMENT]
     if isinstance(moment, bool) or not isinstance(moment, int):
-        raise _receipt_invalid("payload moment must be an int")
+        raise TypeError("receipt payload moment must be an int")
     if moment < 0:
         raise _receipt_invalid("payload moment must be non-negative")
+    if not isinstance(payload[RECEIPT_POLICY], str):
+        raise TypeError("receipt payload policy must be a str")
     if not _is_digest(payload[RECEIPT_POLICY]):
         raise _receipt_invalid(
             "payload policy must be 64 lowercase hex characters"
         )
     version = payload[VERSION]
     if isinstance(version, bool) or not isinstance(version, int):
-        raise _receipt_invalid("payload version must be an int")
+        raise TypeError("receipt payload version must be an int")
     if version != BATCH_RECEIPT_VERSION:
         raise _receipt_invalid("payload version must be the integer 1")
     items = payload[ITEMS]
     if not isinstance(items, list):
-        raise _receipt_invalid("payload items must be a list")
+        raise TypeError("receipt payload items must be a list")
     if not items:
         raise _receipt_invalid("payload items must be non-empty")
     for position, item in enumerate(items):
         where = f"item {position}"
         if not isinstance(item, dict):
-            raise _receipt_invalid(f"{where} must be an object")
+            raise TypeError(f"{where} must be an object")
         if set(item.keys()) != _BATCH_RECEIPT_ITEM_KEYS:
             raise _receipt_invalid(
                 f"{where} must contain exactly the keys 'id', 'digest' "
                 "and 'report'"
             )
         item_id = item[ID]
-        if not isinstance(item_id, str) or item_id == "":
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
             raise _receipt_invalid(f"{where} id must be a non-empty str")
+        if not isinstance(item[CP_DIGEST], str):
+            raise TypeError(f"{where} digest must be a str")
         if not _is_digest(item[CP_DIGEST]):
             raise _receipt_invalid(
                 f"{where} digest must be 64 lowercase hex characters"
@@ -7273,10 +7327,12 @@ def _delegation_invalid(message: str) -> InvalidReceiptDelegationError:
 def _parse_receipt_delegation(raw: object, index: int) -> tuple[dict, str]:
     """Validate one hop's proof bytes into ``(payload, signature)``.
 
-    A non-bytes hop raises :class:`TypeError`; every encoding, key-set,
-    version, digest or canonical-form fault raises
-    :class:`InvalidReceiptDelegationError` naming the hop.  The chain
-    bindings, credentials and signature are checked by the chain walker.
+    A non-bytes hop or a public field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, value, digest or canonical-form fault
+    raises :class:`InvalidReceiptDelegationError` naming the hop.  The
+    chain bindings, credentials and signature are checked by the chain
+    walker.
     """
     where = f"hop {index}"
     if not isinstance(raw, bytes):
@@ -7306,55 +7362,63 @@ def _parse_receipt_delegation(raw: object, index: int) -> tuple[dict, str]:
         raise _delegation_invalid(f"{where} is not valid JSON") from exc
 
     if not isinstance(data, dict):
-        raise _delegation_invalid(f"{where} must be a JSON object")
+        raise TypeError(f"{where} must be a JSON object")
     if set(data.keys()) != _DELEGATION_TOP_KEYS:
         raise _delegation_invalid(
             f"{where} must contain exactly the keys 'payload' and 'signature'"
         )
     signature = data[SIGNATURE]
-    if not isinstance(signature, str) or _HEX64.fullmatch(signature) is None:
+    if not isinstance(signature, str):
+        raise TypeError(f"{where} signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
         raise _delegation_invalid(
             f"{where} signature must be 64 lowercase hex characters"
         )
     payload = data[TICKET_PAYLOAD]
     if not isinstance(payload, dict):
-        raise _delegation_invalid(f"{where} payload must be an object")
+        raise TypeError(f"{where} payload must be an object")
     if set(payload.keys()) != _DELEGATION_PAYLOAD_KEYS:
         raise _delegation_invalid(
             f"{where} payload must contain exactly the keys 'issuer', "
             "'keyVersion', 'moment', 'audience', 'upstream' and 'version'"
         )
     issuer = payload[VD_ISSUER]
-    if not isinstance(issuer, str) or issuer == "":
+    if not isinstance(issuer, str):
+        raise TypeError(f"{where} payload issuer must be a str")
+    if issuer == "":
         raise _delegation_invalid(
             f"{where} payload issuer must be a non-empty str"
         )
     key_version = payload[KEY_VERSION]
     if isinstance(key_version, bool) or not isinstance(key_version, int):
-        raise _delegation_invalid(f"{where} payload keyVersion must be an int")
+        raise TypeError(f"{where} payload keyVersion must be an int")
     if key_version <= 0:
         raise _delegation_invalid(
             f"{where} payload keyVersion must be positive"
         )
     hop_moment = payload[CP_MOMENT]
     if isinstance(hop_moment, bool) or not isinstance(hop_moment, int):
-        raise _delegation_invalid(f"{where} payload moment must be an int")
+        raise TypeError(f"{where} payload moment must be an int")
     if hop_moment < 0:
         raise _delegation_invalid(
             f"{where} payload moment must be non-negative"
         )
     audience = payload[DELEGATION_AUDIENCE]
-    if not isinstance(audience, str) or audience == "":
+    if not isinstance(audience, str):
+        raise TypeError(f"{where} payload audience must be a str")
+    if audience == "":
         raise _delegation_invalid(
             f"{where} payload audience must be a non-empty str"
         )
+    if not isinstance(payload[DELEGATION_UPSTREAM], str):
+        raise TypeError(f"{where} payload upstream must be a str")
     if not _is_digest(payload[DELEGATION_UPSTREAM]):
         raise _delegation_invalid(
             f"{where} payload upstream must be 64 lowercase hex characters"
         )
     version = payload[VERSION]
     if isinstance(version, bool) or not isinstance(version, int):
-        raise _delegation_invalid(f"{where} payload version must be an int")
+        raise TypeError(f"{where} payload version must be an int")
     if version != RECEIPT_DELEGATION_VERSION:
         raise _delegation_invalid(
             f"{where} payload version must be the integer 1"
@@ -7657,4 +7721,305 @@ def verify_batch_receipt_chain(
         DELEGATION_RECEIPT_DIGEST: hashlib.sha256(receipt).hexdigest(),
         DELEGATION_TARGET: target,
         VERSION: RECEIPT_DELEGATION_VERSION,
+    }
+
+
+# --- Offline batch verification of receipt delegation chains -----------------
+
+RECEIPT_CHAINS_VERSION = 1
+
+CHAIN_ITEM_RECEIPT = "receipt"
+CHAIN_ITEM_HOPS = "hops"
+CHAINS_FORKS = "forks"
+
+CHAINS_VERIFIED = "verified"
+CHAINS_CONFLICTED = "conflicted"
+CHAINS_INVALID_RECEIPT = "invalid-receipt"
+CHAINS_INVALID_DELEGATION = "invalid-delegation"
+CHAINS_UNAUTHENTICATED = "unauthenticated"
+
+_CHAIN_ITEM_ERROR = "forked-delegation"
+
+_CHAIN_ITEM_KEYS = frozenset((
+    ID,
+    CHAIN_ITEM_RECEIPT,
+    CHAIN_ITEM_HOPS,
+    DELEGATION_TARGET,
+))
+_FORK_AUDIENCES = "audiences"
+_FORK_IDS = "ids"
+
+
+def _validated_chain_items(items: object) -> list[dict]:
+    """Validate the multi-chain batch before any chain is verified.
+
+    The argument must be a non-empty list of dicts each holding exactly
+    ``id`` (a non-empty str, unique across the batch), ``receipt``
+    (bytes), ``hops`` (a non-empty list of bytes) and ``target`` (a
+    non-empty str).  Container, element and field type faults raise
+    :class:`TypeError`; an empty list, an empty or duplicate id, a wrong
+    key set or an empty hops list raises :class:`ValueError`.  Only a
+    fully validated batch comes back, as fresh item dicts with a copied
+    hops list, so verification below never mutates the caller's objects.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _CHAIN_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'hops', 'id', "
+                "'receipt' and 'target'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        receipt = item[CHAIN_ITEM_RECEIPT]
+        if not isinstance(receipt, bytes):
+            raise TypeError(f"{where} receipt must be bytes")
+        hops = item[CHAIN_ITEM_HOPS]
+        if not isinstance(hops, list):
+            raise TypeError(f"{where} hops must be a list")
+        if not hops:
+            raise ValueError(f"{where} hops must be a non-empty list")
+        for hop_index, hop in enumerate(hops):
+            if not isinstance(hop, bytes):
+                raise TypeError(f"{where} hop {hop_index} must be bytes")
+        target = item[DELEGATION_TARGET]
+        if not isinstance(target, str):
+            raise TypeError(f"{where} target must be a str")
+        if target == "":
+            raise ValueError(f"{where} target must be non-empty")
+        validated.append(
+            {
+                ID: item_id,
+                CHAIN_ITEM_RECEIPT: receipt,
+                CHAIN_ITEM_HOPS: list(hops),
+                DELEGATION_TARGET: target,
+            }
+        )
+    return validated
+
+
+def _chain_item_report(
+    item_id: str, status: str, error: str | None, result: dict | None
+) -> dict:
+    """One multi-chain item report with the fixed key order."""
+    return {
+        CHECKPOINT_ITEM_ERROR: error,
+        ID: item_id,
+        VERDICT_ITEM_RESULT: result,
+        STATUS: status,
+    }
+
+
+def _chain_fork_edges(
+    validated_items: list[dict], results: list[dict | None]
+) -> dict[tuple[str, str], set[str]]:
+    """Map each forking ``(receiptDigest, upstream)`` edge to audiences.
+
+    Only chains that verified successfully participate, grouped by the
+    base receipt digest; delegation paths under different base receipts
+    are never compared.  Chains are walked with the actual hop bytes:
+    the edge leaving one node carries that hop's audience and the next
+    node is the SHA-256 of the hop bytes -- exactly the digest the
+    following hop's ``upstream`` binds.  A given upstream digest
+    pointing at two or more distinct next-hop audiences within one
+    base-receipt group is a fork; a mere prefix extension -- the same
+    path growing longer -- adds no audience and is not a fork.
+    """
+    groups: dict[str, dict[str, set[str]]] = {}
+    for item, result in zip(validated_items, results):
+        if result is None:
+            continue
+        receipt_digest = result[DELEGATION_RECEIPT_DIGEST]
+        edges = groups.setdefault(receipt_digest, {})
+        node = receipt_digest
+        for position, hop_bytes in enumerate(item[CHAIN_ITEM_HOPS]):
+            audience = result[DELEGATION_HOPS][position][DELEGATION_AUDIENCE]
+            edges.setdefault(node, set()).add(audience)
+            node = hashlib.sha256(hop_bytes).hexdigest()
+    fork_edges: dict[tuple[str, str], set[str]] = {}
+    for receipt_digest, receipt_edges in groups.items():
+        for upstream, audiences in receipt_edges.items():
+            if len(audiences) > 1:
+                fork_edges[(receipt_digest, upstream)] = audiences
+    return fork_edges
+
+
+def verify_batch_receipt_chains(
+    items: list, policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify a batch of receipt delegation chains and spot delegation forks.
+
+    ``items`` is a non-empty list; each item is a dict with exactly the
+    keys ``id`` (a non-empty str, unique across the batch), ``receipt``
+    (the base receipt bytes), ``hops`` (a non-empty list of delegation
+    hop bytes) and ``target`` (the expected receiving domain).
+    ``policy``, ``keyring`` and ``moment`` keep their
+    :func:`verify_batch_receipt_chain` meaning.  No file is read or
+    written and no argument is modified.
+
+    The whole batch structure, policy, keyring and moment are validated
+    before any chain is verified: container, element or field type
+    faults raise :class:`TypeError` (a :class:`bool` never poses as an
+    int) and an empty list, an empty or duplicate id, a wrong item key
+    set or an empty hops list raises :class:`ValueError` (policy,
+    keyring and moment keep their single-chain classification).  Only
+    these batch-level faults raise.
+
+    Each item is then verified independently, in strict input order,
+    through the exact :func:`verify_batch_receipt_chain` rules: one
+    chain's failure never stops a later chain or alters an earlier
+    report.  A base-receipt fault is ``invalid-receipt``, a delegation
+    encoding, key-set, version, value or chain-binding fault is
+    ``invalid-delegation`` and an unknown, revoked, not-yet-valid or
+    expired credential or a signature mismatch is ``unauthenticated``;
+    a failed item keeps a definite, non-empty copy of the exception text
+    and a null ``result``.
+
+    Successful chains are grouped by ``receiptDigest`` -- delegation
+    paths under different base receipts are never compared -- and the
+    same ``upstream`` digest pointing at two or more distinct next-hop
+    audiences is a fork (a plain prefix extension is not).  Every chain
+    passing through a forking edge is reclassified ``conflicted``: its
+    verified result is kept and its ``error`` is fixed to
+    ``"forked-delegation"``.
+
+    The top-level result is a fresh dict with the fixed key order
+    ``forks``, ``items`` and ``version`` (the integer 1).  ``forks`` is
+    sorted stably by ``receiptDigest`` then ``upstream``; each fork
+    carries exactly ``receiptDigest``, ``upstream``, ``audiences``
+    (ascending) and ``ids`` (the ascending ids of the chains passing
+    through the edge).  Each item report strictly preserves input order
+    and carries, in this key order, ``error``, ``id``, ``result`` (a
+    fresh copy of the single-chain result when the chain verified,
+    otherwise null) and ``status``.
+    """
+    validated_items = _validated_chain_items(items)
+    _validated_adjudication_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+
+    reports: list[dict] = []
+    results: list[dict | None] = []
+    for item in validated_items:
+        item_id = item[ID]
+        receipt = item[CHAIN_ITEM_RECEIPT]
+        hops = item[CHAIN_ITEM_HOPS]
+        target = item[DELEGATION_TARGET]
+        try:
+            receipt_payload = verify_batch_receipt(
+                receipt, policy, keyring, moment
+            )
+        except AuthenticationError as exc:
+            reports.append(
+                _chain_item_report(
+                    item_id, CHAINS_UNAUTHENTICATED, str(exc), None
+                )
+            )
+            results.append(None)
+            continue
+        except (InvalidBatchReceiptError, TypeError) as exc:
+            # A TypeError here can only come from a wrong JSON field
+            # type *inside* the receipt bytes; the argument types were
+            # all validated before the batch ran.
+            reports.append(
+                _chain_item_report(
+                    item_id, CHAINS_INVALID_RECEIPT, str(exc), None
+                )
+            )
+            results.append(None)
+            continue
+
+        result: dict | None = None
+        try:
+            hop_payloads, domains = _walk_delegation_chain(
+                receipt, receipt_payload, hops, validated_keyring, moment
+            )
+            if domains[-1] != target:
+                raise _delegation_invalid(
+                    f"hop {len(hops) - 1} audience must equal the "
+                    "expected target"
+                )
+        except AuthenticationError as exc:
+            reports.append(
+                _chain_item_report(
+                    item_id, CHAINS_UNAUTHENTICATED, str(exc), None
+                )
+            )
+            results.append(None)
+            continue
+        except (InvalidReceiptDelegationError, TypeError) as exc:
+            # As above, an internal TypeError is a malformed hop field.
+            reports.append(
+                _chain_item_report(
+                    item_id, CHAINS_INVALID_DELEGATION, str(exc), None
+                )
+            )
+            results.append(None)
+            continue
+        else:
+            result = {
+                DELEGATION_HOPS: copy.deepcopy(hop_payloads),
+                RECEIPT: receipt_payload,
+                DELEGATION_RECEIPT_DIGEST: hashlib.sha256(receipt).hexdigest(),
+                DELEGATION_TARGET: target,
+                VERSION: RECEIPT_DELEGATION_VERSION,
+            }
+        reports.append(
+            _chain_item_report(item_id, CHAINS_VERIFIED, None, result)
+        )
+        results.append(result)
+
+    fork_edges = _chain_fork_edges(validated_items, results)
+    edge_ids: dict[tuple[str, str], list[str]] = {
+        edge: [] for edge in fork_edges
+    }
+    if fork_edges:
+        # Record the chains crossing each forking edge and reclassify
+        # those chains in one walk over the actual hop bytes.
+        for item, report, result in zip(validated_items, reports, results):
+            if result is None:
+                continue
+            receipt_digest = result[DELEGATION_RECEIPT_DIGEST]
+            node = receipt_digest
+            crosses_fork = False
+            for hop_bytes in item[CHAIN_ITEM_HOPS]:
+                edge = (receipt_digest, node)
+                if edge in fork_edges:
+                    edge_ids[edge].append(item[ID])
+                    crosses_fork = True
+                node = hashlib.sha256(hop_bytes).hexdigest()
+            if crosses_fork:
+                report[STATUS] = CHAINS_CONFLICTED
+                report[CHECKPOINT_ITEM_ERROR] = _CHAIN_ITEM_ERROR
+
+    forks = [
+        {
+            DELEGATION_RECEIPT_DIGEST: receipt_digest,
+            DELEGATION_UPSTREAM: upstream,
+            _FORK_AUDIENCES: sorted(fork_edges[(receipt_digest, upstream)]),
+            _FORK_IDS: sorted(edge_ids[(receipt_digest, upstream)]),
+        }
+        for receipt_digest, upstream in sorted(fork_edges)
+    ]
+    return {
+        CHAINS_FORKS: forks,
+        ITEMS: reports,
+        VERSION: RECEIPT_CHAINS_VERSION,
     }
