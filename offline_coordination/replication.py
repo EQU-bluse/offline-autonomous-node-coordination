@@ -391,21 +391,26 @@ or any other trailing byte, carrying exactly ``payload`` and
 ``keyVersion`` and ``result`` with no extra fields; ``result`` follows
 the public single-item :func:`verify_recovery_checkpoints` report
 shape (``boundary``, ``digest``, ``error``, ``id``, ``issuer``,
-``keyVersion``, ``status``), and only a ``verified`` result may count.
-The policy binds the authorized ``batch``, a positive ``threshold`` no
-greater than the number of its sites and, per non-empty site, the
-non-empty set of positive key versions that site may use; the keyring
-and moment keep their existing structure, validity and revocation
-rules.  The signature is the lowercase hex HMAC-SHA256 of the
-canonical compact payload bytes under the key selected by the exact
-site and version with no fallback.  A wrong batch or unauthorized
-site/version, unavailable, revoked, not-yet-valid or expired
-credentials, a bad signature and a non-verified result each reject the
-packet with a fixed reason and never count; a single packet with
-illegal encoding, key sets or fields is rejected on its own as
-``invalid-attestation`` and never blocks the other packets.  For one
-site an identical valid packet (same digest and boundary) counts once
-and further copies are ``duplicate``, while differing valid results
+``keyVersion``, ``status``), so every legal verification result is
+accepted -- a failed item may carry no identity (``issuer`` and
+``keyVersion`` both null) and no boundary -- and only a ``verified``
+result may count.  The policy binds the authorized ``batch``, a
+positive ``threshold`` no greater than the number of its sites and,
+per non-empty site, the non-empty set of positive key versions that
+site may use; the keyring and moment keep their existing structure,
+validity and revocation rules.  The signature is the lowercase hex
+HMAC-SHA256 of the canonical compact payload bytes under the key
+selected by the exact site and version with no fallback.  A wrong
+batch or unauthorized site/version, unavailable, revoked,
+not-yet-valid or expired credentials, a bad signature and a
+non-verified result each reject the packet with a fixed reason and
+never count -- an authenticated non-``verified`` result is uniformly
+``not-verified`` and keeps its identity, digest, boundary and status
+-- and a single packet with illegal encoding, key sets or fields is
+rejected on its own as ``invalid-attestation`` and never blocks the
+other packets.  For one site an identical valid packet (the complete
+authenticated result identical in every field) counts once and
+further copies are ``duplicate``, while any differing valid results
 are a self-``contradiction``; valid packets from different sites must
 agree on both digest and boundary, since any disagreement is a fork a
 majority cannot mask.  The result is one canonical compact UTF-8 JSON
@@ -418,6 +423,43 @@ yields ``accepted``, and every other case ``insufficient``.  Every
 packet is reported -- sorted stably by site then id -- with its
 identity, conclusion, fixed reason and verified boundary, and the
 verdict is independent of input order.
+
+:func:`export_recovery_verdict` turns that verdict into a transferable
+signed proof, still touching no file.  It takes the verdict bytes, the
+adjudication ``policy``, a ``keyring``, the signing ``issuer``, the
+key ``version`` and the signing ``moment``.  The proof is one
+canonical compact UTF-8 JSON object -- recursively sorted keys,
+non-ASCII preserved, no trailing byte -- carrying exactly ``payload``
+and ``signature``.  The payload binds exactly ``batch`` (the policy
+batch), ``issuer``, ``keyVersion``, ``signedAt`` (the signing moment),
+``policyDigest`` and the complete embedded ``verdict``; the policy is
+canonicalized with its sites ordered by name and each version set an
+ascending array before the recursive key sort, and ``policyDigest`` is
+the lowercase hex SHA-256 of that compact UTF-8 encoding.  The
+signature is the lowercase hex HMAC-SHA256 of the canonical compact
+payload bytes under the key the keyring binds to the exact issuer and
+version with no fallback; unknown credentials and a revoked,
+not-yet-valid or expired key raise :class:`AuthenticationError`, and
+illegal verdict bytes raise :class:`InvalidRecoveryVerdictError` (a
+:class:`ValueError`).
+
+:func:`verify_recovery_verdict` verifies such a proof entirely offline
+from the proof, the policy, the current keyring and the verification
+moment -- it reads no file and modifies no input.  It recomputes both
+digests (the policy digest from the policy argument and the verdict
+digest from the embedded verdict), checks the batch, the threshold,
+the signing moment, the exact payload structure and the signature, and
+re-checks the current credentials, so a later revocation or expiry
+rejects the proof.  The result is a fresh dict with the fixed key
+order ``batch``, ``issuer``, ``keyVersion``, ``signedAt``,
+``policyDigest``, ``verdictDigest``, ``status``, ``digest``,
+``boundary``, ``items`` and ``version``.  Type faults raise
+:class:`TypeError` (a :class:`bool` never poses as an int); policy,
+identity, version or moment value faults raise :class:`ValueError`;
+proof structure, digest or binding faults raise
+:class:`InvalidRecoveryVerdictProofError` (a :class:`ValueError`); a
+signature mismatch or unusable current credentials raise
+:class:`AuthenticationError`.
 """
 
 from __future__ import annotations
@@ -427,7 +469,7 @@ import hmac
 import json
 import os
 import re
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 from offline_coordination import audit, merge, storage
 
@@ -5352,7 +5394,11 @@ def _validated_embedded_result(result: object) -> dict:
     :func:`verify_recovery_checkpoints` item shape: ``boundary``,
     ``digest``, ``error``, ``id``, ``issuer``, ``keyVersion`` and
     ``status``, with ``error`` null exactly when ``status`` is
-    ``verified``.  Any fault is an invalid attestation.
+    ``verified``.  Every legal verification result is accepted: a
+    failed item may carry no identity (``issuer`` and ``keyVersion``
+    both null, as reported when its checkpoint does not parse) and no
+    boundary, while a ``verified`` item must carry its identity and
+    boundary.  Any other fault is an invalid attestation.
     """
     if not isinstance(result, dict):
         raise _adjudication_invalid("result must be an object")
@@ -5369,13 +5415,22 @@ def _validated_embedded_result(result: object) -> dict:
             "result digest must be 64 lowercase hex characters"
         )
     issuer = result[CP_ISSUER]
-    if not isinstance(issuer, str) or issuer == "":
-        raise _adjudication_invalid("result issuer must be a non-empty str")
+    if issuer is not None and (not isinstance(issuer, str) or issuer == ""):
+        raise _adjudication_invalid(
+            "result issuer must be null or a non-empty str"
+        )
     key_version = result[CP_KEY_VERSION]
-    if isinstance(key_version, bool) or not isinstance(key_version, int):
-        raise _adjudication_invalid("result keyVersion must be an int")
-    if key_version <= 0:
-        raise _adjudication_invalid("result keyVersion must be positive")
+    if key_version is not None:
+        if isinstance(key_version, bool) or not isinstance(key_version, int):
+            raise _adjudication_invalid(
+                "result keyVersion must be null or an int"
+            )
+        if key_version <= 0:
+            raise _adjudication_invalid("result keyVersion must be positive")
+    if (issuer is None) != (key_version is None):
+        raise _adjudication_invalid(
+            "result issuer and keyVersion must both be null or both be set"
+        )
     status = result[STATUS]
     if not isinstance(status, str) or status not in _ADJ_RESULT_STATUSES:
         raise _adjudication_invalid("result status is not a known status")
@@ -5384,6 +5439,10 @@ def _validated_embedded_result(result: object) -> dict:
         if error is not None:
             raise _adjudication_invalid(
                 "result error must be null when status is verified"
+            )
+        if issuer is None:
+            raise _adjudication_invalid(
+                "a verified result must carry its issuer and keyVersion"
             )
     elif not isinstance(error, str) or error == "":
         raise _adjudication_invalid(
@@ -5404,6 +5463,10 @@ def _validated_embedded_result(result: object) -> dict:
             raise _adjudication_invalid(
                 "boundary tail must be 64 lowercase hex characters"
             )
+    if status == _VERIFY_VERIFIED and boundary is None:
+        raise _adjudication_invalid(
+            "a verified result must carry its boundary"
+        )
     return {
         CHECKPOINT_ITEM_BOUNDARY: (
             None
@@ -5616,13 +5679,13 @@ def _adjudicate_one(
     policy: dict,
     keyring: dict[str, list[dict]],
     moment: int,
-) -> tuple[dict, tuple[str, str, dict] | None]:
+) -> tuple[dict, tuple[str, str, dict, dict] | None]:
     """Adjudicate one packet in isolation.
 
     Returns ``(report, vote)`` where ``vote`` is
-    ``(site, digest, boundary)`` for a packet that counts and ``None``
-    otherwise.  A malformed packet is rejected on its own and never
-    affects the other packets.
+    ``(site, digest, boundary, result)`` for a packet that counts and
+    ``None`` otherwise.  A malformed packet is rejected on its own and
+    never affects the other packets.
     """
     item_id = item[ID]
     attestation = item[ADJ_ATTESTATION]
@@ -5693,7 +5756,7 @@ def _adjudicate_one(
         item_id, site, key_version, digest, boundary, status,
         ADJ_CONCLUSION_VALID, None,
     )
-    return report, (site, digest, boundary)
+    return report, (site, digest, boundary, result)
 
 
 def adjudicate_recovery(
@@ -5710,10 +5773,12 @@ def adjudicate_recovery(
     exactly ``batch``, ``site``, ``keyVersion`` and ``result`` with no
     extra fields; ``result`` follows the public single-item
     :func:`verify_recovery_checkpoints` shape (``boundary``, ``digest``,
-    ``error``, ``id``, ``issuer``, ``keyVersion``, ``status``).  The
-    signature is the lowercase hex HMAC-SHA256 of the canonical compact
-    payload bytes under the key the keyring binds to the exact site and
-    version, with no fallback.
+    ``error``, ``id``, ``issuer``, ``keyVersion``, ``status``), so every
+    legal verification result is accepted -- a failed item may carry no
+    identity (``issuer`` and ``keyVersion`` both null) and no boundary.
+    The signature is the lowercase hex HMAC-SHA256 of the canonical
+    compact payload bytes under the key the keyring binds to the exact
+    site and version, with no fallback.
 
     ``policy`` is a dict with exactly ``batch`` (the authorized batch
     id), ``threshold`` (a positive integer no greater than the number
@@ -5736,13 +5801,15 @@ def adjudicate_recovery(
     ``unauthorized-batch``, ``unauthorized-site``,
     ``unauthorized-version``, ``credential-unavailable``, ``revoked``,
     ``not-yet-valid``, ``expired``, ``bad-signature`` and
-    ``not-verified`` each reject (and never count) their packet.  For
-    one site the same valid packet -- equal digest and boundary --
-    counts once; later identical packets are ``duplicate``, while a
-    different valid result from the same site is a
-    ``contradiction``.  Valid packets from different sites must agree on
-    both digest and boundary: any disagreement is a cross-site conflict
-    that no majority can outvote.
+    ``not-verified`` each reject (and never count) their packet; an
+    authenticated non-``verified`` result is uniformly ``not-verified``
+    and keeps its identity, digest, boundary and status in the report.
+    For one site the same valid packet -- the complete authenticated
+    result identical in every field -- counts once; later identical
+    packets are ``duplicate``, while any differing valid result from
+    the same site is a ``contradiction``.  Valid packets from different
+    sites must agree on both digest and boundary: any disagreement is a
+    cross-site conflict that no majority can outvote.
 
     The returned bytes are one canonical compact UTF-8 JSON object with
     recursively sorted keys, non-ASCII preserved and no trailing byte,
@@ -5776,12 +5843,13 @@ def adjudicate_recovery(
         )
         reports.append(report)
         if vote is not None:
-            site, digest, boundary = vote
+            site, digest, boundary, result = vote
             accepted.append(
                 {
                     "site": site,
                     "digest": digest,
                     "boundary": boundary,
+                    ADJ_RESULT: result,
                     ID: report[ID],
                     "report": report,
                 }
@@ -5789,10 +5857,10 @@ def adjudicate_recovery(
 
     # Per-site accounting is derived from the authenticated, verified
     # packets keyed by their unique ids, never from input order: for one
-    # site a single agreed content counts once (the smallest-id packet
-    # is the vote, every repeat a duplicate), while two different
-    # contents are a self-contradiction whose representatives each
-    # contradict and whose repeats stay duplicates.
+    # site a single complete result -- identical in every field -- counts
+    # once (the smallest-id packet is the vote, every repeat a duplicate),
+    # while two differing results are a self-contradiction whose
+    # representatives each contradict and whose repeats stay duplicates.
     by_site: dict[str, list[dict]] = {}
     for packet in accepted:
         by_site.setdefault(packet["site"], []).append(packet)
@@ -5800,12 +5868,9 @@ def adjudicate_recovery(
     votes: list[tuple[str, str, dict]] = []
     contradicted = False
     for site, packets in by_site.items():
-        groups: dict[tuple[str, str], list[dict]] = {}
+        groups: dict[bytes, list[dict]] = {}
         for packet in packets:
-            content = (
-                packet["digest"],
-                _checkpoint_compact(packet["boundary"]).decode("utf-8"),
-            )
+            content = _checkpoint_compact(packet[ADJ_RESULT])
             groups.setdefault(content, []).append(packet)
         ordered = sorted(
             groups.items(), key=lambda kv: min(member[ID] for member in kv[1])
@@ -5866,3 +5931,578 @@ def adjudicate_recovery(
         "digest": agreed_digest,
     }
     return _checkpoint_compact(result)
+
+
+# --- Signed recovery verdict proofs and offline verification -------------------
+
+VR_BATCH = ADJ_BATCH
+VR_ISSUER = CP_ISSUER
+VR_SIGNED_AT = "signedAt"
+VR_POLICY_DIGEST = "policyDigest"
+VR_VERDICT = "verdict"
+VR_VERDICT_DIGEST = "verdictDigest"
+
+_VERDICT_TOP_KEYS = frozenset((
+    CHECKPOINT_ITEM_BOUNDARY,
+    CP_DIGEST,
+    ITEMS,
+    STATUS,
+    ADJ_THRESHOLD,
+    VERSION,
+))
+_VERDICT_STATUSES = frozenset((
+    ADJ_STATUS_ACCEPTED,
+    ADJ_STATUS_CONFLICTED,
+    ADJ_STATUS_INSUFFICIENT,
+))
+_VERDICT_ITEM_KEYS = frozenset((
+    CHECKPOINT_ITEM_BOUNDARY,
+    ADJ_CONCLUSION,
+    CP_DIGEST,
+    ID,
+    CP_KEY_VERSION,
+    ADJ_REASON,
+    ADJ_SITE,
+    STATUS,
+))
+_VERDICT_CONCLUSIONS = frozenset((
+    ADJ_CONCLUSION_VALID,
+    ADJ_CONCLUSION_INVALID,
+    ADJ_CONCLUSION_DUPLICATE,
+    ADJ_CONCLUSION_CONTRADICTION,
+))
+_VERDICT_REASONS = frozenset((
+    REASON_DUPLICATE,
+    REASON_CONTRADICTION,
+    REASON_UNAUTHORIZED_BATCH,
+    REASON_UNAUTHORIZED_SITE,
+    REASON_UNAUTHORIZED_VERSION,
+    REASON_CREDENTIAL_UNAVAILABLE,
+    REASON_REVOKED,
+    REASON_NOT_YET_VALID,
+    REASON_EXPIRED,
+    REASON_BAD_SIGNATURE,
+    REASON_NOT_VERIFIED,
+    REASON_INVALID_ATTESTATION,
+))
+_VERDICT_PROOF_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_VERDICT_PAYLOAD_KEYS = frozenset((
+    VR_BATCH,
+    VR_ISSUER,
+    CP_KEY_VERSION,
+    VR_POLICY_DIGEST,
+    VR_SIGNED_AT,
+    VR_VERDICT,
+))
+
+
+class InvalidRecoveryVerdictError(ValueError):
+    """Recovery verdict bytes fail their format contract."""
+
+
+class InvalidRecoveryVerdictProofError(ValueError):
+    """A signed recovery verdict proof fails its structure or bindings."""
+
+
+def _verdict_invalid(message: str) -> InvalidRecoveryVerdictError:
+    return InvalidRecoveryVerdictError(f"invalid recovery verdict: {message}")
+
+
+def _verdict_proof_invalid(message: str) -> InvalidRecoveryVerdictProofError:
+    return InvalidRecoveryVerdictProofError(
+        f"invalid recovery verdict proof: {message}"
+    )
+
+
+def _reject_duplicate_verdict_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate verdict keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _verdict_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _reject_duplicate_verdict_proof_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate proof keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _verdict_proof_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _validated_verdict_boundary(
+    value: object, invalid: Callable[[str], Exception], where: str
+) -> dict | None:
+    """Require a null or ``{'lastSeq', 'tail'}`` boundary and copy it."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise TypeError(f"{where} boundary must be a dict or None")
+    if set(value.keys()) != _ADJ_BOUNDARY_KEYS:
+        raise invalid(f"{where} boundary must be null or {{'lastSeq', 'tail'}}")
+    last_seq = value[CP_LAST_SEQ]
+    if isinstance(last_seq, bool) or not isinstance(last_seq, int):
+        raise TypeError(f"{where} boundary lastSeq must be an int")
+    if last_seq < 0:
+        raise invalid(f"{where} boundary lastSeq must be >= 0")
+    tail = value[CP_TAIL]
+    if not isinstance(tail, str):
+        raise TypeError(f"{where} boundary tail must be a str")
+    if not _is_digest(tail):
+        raise invalid(f"{where} boundary tail must be 64 lowercase hex characters")
+    return {CP_LAST_SEQ: last_seq, CP_TAIL: tail}
+
+
+def _validated_verdict_item(item: object, invalid: Callable[[str], Exception], position: int) -> dict:
+    """Validate one adjudication verdict item report into a fresh dict."""
+    where = f"verdict item {position}"
+    if not isinstance(item, dict):
+        raise TypeError(f"{where} must be a dict")
+    if set(item.keys()) != _VERDICT_ITEM_KEYS:
+        raise invalid(
+            f"{where} must contain exactly the keys 'boundary', "
+            "'conclusion', 'digest', 'id', 'keyVersion', 'reason', 'site' "
+            "and 'status'"
+        )
+    item_id = item[ID]
+    if not isinstance(item_id, str):
+        raise TypeError(f"{where} id must be a str")
+    if item_id == "":
+        raise invalid(f"{where} id must be non-empty")
+    site = item[ADJ_SITE]
+    if site is not None:
+        if not isinstance(site, str):
+            raise TypeError(f"{where} site must be a str or None")
+        if site == "":
+            raise invalid(f"{where} site must be non-empty")
+    key_version = item[CP_KEY_VERSION]
+    if key_version is not None:
+        if isinstance(key_version, bool) or not isinstance(key_version, int):
+            raise TypeError(f"{where} keyVersion must be an int or None")
+        if key_version <= 0:
+            raise invalid(f"{where} keyVersion must be positive")
+    if (site is None) != (key_version is None):
+        raise invalid(
+            f"{where} site and keyVersion must both be null or both be set"
+        )
+    digest = item[CP_DIGEST]
+    if digest is not None:
+        if not isinstance(digest, str):
+            raise TypeError(f"{where} digest must be a str or None")
+        if not _is_digest(digest):
+            raise invalid(f"{where} digest must be 64 lowercase hex characters")
+    status = item[STATUS]
+    if status is not None:
+        if not isinstance(status, str):
+            raise TypeError(f"{where} status must be a str or None")
+        if status not in _ADJ_RESULT_STATUSES:
+            raise invalid(f"{where} status is not a known status")
+    conclusion = item[ADJ_CONCLUSION]
+    if not isinstance(conclusion, str):
+        raise TypeError(f"{where} conclusion must be a str")
+    if conclusion not in _VERDICT_CONCLUSIONS:
+        raise invalid(f"{where} conclusion is not a known conclusion")
+    reason = item[ADJ_REASON]
+    if reason is not None:
+        if not isinstance(reason, str):
+            raise TypeError(f"{where} reason must be a str or None")
+        if reason not in _VERDICT_REASONS:
+            raise invalid(f"{where} reason is not a known reason")
+    if conclusion == ADJ_CONCLUSION_VALID:
+        if reason is not None:
+            raise invalid(f"{where} reason must be null when valid")
+    elif reason is None:
+        raise invalid(f"{where} reason must be set when not valid")
+    boundary = _validated_verdict_boundary(
+        item[CHECKPOINT_ITEM_BOUNDARY], invalid, where
+    )
+    return {
+        CHECKPOINT_ITEM_BOUNDARY: boundary,
+        ADJ_CONCLUSION: conclusion,
+        CP_DIGEST: digest,
+        ID: item_id,
+        CP_KEY_VERSION: key_version,
+        ADJ_REASON: reason,
+        ADJ_SITE: site,
+        STATUS: status,
+    }
+
+
+def _validated_verdict_object(data: object, invalid: Callable[[str], Exception]) -> dict:
+    """Validate a decoded :func:`adjudicate_recovery` verdict into a copy.
+
+    Type faults raise :class:`TypeError` (a :class:`bool` never poses as
+    an int); every key-set, range, status or consistency fault is
+    reported through ``invalid`` so the caller picks its own error type.
+    """
+    if not isinstance(data, dict):
+        raise TypeError("verdict must be a JSON object")
+    if set(data.keys()) != _VERDICT_TOP_KEYS:
+        raise invalid(
+            "must contain exactly the keys 'boundary', 'digest', 'items', "
+            "'status', 'threshold' and 'version'"
+        )
+    version = data[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("verdict version must be an int")
+    if version != ADJUDICATE_VERSION:
+        raise invalid("version must be the integer 1")
+    status = data[STATUS]
+    if not isinstance(status, str):
+        raise TypeError("verdict status must be a str")
+    if status not in _VERDICT_STATUSES:
+        raise invalid(
+            "status must be 'accepted', 'conflicted' or 'insufficient'"
+        )
+    threshold = data[ADJ_THRESHOLD]
+    if isinstance(threshold, bool) or not isinstance(threshold, int):
+        raise TypeError("verdict threshold must be an int")
+    if threshold <= 0:
+        raise invalid("threshold must be a positive integer")
+    digest = data[CP_DIGEST]
+    if digest is not None:
+        if not isinstance(digest, str):
+            raise TypeError("verdict digest must be a str or None")
+        if not _is_digest(digest):
+            raise invalid("digest must be null or 64 lowercase hex characters")
+    boundary = _validated_verdict_boundary(
+        data[CHECKPOINT_ITEM_BOUNDARY], invalid, "verdict"
+    )
+    if status == ADJ_STATUS_ACCEPTED:
+        if digest is None or boundary is None:
+            raise invalid(
+                "an accepted verdict must carry its digest and boundary"
+            )
+    elif digest is not None or boundary is not None:
+        raise invalid(
+            "a non-accepted verdict must carry a null digest and boundary"
+        )
+    items = data[ITEMS]
+    if not isinstance(items, list):
+        raise TypeError("verdict items must be a list")
+    if not items:
+        raise invalid("items must be a non-empty list")
+    validated_items = [
+        _validated_verdict_item(item, invalid, position)
+        for position, item in enumerate(items)
+    ]
+    return {
+        CHECKPOINT_ITEM_BOUNDARY: boundary,
+        CP_DIGEST: digest,
+        ITEMS: validated_items,
+        STATUS: status,
+        ADJ_THRESHOLD: threshold,
+        VERSION: version,
+    }
+
+
+def _parse_verdict(raw: object) -> dict:
+    """Validate verdict bytes against the adjudication byte contract.
+
+    A non-bytes argument or a field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, range, status, consistency or canonical-form
+    fault raises :class:`InvalidRecoveryVerdictError`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("verdict must be bytes")
+    # The verdict carries no terminator of any kind: no trailing
+    # newline and no other byte past the closing brace.
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _verdict_invalid("must end with the closing brace, no trailing byte")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _verdict_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(text, object_pairs_hook=_reject_duplicate_verdict_keys)
+    except json.JSONDecodeError as exc:
+        raise _verdict_invalid("is not valid JSON") from exc
+    verdict = _validated_verdict_object(data, _verdict_invalid)
+    # The bytes must be the single canonical compact form with
+    # recursively sorted keys and no trailing byte whatsoever.
+    if _checkpoint_compact(verdict) != raw:
+        raise _verdict_invalid("encoding is not the canonical compact form")
+    return verdict
+
+
+def _canonical_policy(policy: dict) -> dict:
+    """The signing form of a validated adjudication policy.
+
+    Sites are ordered by name and each version set becomes an ascending
+    array; the recursive key sort of the canonical compact encoding
+    finishes the normalization.
+    """
+    return {
+        ADJ_BATCH: policy[ADJ_BATCH],
+        ADJ_SITES: {
+            site: sorted(versions)
+            for site, versions in sorted(policy[ADJ_SITES].items())
+        },
+        ADJ_THRESHOLD: policy[ADJ_THRESHOLD],
+    }
+
+
+def _policy_digest(policy: dict) -> str:
+    """The lowercase hex SHA-256 of the canonical policy encoding."""
+    return _digest(_checkpoint_compact(_canonical_policy(policy)))
+
+
+def _parse_verdict_proof(raw: object) -> tuple[dict, str]:
+    """Validate verdict proof bytes structurally into ``(payload, signature)``.
+
+    A non-bytes argument or a field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, range, shape or canonical-format fault raises
+    :class:`InvalidRecoveryVerdictProofError`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("proof must be bytes")
+    # The proof carries no terminator of any kind: no trailing newline
+    # and no other byte past the closing brace.
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _verdict_proof_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _verdict_proof_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_verdict_proof_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _verdict_proof_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("proof must be a JSON object")
+    if set(data.keys()) != _VERDICT_PROOF_TOP_KEYS:
+        raise _verdict_proof_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("proof signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
+        raise _verdict_proof_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("proof payload must be a dict")
+    if set(payload.keys()) != _VERDICT_PAYLOAD_KEYS:
+        raise _verdict_proof_invalid(
+            "payload must contain exactly the keys 'batch', 'issuer', "
+            "'keyVersion', 'policyDigest', 'signedAt' and 'verdict'"
+        )
+    batch = payload[VR_BATCH]
+    if not isinstance(batch, str):
+        raise TypeError("proof batch must be a str")
+    if batch == "":
+        raise _verdict_proof_invalid("batch must be non-empty")
+    issuer = payload[VR_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("proof issuer must be a str")
+    if issuer == "":
+        raise _verdict_proof_invalid("issuer must be non-empty")
+    key_version = payload[CP_KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("proof keyVersion must be an int")
+    if key_version <= 0:
+        raise _verdict_proof_invalid("keyVersion must be positive")
+    signed_at = payload[VR_SIGNED_AT]
+    if isinstance(signed_at, bool) or not isinstance(signed_at, int):
+        raise TypeError("proof signedAt must be an int")
+    if signed_at < 0:
+        raise _verdict_proof_invalid("signedAt must be non-negative")
+    policy_digest = payload[VR_POLICY_DIGEST]
+    if not isinstance(policy_digest, str):
+        raise TypeError("proof policyDigest must be a str")
+    if not _is_digest(policy_digest):
+        raise _verdict_proof_invalid(
+            "policyDigest must be 64 lowercase hex characters"
+        )
+    verdict = _validated_verdict_object(payload[VR_VERDICT], _verdict_proof_invalid)
+    normalized = {
+        VR_BATCH: batch,
+        VR_ISSUER: issuer,
+        CP_KEY_VERSION: key_version,
+        VR_POLICY_DIGEST: policy_digest,
+        VR_SIGNED_AT: signed_at,
+        VR_VERDICT: verdict,
+    }
+    # The bytes must be the single canonical compact form with
+    # recursively sorted keys and no trailing byte whatsoever.
+    if _checkpoint_compact({TICKET_PAYLOAD: normalized, SIGNATURE: signature}) != raw:
+        raise _verdict_proof_invalid("encoding is not the canonical compact form")
+    return normalized, signature
+
+
+def export_recovery_verdict(
+    verdict: bytes,
+    policy: dict,
+    keyring: dict,
+    issuer: str,
+    version: int,
+    moment: int,
+) -> bytes:
+    """Sign an adjudication verdict into a transferable proof.
+
+    ``verdict`` is the byte string produced by
+    :func:`adjudicate_recovery`; it is validated against the verdict
+    byte contract and embedded whole into the signed payload.
+    ``policy`` is the adjudication policy (its ``batch`` and
+    ``threshold`` bind the verdict), ``keyring`` follows the
+    :func:`apply_signed_remote` rules, ``issuer`` and ``version`` name
+    the signing credentials and ``moment`` is the signing time as a
+    non-negative integer.  No file is ever read or written and no input
+    is modified.
+
+    The proof is one canonical compact UTF-8 JSON object -- every
+    object key recursively sorted lexicographically, non-ASCII
+    preserved, no trailing newline or any other trailing byte --
+    carrying exactly ``payload`` and ``signature``.  The payload binds
+    exactly ``batch`` (the policy batch), ``issuer``, ``keyVersion``,
+    ``signedAt`` (the signing moment), ``policyDigest`` and the
+    complete ``verdict``.  ``policyDigest`` is the lowercase hex
+    SHA-256 of the canonical policy encoding: sites ordered by name,
+    each version set an ascending array, keys recursively sorted,
+    compact UTF-8.  The signature is the lowercase hex HMAC-SHA256 of
+    the canonical compact payload bytes under the key the keyring
+    binds to the exact issuer and version, with no fallback.
+
+    Type faults in the arguments raise :class:`TypeError` (a
+    :class:`bool` never poses as an int); policy, issuer, version or
+    moment value faults raise :class:`ValueError`; illegal verdict
+    bytes raise :class:`InvalidRecoveryVerdictError` (a
+    :class:`ValueError`).  Unknown credentials and a revoked,
+    not-yet-valid or expired key at ``moment`` raise
+    :class:`AuthenticationError` (a :class:`ValueError`).
+    """
+    if not isinstance(verdict, bytes):
+        raise TypeError("verdict must be bytes")
+    validated_policy = _validated_adjudication_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+
+    parsed_verdict = _parse_verdict(verdict)
+    entry = _usable_checkpoint_key(validated_keyring, issuer, version, moment)
+
+    payload = {
+        VR_BATCH: validated_policy[ADJ_BATCH],
+        VR_ISSUER: issuer,
+        CP_KEY_VERSION: version,
+        VR_POLICY_DIGEST: _policy_digest(validated_policy),
+        VR_SIGNED_AT: moment,
+        VR_VERDICT: parsed_verdict,
+    }
+    signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _checkpoint_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+def verify_recovery_verdict(
+    proof: bytes, policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify a signed recovery verdict proof entirely offline.
+
+    ``proof`` is the byte string produced by
+    :func:`export_recovery_verdict`, ``policy`` the adjudication policy
+    the proof must be bound to, ``keyring`` the current keyring and
+    ``moment`` the verification time as a non-negative integer.  No
+    file is ever read and no input is modified.
+
+    The proof is parsed against its byte contract; both digests are
+    then recomputed -- the policy digest from ``policy`` (sites ordered
+    by name, version sets as ascending arrays, keys recursively sorted,
+    compact UTF-8) and the verdict digest from the embedded verdict --
+    and every binding is checked: the payload ``batch`` must equal the
+    policy batch, the verdict ``threshold`` must equal the policy
+    threshold, ``signedAt`` must be a valid non-negative signing moment
+    and the payload structure must be exact.  The signature is the
+    lowercase hex HMAC-SHA256 of the canonical compact payload bytes
+    under the key the *current* keyring binds to the exact issuer and
+    version with no fallback, so a later revocation or expiry rejects
+    the proof.
+
+    The result is a fresh dict with the fixed key order ``batch``,
+    ``issuer``, ``keyVersion``, ``signedAt``, ``policyDigest``,
+    ``verdictDigest``, ``status``, ``digest``, ``boundary``, ``items``
+    and ``version``: the signed payload fields, the recomputed
+    lowercase hex SHA-256 of the canonical verdict encoding and the
+    embedded verdict's own outcome fields.
+
+    Type faults in the arguments raise :class:`TypeError` (a
+    :class:`bool` never poses as an int); policy or moment value
+    faults raise :class:`ValueError`; proof structure, digest or
+    binding faults raise :class:`InvalidRecoveryVerdictProofError` (a
+    :class:`ValueError`); a signature mismatch and unknown, revoked,
+    not-yet-valid or expired current credentials raise
+    :class:`AuthenticationError` (a :class:`ValueError`).
+    """
+    if not isinstance(proof, bytes):
+        raise TypeError("proof must be bytes")
+    validated_policy = _validated_adjudication_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+
+    payload, signature = _parse_verdict_proof(proof)
+    verdict = payload[VR_VERDICT]
+
+    # Recompute both digests and check every binding before the
+    # signature and the current credentials are consulted.
+    if payload[VR_POLICY_DIGEST] != _policy_digest(validated_policy):
+        raise _verdict_proof_invalid("policyDigest does not match the policy")
+    if payload[VR_BATCH] != validated_policy[ADJ_BATCH]:
+        raise _verdict_proof_invalid("batch does not match the policy batch")
+    if verdict[ADJ_THRESHOLD] != validated_policy[ADJ_THRESHOLD]:
+        raise _verdict_proof_invalid(
+            "verdict threshold does not match the policy threshold"
+        )
+
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VR_ISSUER], payload[CP_KEY_VERSION], moment
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError("verdict proof signature does not match")
+
+    return {
+        VR_BATCH: payload[VR_BATCH],
+        VR_ISSUER: payload[VR_ISSUER],
+        CP_KEY_VERSION: payload[CP_KEY_VERSION],
+        VR_SIGNED_AT: payload[VR_SIGNED_AT],
+        VR_POLICY_DIGEST: payload[VR_POLICY_DIGEST],
+        VR_VERDICT_DIGEST: _digest(_checkpoint_compact(verdict)),
+        STATUS: verdict[STATUS],
+        CP_DIGEST: verdict[CP_DIGEST],
+        CHECKPOINT_ITEM_BOUNDARY: verdict[CHECKPOINT_ITEM_BOUNDARY],
+        ITEMS: verdict[ITEMS],
+        VERSION: verdict[VERSION],
+    }

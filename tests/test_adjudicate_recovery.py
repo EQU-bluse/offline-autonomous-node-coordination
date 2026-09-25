@@ -321,7 +321,7 @@ class AcceptedTest(unittest.TestCase):
     def test_extra_same_site_packets_are_duplicates_and_do_not_add_votes(self):
         items = [
             make_item("i1", site="a", result=verification_result(rid="r1")),
-            make_item("i2", site="a", result=verification_result(rid="r1b")),
+            make_item("i2", site="a", result=verification_result(rid="r1")),
             make_item("i3", site="b", secret=SECRET_B,
                       result=verification_result(rid="r2")),
         ]
@@ -337,10 +337,25 @@ class AcceptedTest(unittest.TestCase):
         self.assertEqual(duplicate["digest"], DIGEST)
         self.assertEqual(duplicate["boundary"], BOUNDARY)
 
+    def test_same_digest_and_boundary_but_different_result_contradicts(self):
+        # Only a complete, field-identical result is a duplicate; the
+        # same digest and boundary under a different result id is a
+        # self-contradiction.
+        items = [
+            make_item("i1", site="a", result=verification_result(rid="r1")),
+            make_item("i2", site="a", result=verification_result(rid="r1b")),
+        ]
+        data = adjudicate(items)
+        self.assertEqual(data["status"], "conflicted")
+        self.assertEqual(
+            [i["conclusion"] for i in data["items"]],
+            ["contradiction", "contradiction"],
+        )
+
     def test_one_site_below_threshold_is_insufficient(self):
         items = [
             make_item("i1", site="a", result=verification_result(rid="r1")),
-            make_item("i2", site="a", result=verification_result(rid="r2")),
+            make_item("i2", site="a", result=verification_result(rid="r1")),
         ]
         data = adjudicate(items)
         self.assertEqual(data["status"], "insufficient")
@@ -437,6 +452,39 @@ class RejectionReasonTest(unittest.TestCase):
         self.assertEqual(report["digest"], DIGEST)
         self.assertEqual(report["boundary"], BOUNDARY)
         self.assertEqual(report["status"], "invalid-page")
+
+    def test_failed_result_without_identity_or_boundary_is_not_verified(self):
+        # A checkpoint that does not parse reports no issuer, keyVersion
+        # or boundary; the packet is still a legal verification result.
+        result = verification_result(
+            status="invalid-checkpoint", error="bad checkpoint",
+            issuer=None, key_version=None, boundary=None,
+        )
+        data = adjudicate([make_item("x", result=result)])
+        report = data["items"][0]
+        self.assertEqual(report["conclusion"], "invalid")
+        self.assertEqual(report["reason"], "not-verified")
+        self.assertEqual(report["site"], "a")
+        self.assertEqual(report["keyVersion"], 1)
+        self.assertEqual(report["digest"], DIGEST)
+        self.assertIsNone(report["boundary"])
+        self.assertEqual(report["status"], "invalid-checkpoint")
+
+    def test_verified_result_requires_identity_and_boundary(self):
+        for result in (
+            verification_result(issuer=None, key_version=None),
+            verification_result(boundary=None),
+        ):
+            with self.subTest(result=result):
+                data = adjudicate([make_item("x", result=result)])
+                self.assertEqual(data["items"][0]["reason"],
+                                 "invalid-attestation")
+
+    def test_identity_must_be_both_null_or_both_set(self):
+        result = verification_result(status="invalid-page", error="bad page",
+                                     key_version=None)
+        data = adjudicate([make_item("x", result=result)])
+        self.assertEqual(data["items"][0]["reason"], "invalid-attestation")
 
 
 class InvalidPacketTest(unittest.TestCase):
@@ -571,7 +619,7 @@ class ContradictionAndConflictTest(unittest.TestCase):
     def test_duplicate_beside_a_contradiction_stays_duplicate(self):
         items = [
             make_item("i1", site="a", result=verification_result(rid="r1")),
-            make_item("i2", site="a", result=verification_result(rid="r2")),
+            make_item("i2", site="a", result=verification_result(rid="r1")),
             make_item("i3", site="a",
                       result=verification_result(rid="r3",
                                                  digest=OTHER_DIGEST,
