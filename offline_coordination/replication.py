@@ -7273,8 +7273,9 @@ def _delegation_invalid(message: str) -> InvalidReceiptDelegationError:
 def _parse_receipt_delegation(raw: object, index: int) -> tuple[dict, str]:
     """Validate one hop's proof bytes into ``(payload, signature)``.
 
-    A non-bytes hop raises :class:`TypeError`; every encoding, key-set,
-    version, digest or canonical-form fault raises
+    A non-bytes hop or a public field of the wrong JSON type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, value or canonical-form fault raises
     :class:`InvalidReceiptDelegationError` naming the hop.  The chain
     bindings, credentials and signature are checked by the chain walker.
     """
@@ -7306,55 +7307,62 @@ def _parse_receipt_delegation(raw: object, index: int) -> tuple[dict, str]:
         raise _delegation_invalid(f"{where} is not valid JSON") from exc
 
     if not isinstance(data, dict):
-        raise _delegation_invalid(f"{where} must be a JSON object")
+        raise TypeError(f"{where} must be a JSON object")
     if set(data.keys()) != _DELEGATION_TOP_KEYS:
         raise _delegation_invalid(
             f"{where} must contain exactly the keys 'payload' and 'signature'"
         )
     signature = data[SIGNATURE]
-    if not isinstance(signature, str) or _HEX64.fullmatch(signature) is None:
+    if not isinstance(signature, str):
+        raise TypeError(f"{where} signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
         raise _delegation_invalid(
             f"{where} signature must be 64 lowercase hex characters"
         )
     payload = data[TICKET_PAYLOAD]
     if not isinstance(payload, dict):
-        raise _delegation_invalid(f"{where} payload must be an object")
+        raise TypeError(f"{where} payload must be an object")
     if set(payload.keys()) != _DELEGATION_PAYLOAD_KEYS:
         raise _delegation_invalid(
             f"{where} payload must contain exactly the keys 'issuer', "
             "'keyVersion', 'moment', 'audience', 'upstream' and 'version'"
         )
     issuer = payload[VD_ISSUER]
-    if not isinstance(issuer, str) or issuer == "":
-        raise _delegation_invalid(
-            f"{where} payload issuer must be a non-empty str"
-        )
+    if not isinstance(issuer, str):
+        raise TypeError(f"{where} payload issuer must be a str")
+    if issuer == "":
+        raise _delegation_invalid(f"{where} payload issuer must be non-empty")
     key_version = payload[KEY_VERSION]
     if isinstance(key_version, bool) or not isinstance(key_version, int):
-        raise _delegation_invalid(f"{where} payload keyVersion must be an int")
+        raise TypeError(f"{where} payload keyVersion must be an int")
     if key_version <= 0:
         raise _delegation_invalid(
             f"{where} payload keyVersion must be positive"
         )
     hop_moment = payload[CP_MOMENT]
     if isinstance(hop_moment, bool) or not isinstance(hop_moment, int):
-        raise _delegation_invalid(f"{where} payload moment must be an int")
+        raise TypeError(f"{where} payload moment must be an int")
     if hop_moment < 0:
         raise _delegation_invalid(
             f"{where} payload moment must be non-negative"
         )
     audience = payload[DELEGATION_AUDIENCE]
-    if not isinstance(audience, str) or audience == "":
+    if not isinstance(audience, str):
+        raise TypeError(f"{where} payload audience must be a str")
+    if audience == "":
         raise _delegation_invalid(
-            f"{where} payload audience must be a non-empty str"
+            f"{where} payload audience must be non-empty"
         )
-    if not _is_digest(payload[DELEGATION_UPSTREAM]):
+    upstream = payload[DELEGATION_UPSTREAM]
+    if not isinstance(upstream, str):
+        raise TypeError(f"{where} payload upstream must be a str")
+    if not _is_digest(upstream):
         raise _delegation_invalid(
             f"{where} payload upstream must be 64 lowercase hex characters"
         )
     version = payload[VERSION]
     if isinstance(version, bool) or not isinstance(version, int):
-        raise _delegation_invalid(f"{where} payload version must be an int")
+        raise TypeError(f"{where} payload version must be an int")
     if version != RECEIPT_DELEGATION_VERSION:
         raise _delegation_invalid(
             f"{where} payload version must be the integer 1"
@@ -7512,11 +7520,13 @@ def delegate_batch_receipt(
     under the key the keyring binds to the exact issuer and version,
     with no fallback.
 
-    Parameter or public field type faults raise :class:`TypeError` (a
-    :class:`bool` never poses as an int); an empty issuer or audience or
-    a non-positive version raises :class:`ValueError`; an illegal base
-    receipt raises :class:`InvalidBatchReceiptError`; an illegal
-    delegation encoding, key set, version or chain binding raises
+    Parameter or public field type faults -- including a public field of
+    the wrong JSON type inside an existing hop's proof -- raise
+    :class:`TypeError` (a :class:`bool` never poses as an int); an empty
+    issuer or audience or a non-positive version raises
+    :class:`ValueError`; an illegal base receipt raises
+    :class:`InvalidBatchReceiptError`; an illegal delegation encoding,
+    key set, version, value or chain binding raises
     :class:`InvalidReceiptDelegationError`; and unknown, revoked,
     not-yet-valid or expired credentials raise
     :class:`AuthenticationError`.
@@ -7617,15 +7627,16 @@ def verify_batch_receipt_chain(
     moment and at the verification moment, with no fallback -- and the
     last hop's audience must equal ``target``.
 
-    Parameter or public field type faults raise :class:`TypeError` (a
-    :class:`bool` never poses as an int); an empty target, an empty hop
-    sequence or a negative moment raises :class:`ValueError`; an illegal
-    base receipt raises :class:`InvalidBatchReceiptError`; an illegal
-    delegation encoding, key set, version or chain binding raises
-    :class:`InvalidReceiptDelegationError` (a :class:`ValueError`
-    subclass) with the first failing hop in the message; and unknown,
-    revoked, not-yet-valid or expired credentials or a signature
-    mismatch raise :class:`AuthenticationError`.
+    Parameter or public field type faults -- including a public field of
+    the wrong JSON type inside a hop's proof -- raise :class:`TypeError`
+    (a :class:`bool` never poses as an int); an empty target, an empty
+    hop sequence or a negative moment raises :class:`ValueError`; an
+    illegal base receipt raises :class:`InvalidBatchReceiptError`; an
+    illegal delegation encoding, key set, version, value or chain
+    binding raises :class:`InvalidReceiptDelegationError` (a
+    :class:`ValueError` subclass) with the first failing hop in the
+    message; and unknown, revoked, not-yet-valid or expired credentials
+    or a signature mismatch raise :class:`AuthenticationError`.
 
     The result is a fresh mapping with the fixed keys ``hops`` (the hop
     payloads in chain order), ``receipt`` (the base receipt payload),
@@ -7657,4 +7668,271 @@ def verify_batch_receipt_chain(
         DELEGATION_RECEIPT_DIGEST: hashlib.sha256(receipt).hexdigest(),
         DELEGATION_TARGET: target,
         VERSION: RECEIPT_DELEGATION_VERSION,
+    }
+
+
+# --- Batch verification of receipt delegation chains with fork detection -----
+
+RECEIPT_CHAINS_VERSION = 1
+
+CHAINS_FORKS = "forks"
+CHAIN_FORK_AUDIENCES = "audiences"
+CHAIN_FORK_IDS = "ids"
+
+CHAIN_STATUS_CONFLICTED = "conflicted"
+CHAIN_STATUS_INVALID_RECEIPT = "invalid-receipt"
+CHAIN_STATUS_INVALID_DELEGATION = "invalid-delegation"
+CHAIN_ERROR_FORKED = "forked-delegation"
+
+_CHAIN_BATCH_ITEM_KEYS = frozenset((
+    ID,
+    RECEIPT,
+    DELEGATION_HOPS,
+    DELEGATION_TARGET,
+))
+
+
+def _validated_chain_items(items: object) -> list[dict]:
+    """Validate the chain batch before any chain is verified.
+
+    The argument must be a non-empty list of dicts each holding exactly
+    ``id`` (a non-empty str, unique across the batch), ``receipt``
+    (bytes), ``hops`` (a non-empty list of bytes) and ``target`` (a
+    non-empty str).  Container, element and field type faults raise
+    :class:`TypeError`; an empty list, an empty or duplicate id, a wrong
+    key set, an empty target or empty hops raises :class:`ValueError`.
+    Only a fully validated batch comes back, as fresh item dicts.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _CHAIN_BATCH_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'id', 'receipt', "
+                "'hops' and 'target'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        receipt = item[RECEIPT]
+        if not isinstance(receipt, bytes):
+            raise TypeError(f"{where} receipt must be bytes")
+        hops = item[DELEGATION_HOPS]
+        if not isinstance(hops, list):
+            raise TypeError(f"{where} hops must be a list")
+        if not hops:
+            raise ValueError(f"{where} hops must be a non-empty list")
+        for index, hop in enumerate(hops):
+            if not isinstance(hop, bytes):
+                raise TypeError(f"{where} hop {index} must be bytes")
+        target = item[DELEGATION_TARGET]
+        if not isinstance(target, str):
+            raise TypeError(f"{where} target must be a str")
+        if target == "":
+            raise ValueError(f"{where} target must be non-empty")
+        validated.append({
+            ID: item_id,
+            RECEIPT: receipt,
+            DELEGATION_HOPS: list(hops),
+            DELEGATION_TARGET: target,
+        })
+    return validated
+
+
+def _chain_batch_report(
+    item_id: str, status: str, error: str | None, result: dict | None
+) -> dict:
+    """One chain batch report with the fixed key order."""
+    return {
+        CHECKPOINT_ITEM_ERROR: error,
+        ID: item_id,
+        VERDICT_ITEM_RESULT: result,
+        STATUS: status,
+    }
+
+
+def _verify_chain_item(
+    item: dict, policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify one receipt delegation chain in isolation and report it.
+
+    The chain runs through the exact :func:`verify_batch_receipt_chain`
+    rules.  An illegal base receipt makes the item ``invalid-receipt``,
+    an illegal delegation hop ``invalid-delegation`` and a credential or
+    signature failure ``unauthenticated``; a passing chain is
+    ``verified`` with the single-chain result.  A failed item keeps a
+    definite, non-empty copy of the original exception text and a null
+    ``result``.
+    """
+    item_id = item[ID]
+    try:
+        result = verify_batch_receipt_chain(
+            item[RECEIPT],
+            item[DELEGATION_HOPS],
+            policy,
+            keyring,
+            moment,
+            item[DELEGATION_TARGET],
+        )
+    except InvalidBatchReceiptError as exc:
+        return _chain_batch_report(
+            item_id, CHAIN_STATUS_INVALID_RECEIPT, str(exc), None
+        )
+    except InvalidReceiptDelegationError as exc:
+        return _chain_batch_report(
+            item_id, CHAIN_STATUS_INVALID_DELEGATION, str(exc), None
+        )
+    except AuthenticationError as exc:
+        return _chain_batch_report(
+            item_id, VERIFY_UNAUTHENTICATED, str(exc), None
+        )
+    except TypeError as exc:
+        # A TypeError here can only come from a wrong JSON field type
+        # *inside* a hop's proof; the public argument types were all
+        # validated before the batch ran.
+        return _chain_batch_report(
+            item_id, CHAIN_STATUS_INVALID_DELEGATION, str(exc), None
+        )
+    return _chain_batch_report(item_id, _VERIFY_VERIFIED, None, result)
+
+
+def _detect_chain_forks(
+    reports: list[dict],
+) -> tuple[list[dict], set[str]]:
+    """Find divergent delegations among the verified chains.
+
+    Only chains sharing one base receipt digest are compared.  Within
+    such a group a fork is one upstream digest whose legal next hops
+    name more than one audience; a chain that merely extends a path
+    prefix further never forks it.  Returns the fork reports -- each
+    with the fixed keys ``receiptDigest``, ``upstream``, ``audiences``
+    (ascending) and ``ids`` (ascending), sorted stably by
+    ``receiptDigest`` then ``upstream`` -- and the set of item ids whose
+    chains pass through a fork edge.
+    """
+    groups: dict[str, list[dict]] = {}
+    for report in reports:
+        if report[STATUS] != _VERIFY_VERIFIED:
+            continue
+        result = report[VERDICT_ITEM_RESULT]
+        groups.setdefault(result[DELEGATION_RECEIPT_DIGEST], []).append(
+            report
+        )
+    forks: list[dict] = []
+    conflicted_ids: set[str] = set()
+    for receipt_digest, group in groups.items():
+        edges: dict[str, dict[str, set[str]]] = {}
+        for report in group:
+            item_id = report[ID]
+            for hop in report[VERDICT_ITEM_RESULT][DELEGATION_HOPS]:
+                audiences = edges.setdefault(hop[DELEGATION_UPSTREAM], {})
+                audiences.setdefault(
+                    hop[DELEGATION_AUDIENCE], set()
+                ).add(item_id)
+        for upstream, audiences in edges.items():
+            if len(audiences) < 2:
+                continue
+            ids = sorted(
+                item_id
+                for audience_ids in audiences.values()
+                for item_id in audience_ids
+            )
+            conflicted_ids.update(ids)
+            forks.append({
+                DELEGATION_RECEIPT_DIGEST: receipt_digest,
+                DELEGATION_UPSTREAM: upstream,
+                CHAIN_FORK_AUDIENCES: sorted(audiences),
+                CHAIN_FORK_IDS: ids,
+            })
+    forks.sort(
+        key=lambda fork: (
+            fork[DELEGATION_RECEIPT_DIGEST],
+            fork[DELEGATION_UPSTREAM],
+        )
+    )
+    return forks, conflicted_ids
+
+
+def verify_batch_receipt_chains(
+    items: list, policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify a batch of receipt delegation chains and detect forks.
+
+    ``items`` is a non-empty list; each item is a dict with exactly the
+    keys ``id`` (a non-empty str, unique across the batch), ``receipt``
+    (the base receipt bytes), ``hops`` (a non-empty list of delegation
+    proof bytes) and ``target`` (a non-empty str, the expected receiving
+    domain).  ``policy``, ``keyring`` and ``moment`` keep their
+    :func:`verify_batch_receipt_chain` meaning.  No file is read or
+    written and no argument is modified.
+
+    The whole batch structure together with the shared policy, keyring
+    and moment is validated before any chain is processed: container,
+    element or field type faults raise :class:`TypeError` (a
+    :class:`bool` never poses as an int) and an empty list, an empty or
+    duplicate id, a wrong item key set, an empty target or empty hops
+    raises :class:`ValueError`.  Only these batch-level faults raise --
+    one chain's failure never stops the later chains or alters an
+    earlier report.
+
+    Each chain is then verified independently, in strict input order,
+    through the exact :func:`verify_batch_receipt_chain` rules: an
+    illegal base receipt makes the item ``invalid-receipt``, an illegal
+    delegation encoding, key set, version, value or chain binding makes
+    it ``invalid-delegation``, and unknown, revoked, not-yet-valid or
+    expired credentials or a signature mismatch make it
+    ``unauthenticated``; a failed item keeps a null ``result`` and a
+    definite, non-empty copy of the original exception text.
+
+    The verified chains are then grouped by their ``receiptDigest`` and
+    only delegation paths under the same base receipt are compared: one
+    upstream digest whose legal next hops name different audiences is a
+    fork -- a chain that merely extends a path prefix is not.  Every
+    chain passing through a fork edge is re-marked ``conflicted``,
+    keeping its ``result`` and taking the fixed error
+    ``forked-delegation``.
+
+    The result is a fresh dict with the fixed keys ``forks``, ``items``
+    and ``version`` (the integer 1).  Each fork report carries
+    ``receiptDigest``, ``upstream``, the ascending ``audiences`` and the
+    ascending ``ids`` of the chains through the fork edges; forks are
+    sorted stably by ``receiptDigest`` then ``upstream``.  Each item
+    report strictly preserves input order and carries exactly ``error``,
+    ``id``, ``result`` and ``status``, with a verified item keeping a
+    fresh copy of the single-chain result.  Repeated calls return equal
+    but independent results.
+    """
+    validated_items = _validated_chain_items(items)
+    _validated_adjudication_policy(policy)
+    _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+
+    reports = [
+        _verify_chain_item(item, policy, keyring, moment)
+        for item in validated_items
+    ]
+    forks, conflicted_ids = _detect_chain_forks(reports)
+    for report in reports:
+        if report[ID] in conflicted_ids:
+            report[STATUS] = CHAIN_STATUS_CONFLICTED
+            report[CHECKPOINT_ITEM_ERROR] = CHAIN_ERROR_FORKED
+    return {
+        CHAINS_FORKS: forks,
+        ITEMS: reports,
+        VERSION: RECEIPT_CHAINS_VERSION,
     }
