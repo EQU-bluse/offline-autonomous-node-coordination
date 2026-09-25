@@ -17052,3 +17052,1357 @@ def verify_chain_suffixes(
         ITEMS: reports,
         VERSION: SUPERSEDE_VERSION,
     }
+
+
+# --- Pruning of multi-round fork convergence archives -------------------------
+
+CHAIN_PRUNE_VERSION = 1
+
+PRUNE_PROJECT = "project"
+PRUNE_CERTIFICATE = "certificate"
+PRUNE_CHECKPOINT = "checkpoint"
+PRUNE_ROUNDS = "rounds"
+PRUNE_SOURCE = "source"
+PRUNE_TARGET = "target"
+PRUNE_DELETE = "delete"
+PRUNE_RETAIN = "retain"
+PRUNE_PLAN = "plan"
+PRUNE_HEADER = "header"
+PRUNE_PATH = "path"
+PRUNE_MOMENT = "moment"
+PRUNE_STATUS = "status"
+PRUNE_BEFORE = "beforeDigest"
+PRUNE_AFTER = "afterDigest"
+PRUNE_ERROR = "error"
+PRUNE_RECEIPT = "receipt"
+
+PRUNE_STATUS_PRUNED = "pruned"
+PRUNE_STATUS_DUPLICATE = "duplicate"
+
+PRUNE_INTENT_PHASE = "phase"
+PRUNE_INTENT_TARGET = "target"
+PRUNE_INTENT_PLAN_DIGEST = "planDigest"
+PRUNE_INTENT_CHECKPOINT_DIGEST = "checkpointDigest"
+PRUNE_INTENT_CANDIDATE = INTENT_CANDIDATE
+PRUNE_INTENT_PREDECESSOR = INTENT_PREDECESSOR
+PRUNE_INTENT_NEW_DIGEST = INTENT_NEW_DIGEST
+PRUNE_INTENT_OLD_DIGEST = INTENT_OLD_DIGEST
+
+_PRUNE_ARCHIVE_KEYS = frozenset((
+    PRUNE_CERTIFICATE,
+    PRUNE_PROJECT,
+    PRUNE_ROUNDS,
+    VERSION,
+))
+_PRUNE_PRUNED_KEYS = frozenset((
+    PRUNE_PROJECT,
+    VERSION,
+))
+_PRUNE_ROUND_KEYS = frozenset((FC_CONFIRMATION, FC_SEQ))
+_PRUNE_PLAN_PAYLOAD_KEYS = frozenset((
+    PRUNE_CHECKPOINT,
+    PRUNE_DELETE,
+    PRUNE_RETAIN,
+    PRUNE_SOURCE,
+    PRUNE_TARGET,
+    VERSION,
+))
+_PRUNE_HEADER_KEYS = frozenset((VD_ISSUER, KEY_VERSION, PRUNE_MOMENT))
+_PRUNE_RECEIPT_PAYLOAD_KEYS = frozenset((
+    PRUNE_AFTER,
+    PRUNE_BEFORE,
+    PRUNE_CHECKPOINT,
+    PRUNE_DELETE,
+    PRUNE_MOMENT,
+    PRUNE_PLAN,
+    PRUNE_RETAIN,
+    PRUNE_STATUS,
+    VERSION,
+))
+_PRUNE_ITEM_KEYS = frozenset((
+    ID, PRUNE_PATH, PRUNE_PLAN, PRUNE_CHECKPOINT, PRUNE_HEADER,
+))
+_PRUNE_INTENT_KEYS = frozenset((
+    PRUNE_INTENT_CANDIDATE,
+    PRUNE_INTENT_CHECKPOINT_DIGEST,
+    PRUNE_INTENT_NEW_DIGEST,
+    PRUNE_INTENT_OLD_DIGEST,
+    PRUNE_INTENT_PHASE,
+    PRUNE_INTENT_PLAN_DIGEST,
+    PRUNE_INTENT_PREDECESSOR,
+    PRUNE_INTENT_TARGET,
+    VERSION,
+))
+
+_PRUNE_HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+class InvalidPruneError(ValueError):
+    """A chain prune archive, plan, receipt or intent breaks its contract."""
+
+
+class StalePruneError(ValueError):
+    """A prune target no longer matches the digest the plan was built from."""
+
+
+def _prune_invalid(message: str) -> InvalidPruneError:
+    return InvalidPruneError(f"invalid chain prune: {message}")
+
+
+def _prune_stale(message: str) -> StalePruneError:
+    return StalePruneError(f"stale chain prune: {message}")
+
+
+def _prune_reject_duplicate_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate prune object keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _prune_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _prune_compact(obj: object, trailing_newline: bool = False) -> bytes:
+    """Canonical compact sorted-key UTF-8 JSON, optionally with one trailing LF."""
+    raw = json.dumps(
+        obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return raw + b"\n" if trailing_newline else raw
+
+
+def _prune_is_digest(value: object) -> bool:
+    return isinstance(value, str) and _PRUNE_HEX64.fullmatch(value) is not None
+
+
+def _prune_hex_field(value: object, key: str) -> bytes:
+    """Decode one archive byte field carried as non-empty lowercase hex."""
+    if not isinstance(value, str):
+        raise TypeError(f"{key} must be a hex str")
+    try:
+        return _hex_bytes(value)
+    except ValueError as exc:
+        raise _prune_invalid(
+            f"{key} must be non-empty even-length lowercase hex"
+        ) from exc
+
+
+def _prune_pruned_bytes(project: str) -> bytes:
+    """The trimmed archive installed after pruning: project marker only.
+
+    The certificate and the whole ordered round group are pruned away;
+    the project marker survives as one canonical version-1 JSON object
+    ending in exactly one newline.  The marker carries no checkpoint:
+    which checkpoint authorized the trim is a property of the signed
+    plan and receipt, not of the retained bytes.
+    """
+    return _prune_compact(
+        {
+            PRUNE_PROJECT: project,
+            VERSION: CHAIN_PRUNE_VERSION,
+        },
+        trailing_newline=True,
+    )
+
+
+def _prune_parse_archive(raw: bytes) -> dict:
+    """Validate every byte of a version-1 convergence archive.
+
+    The archive is one compact UTF-8 JSON object with recursively
+    sorted keys, non-ASCII preserved and exactly one trailing newline,
+    carrying exactly ``certificate``, ``project``, ``rounds`` and
+    ``version`` (the integer 1).  ``project`` is a non-empty str; the
+    certificate and the ordered rounds' confirmation bytes are
+    non-empty lowercase hex, and the rounds are numbered
+    consecutively from one with no gap, reordering or duplicate.  A
+    :class:`bool` never poses as an int.  A non-bytes argument raises
+    :class:`TypeError`; every encoding, key-set or field-shape fault
+    raises :class:`InvalidPruneError`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("archive must be bytes")
+    if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+        raise _prune_invalid(
+            "archive must be a single JSON object ending in one LF"
+        )
+    try:
+        text = raw[:-1].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _prune_invalid("archive is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_prune_reject_duplicate_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _prune_invalid("archive is not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise TypeError("archive must be a JSON object")
+    if set(data.keys()) != _PRUNE_ARCHIVE_KEYS:
+        raise _prune_invalid(
+            "archive must contain exactly the keys 'certificate', "
+            "'project', 'rounds' and 'version'"
+        )
+    version = data[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("archive version must be an int")
+    if version != CHAIN_PRUNE_VERSION:
+        raise _prune_invalid("archive version must be the integer 1")
+    project = data[PRUNE_PROJECT]
+    if not isinstance(project, str):
+        raise TypeError("archive project must be a str")
+    if project == "":
+        raise _prune_invalid("archive project must be non-empty")
+    certificate = _prune_hex_field(
+        data[PRUNE_CERTIFICATE], "archive certificate"
+    )
+    rounds_raw = data[PRUNE_ROUNDS]
+    if not isinstance(rounds_raw, list):
+        raise TypeError("archive rounds must be a list")
+    if not rounds_raw:
+        raise _prune_invalid("archive rounds must be non-empty")
+    rounds: list[dict] = []
+    for position, entry in enumerate(rounds_raw):
+        where = f"archive round {position}"
+        if not isinstance(entry, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(entry.keys()) != _PRUNE_ROUND_KEYS:
+            raise _prune_invalid(
+                f"{where} must contain exactly the keys 'confirmation' "
+                "and 'seq'"
+            )
+        seq = entry[FC_SEQ]
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            raise TypeError(f"{where} seq must be an int")
+        if seq != position + 1:
+            raise _prune_invalid(
+                f"{where} seq must be {position + 1}: rounds are numbered "
+                "consecutively from one with no gap, reordering or duplicate"
+            )
+        confirmation = _prune_hex_field(
+            entry[FC_CONFIRMATION], f"{where} confirmation"
+        )
+        rounds.append({FC_SEQ: seq, FC_CONFIRMATION: confirmation})
+    if _prune_compact(data, trailing_newline=True) != raw:
+        raise _prune_invalid(
+            "archive encoding is not the canonical compact form"
+        )
+    return {
+        PRUNE_PROJECT: project,
+        PRUNE_CERTIFICATE: certificate,
+        PRUNE_ROUNDS: rounds,
+    }
+
+
+def _prune_parse_pruned(raw: bytes, project: str) -> None:
+    """Validate an already-trimmed project marker archive.
+
+    The marker carries exactly ``project`` and ``version``; which
+    checkpoint authorized the trim is a property of the signed plan
+    and receipt, so the marker alone authenticates nothing.  Every
+    encoding, key-set or binding fault raises
+    :class:`InvalidPruneError`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("archive must be bytes")
+    if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+        raise _prune_invalid(
+            "pruned archive must be a JSON object ending in one LF"
+        )
+    try:
+        text = raw[:-1].decode("utf-8")
+        data = json.loads(
+            text, object_pairs_hook=_prune_reject_duplicate_keys
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _prune_invalid("pruned archive is not valid JSON") from exc
+    if not isinstance(data, dict) or set(data.keys()) != _PRUNE_PRUNED_KEYS:
+        raise _prune_invalid("pruned archive has an illegal key set")
+    version = data[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("pruned archive version must be an int")
+    if version != CHAIN_PRUNE_VERSION:
+        raise _prune_invalid("pruned archive version must be the integer 1")
+    if data[PRUNE_PROJECT] != project:
+        raise _prune_invalid("pruned archive is bound to another project")
+    if _prune_compact(data, trailing_newline=True) != raw:
+        raise _prune_invalid(
+            "pruned archive encoding is not the canonical compact form"
+        )
+
+
+def plan_chain_prune(
+    paths,
+    checkpoint,
+    decision,
+    policy,
+    keyring,
+    moment,
+):
+    """Build a read-only signed plan for pruning convergence archives.
+
+    ``paths`` is an explicit, non-empty list of distinct archive file
+    paths; each archive is a version-1 canonical JSON document carrying
+    a unique non-empty ``project``, a convergence ``certificate`` and
+    the ordered, consecutively numbered ``rounds`` whose confirmation
+    bytes the certificate seals (both the certificate and the round
+    bytes as lowercase hex).  The files are read but never modified,
+    created or deleted.
+
+    The sealing ``checkpoint`` is authenticated against the current
+    ``keyring`` (exact issuer/version, usable at ``moment``) through the
+    exact :func:`verify_chain_suffix` checkpoint rules.  An archive is
+    eligible for pruning only when its certificate digest is part of
+    the checkpoint's pruned evidence prefix and its whole round group
+    re-verifies through the exact :func:`verify_fork_convergence` rules
+    against ``decision``, ``policy`` and ``keyring`` at ``moment``.
+    Projects that are not eligible are retained.  When no archive is
+    eligible a :class:`ValueError` is raised.
+
+    The result is one canonical compact UTF-8 JSON object with
+    recursively sorted keys, non-ASCII preserved and no trailing byte,
+    carrying exactly ``payload`` and ``signature``.  The payload binds
+    exactly ``checkpoint`` (the checkpoint SHA-256), ``delete`` (the
+    eligible projects in ascending order), ``retain`` (the SHA-256 of
+    every retained archive's bytes, ascending), ``source`` and
+    ``target`` (each a map from an eligible project to the lowercase
+    hex SHA-256 of its archive bytes before pruning and of its trimmed
+    anchor-only archive after pruning), and ``version`` (the integer
+    1).  The plan signs the exact identity versions of the bytes -- it
+    carries no moment or project identifier of its own -- with the
+    exact issuer/key version the checkpoint itself names, usable at
+    ``moment`` with no fallback; equal arguments yield byte-identical
+    plans.
+
+    A container or field type fault raises :class:`TypeError` (a
+    :class:`bool` never poses as an int); an empty path list, an empty
+    or duplicate path or project, a wrong key set or an illegal version
+    raises :class:`ValueError`; a missing archive raises
+    :class:`FileNotFoundError`; an illegal archive or checkpoint
+    encoding or binding raises :class:`InvalidPruneError`; and unknown,
+    revoked, not-yet-valid or expired credentials or a wrong signature
+    raise :class:`AuthenticationError`.
+    """
+    if not isinstance(paths, list):
+        raise TypeError("paths must be a list")
+    if not paths:
+        raise ValueError("paths must be a non-empty list")
+    for position, path in enumerate(paths):
+        if not isinstance(path, str):
+            raise TypeError(f"path {position} must be a str")
+        if path == "":
+            raise ValueError(f"path {position} must be non-empty")
+    if len(set(paths)) != len(paths):
+        raise ValueError("paths must be distinct")
+    if not isinstance(checkpoint, bytes):
+        raise TypeError("checkpoint must be bytes")
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    _validated_fork_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    plan_moment = _fe_moment(moment, "moment")
+
+    # Authenticate the sealing checkpoint exactly as a suffix verifier
+    # would; the plan is signed with the checkpoint's own key.
+    try:
+        cp_payload, cp_signature = _parse_chain_checkpoint(checkpoint)
+    except InvalidCheckpointError as exc:
+        raise _prune_invalid(str(exc)) from exc
+    cp_issuer = cp_payload[VD_ISSUER]
+    cp_version = cp_payload[KEY_VERSION]
+    cp_entry = _usable_checkpoint_key(
+        validated_keyring, cp_issuer, cp_version, plan_moment
+    )
+    cp_expected = hmac.new(
+        bytes.fromhex(cp_entry[SECRET]),
+        _checkpoint_compact(cp_payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(cp_expected, cp_signature):
+        raise AuthenticationError(
+            "chain checkpoint signature does not match"
+        )
+    evidence = set(cp_payload[DS_EVIDENCE])
+
+    parsed: list[dict] = []
+    seen_projects: set[str] = set()
+    for path in paths:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+        record = _prune_parse_archive(raw)
+        project = record[PRUNE_PROJECT]
+        if project in seen_projects:
+            raise ValueError(f"duplicate archive project {project!r}")
+        seen_projects.add(project)
+        parsed.append({"path": path, "raw": raw, "record": record})
+
+    delete: list[str] = []
+    retain: list[str] = []
+    source: dict[str, str] = {}
+    target: dict[str, str] = {}
+    for entry_archive in parsed:
+        record = entry_archive["record"]
+        raw = entry_archive["raw"]
+        project = record[PRUNE_PROJECT]
+        certificate = record[PRUNE_CERTIFICATE]
+        cert_digest = hashlib.sha256(certificate).hexdigest()
+        eligible = cert_digest in evidence
+        if eligible:
+            # The whole round group must re-verify now, under the
+            # current keyring, before the archive may be trimmed.
+            rounds = record[PRUNE_ROUNDS]
+            public_rounds = [
+                {
+                    FC_SEQ: round_entry[FC_SEQ],
+                    FE_PREVIOUS: (
+                        None
+                        if position == 0
+                        else hashlib.sha256(
+                            rounds[position - 1][FC_CONFIRMATION]
+                        ).hexdigest()
+                    ),
+                    FC_CONFIRMATION: round_entry[FC_CONFIRMATION],
+                }
+                for position, round_entry in enumerate(rounds)
+            ]
+            try:
+                verify_fork_convergence(
+                    certificate, public_rounds, decision, policy, keyring,
+                    plan_moment,
+                )
+            except AuthenticationError:
+                raise
+            except (InvalidForkConvergenceError, InvalidForkExecutionError,
+                    TypeError, ValueError) as exc:
+                raise _prune_invalid(
+                    f"archive {project!r} rounds do not re-verify: {exc}"
+                ) from exc
+            trimmed = _prune_pruned_bytes(project)
+            delete.append(project)
+            source[project] = hashlib.sha256(raw).hexdigest()
+            target[project] = hashlib.sha256(trimmed).hexdigest()
+        else:
+            retain.append(hashlib.sha256(raw).hexdigest())
+
+    if not delete:
+        raise ValueError("no archive is eligible for pruning")
+
+    payload = {
+        PRUNE_CHECKPOINT: hashlib.sha256(checkpoint).hexdigest(),
+        PRUNE_DELETE: sorted(delete),
+        PRUNE_RETAIN: sorted(retain),
+        PRUNE_SOURCE: {project: source[project] for project in sorted(source)},
+        PRUNE_TARGET: {project: target[project] for project in sorted(target)},
+        VERSION: CHAIN_PRUNE_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(cp_entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+def _prune_loads_envelope(raw: object, what: str) -> object:
+    """Decode a canonical trailing-byte-free signed prune packet."""
+    if not isinstance(raw, bytes):
+        raise TypeError(f"{what} must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _prune_invalid(
+            f"{what} must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _prune_invalid(f"{what} is not valid UTF-8") from exc
+    try:
+        return json.loads(
+            text, object_pairs_hook=_prune_reject_duplicate_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _prune_invalid(f"{what} is not valid JSON") from exc
+
+
+def _prune_parse_envelope(
+    raw: object, what: str, payload_keys: frozenset
+) -> tuple[dict, str]:
+    """Parse a signed prune ``{payload, signature}`` packet structurally."""
+    data = _prune_loads_envelope(raw, what)
+    if not isinstance(data, dict):
+        raise TypeError(f"{what} must be a JSON object")
+    if set(data.keys()) != _DS_TOP_KEYS:
+        raise _prune_invalid(
+            f"{what} must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError(f"{what} signature must be a str")
+    if _PRUNE_HEX64.fullmatch(signature) is None:
+        raise _prune_invalid(
+            f"{what} signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError(f"{what} payload must be an object")
+    if set(payload.keys()) != payload_keys:
+        raise _prune_invalid(f"{what} payload has an illegal key set")
+    if _prune_compact(data) != raw:
+        raise _prune_invalid(
+            f"{what} encoding is not the canonical compact form"
+        )
+    return payload, signature
+
+
+def _prune_validated_digest_map(
+    value: object, key: str, projects: set[str]
+) -> dict:
+    """Validate a ``project -> digest`` map bound by a prune plan."""
+    if not isinstance(value, dict):
+        raise TypeError(f"plan {key} must be an object")
+    if set(value.keys()) != projects:
+        raise _prune_invalid(
+            f"plan {key} must name exactly its delete projects"
+        )
+    result: dict[str, str] = {}
+    for project, digest in value.items():
+        if not isinstance(project, str) or project == "":
+            raise _prune_invalid(f"plan {key} project must be a non-empty str")
+        if project not in projects:
+            raise _prune_invalid(
+                f"plan {key} names a project outside its delete list"
+            )
+        if not _prune_is_digest(digest):
+            raise _prune_invalid(
+                f"plan {key}.{project} must be 64 lowercase hex characters"
+            )
+        result[project] = digest
+    return result
+
+
+def _prune_parse_plan(raw: object) -> tuple[dict, str, dict]:
+    """Validate a prune plan structurally into payload, signature, envelope."""
+    if not isinstance(raw, bytes):
+        raise TypeError("plan must be bytes")
+    envelope = _prune_loads_envelope(raw, "prune plan")
+    payload, signature = _prune_parse_envelope(
+        raw, "prune plan", _PRUNE_PLAN_PAYLOAD_KEYS
+    )
+    if not _prune_is_digest(payload[PRUNE_CHECKPOINT]):
+        raise _prune_invalid(
+            "plan checkpoint must be 64 lowercase hex characters"
+        )
+    deleted = payload[PRUNE_DELETE]
+    if not isinstance(deleted, list):
+        raise TypeError("plan delete must be a list")
+    if not deleted:
+        raise _prune_invalid("plan delete must be non-empty")
+    for position, value in enumerate(deleted):
+        if not isinstance(value, str) or value == "":
+            raise TypeError(f"plan delete {position} must be a non-empty str")
+    if len(set(deleted)) != len(deleted):
+        raise _prune_invalid("plan delete entries must be unique")
+    if deleted != sorted(deleted):
+        raise _prune_invalid("plan delete entries must be ascending")
+    retained = payload[PRUNE_RETAIN]
+    if not isinstance(retained, list):
+        raise TypeError("plan retain must be a list")
+    for position, value in enumerate(retained):
+        if not _prune_is_digest(value):
+            raise _prune_invalid(
+                f"plan retain {position} must be 64 lowercase hex characters"
+            )
+    if retained != sorted(retained):
+        raise _prune_invalid("plan retain entries must be ascending")
+    projects = set(deleted)
+    _prune_validated_digest_map(payload[PRUNE_SOURCE], PRUNE_SOURCE, projects)
+    _prune_validated_digest_map(payload[PRUNE_TARGET], PRUNE_TARGET, projects)
+    version = payload[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("plan version must be an int")
+    if version != CHAIN_PRUNE_VERSION:
+        raise _prune_invalid("plan version must be the integer 1")
+    return payload, signature, envelope
+
+
+def _prune_validated_header(header: object, where: str) -> dict:
+    """Validate one per-item header policy naming signer and prune moment."""
+    if not isinstance(header, dict):
+        raise TypeError(f"{where} header must be a dict")
+    if set(header.keys()) != _PRUNE_HEADER_KEYS:
+        raise ValueError(
+            f"{where} header must contain exactly the keys 'issuer', "
+            "'keyVersion' and 'moment'"
+        )
+    issuer = header[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError(f"{where} header issuer must be a str")
+    if issuer == "":
+        raise ValueError(f"{where} header issuer must be non-empty")
+    key_version = header[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError(f"{where} header keyVersion must be an int")
+    if key_version <= 0:
+        raise ValueError(f"{where} header keyVersion must be positive")
+    moment = header[PRUNE_MOMENT]
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError(f"{where} header moment must be an int")
+    if moment < 0:
+        raise ValueError(f"{where} header moment must be non-negative")
+    return {
+        VD_ISSUER: issuer,
+        KEY_VERSION: key_version,
+        PRUNE_MOMENT: moment,
+    }
+
+
+def _prune_validated_items(items: object) -> list[dict]:
+    """Validate the prune batch before any item is executed.
+
+    Each item holds exactly a non-empty, batch-unique ``id``, a
+    non-empty archive ``path`` str, the ``plan`` bytes, the
+    ``checkpoint`` bytes and a ``header`` naming the exact signing
+    ``issuer``/``keyVersion`` (the checkpoint sealer) and the
+    non-negative prune ``moment``.  Container, element or field type
+    faults raise :class:`TypeError`; an empty list, an empty or
+    duplicate id, an empty path, a wrong key set or an illegal header
+    value raises :class:`ValueError`.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _PRUNE_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'id', 'path', "
+                "'plan', 'checkpoint' and 'header'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen.add(item_id)
+        path = item[PRUNE_PATH]
+        if not isinstance(path, str):
+            raise TypeError(f"{where} path must be a str")
+        if path == "":
+            raise ValueError(f"{where} path must be non-empty")
+        plan = item[PRUNE_PLAN]
+        if not isinstance(plan, bytes):
+            raise TypeError(f"{where} plan must be bytes")
+        checkpoint = item[PRUNE_CHECKPOINT]
+        if not isinstance(checkpoint, bytes):
+            raise TypeError(f"{where} checkpoint must be bytes")
+        header = _prune_validated_header(item[PRUNE_HEADER], where)
+        validated.append({
+            ID: item_id,
+            PRUNE_PATH: path,
+            PRUNE_PLAN: plan,
+            PRUNE_CHECKPOINT: checkpoint,
+            PRUNE_HEADER: header,
+        })
+    return validated
+
+
+def _prune_parse_receipt(raw: object) -> tuple[dict, str]:
+    """Validate a prune receipt structurally into payload and signature."""
+    if not isinstance(raw, bytes):
+        raise TypeError("receipt must be bytes")
+    payload, signature = _prune_parse_envelope(
+        raw, "prune receipt", _PRUNE_RECEIPT_PAYLOAD_KEYS
+    )
+    for key in (PRUNE_AFTER, PRUNE_BEFORE, PRUNE_CHECKPOINT):
+        if not _prune_is_digest(payload[key]):
+            raise _prune_invalid(
+                f"receipt {key} must be 64 lowercase hex characters"
+            )
+    deleted = payload[PRUNE_DELETE]
+    if not isinstance(deleted, list) or not deleted:
+        raise _prune_invalid("receipt delete must be a non-empty list")
+    for value in deleted:
+        if not isinstance(value, str) or not value:
+            raise _prune_invalid("receipt delete entries must be non-empty str")
+    retained = payload[PRUNE_RETAIN]
+    if not isinstance(retained, list):
+        raise _prune_invalid("receipt retain must be a list")
+    for value in retained:
+        if not _prune_is_digest(value):
+            raise _prune_invalid(
+                "receipt retain entries must be 64 lowercase hex characters"
+            )
+    plan = payload[PRUNE_PLAN]
+    if not isinstance(plan, dict) or set(plan.keys()) != _DS_TOP_KEYS:
+        raise _prune_invalid(
+            "receipt plan must be an object with exactly 'payload' and "
+            "'signature'"
+        )
+    bound_moment = payload[PRUNE_MOMENT]
+    if isinstance(bound_moment, bool) or not isinstance(bound_moment, int):
+        raise TypeError("receipt moment must be an int")
+    if bound_moment < 0:
+        raise _prune_invalid("receipt moment must be non-negative")
+    status = payload[PRUNE_STATUS]
+    if status not in (PRUNE_STATUS_PRUNED, PRUNE_STATUS_DUPLICATE):
+        raise _prune_invalid(
+            "receipt status must be 'pruned' or 'duplicate'"
+        )
+    version = payload[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("receipt version must be an int")
+    if version != CHAIN_PRUNE_VERSION:
+        raise _prune_invalid("receipt version must be the integer 1")
+    return payload, signature
+
+
+def _prune_intent_payload(
+    phase: str,
+    target_name: str,
+    plan_digest: str,
+    checkpoint_digest: str,
+    new_digest: str,
+    old_digest: str | None,
+    candidate_name: str,
+    predecessor_name: str | None,
+) -> bytes:
+    """Canonical prune intent bytes: compact sorted JSON, one trailing LF."""
+    intent = {
+        PRUNE_INTENT_CANDIDATE: candidate_name,
+        PRUNE_INTENT_CHECKPOINT_DIGEST: checkpoint_digest,
+        PRUNE_INTENT_NEW_DIGEST: new_digest,
+        PRUNE_INTENT_OLD_DIGEST: old_digest,
+        PRUNE_INTENT_PHASE: phase,
+        PRUNE_INTENT_PLAN_DIGEST: plan_digest,
+        PRUNE_INTENT_PREDECESSOR: predecessor_name,
+        PRUNE_INTENT_TARGET: target_name,
+        VERSION: CHAIN_PRUNE_VERSION,
+    }
+    return _prune_compact(intent, trailing_newline=True)
+
+
+def _prune_publish_intent(archive_path: str, payload: bytes) -> None:
+    """Atomically publish the intent at ``archive_path + ".prune.txn"``.
+
+    Written to a uniquely named same-directory temporary, flushed and
+    synced, renamed into place and followed by a directory sync, so a
+    crash leaves either no intent or the complete intent.
+    """
+    handle, tmp_path = _reserve_unique_file(f"{archive_path}.prune.txn.")
+    try:
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, archive_path + ".prune.txn")
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            _remove_quietly(tmp_path)
+    storage._fsync_dir(archive_path)
+
+
+def _prune_safe_base_name(name: object, key: str) -> None:
+    """Require a plain base name confined to the archive's own directory."""
+    if not isinstance(name, str) or name == "":
+        raise _prune_invalid(f"{key} must be a non-empty str")
+    if (
+        name in (".", "..")
+        or os.path.basename(name) != name
+        or os.sep in name
+        or (os.altsep is not None and os.altsep in name)
+    ):
+        raise _prune_invalid(f"{key} must be a plain base name")
+
+
+def _prune_validated_intent_name(
+    name: object, key: str, archive_base: str
+) -> None:
+    """Validate a candidate/predecessor name named by a prune intent."""
+    _prune_safe_base_name(name, key)
+    if name in (archive_base, archive_base + ".txn",
+                archive_base + ".prune.txn"):
+        raise _prune_invalid(
+            f"{key} must not name the archive or the prune intent"
+        )
+
+
+def _prune_parse_intent(raw: bytes, archive_base: str) -> dict:
+    """Validate every byte of a prune recovery intent."""
+    if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+        raise _prune_invalid(
+            "intent must be a single JSON object ending in one LF"
+        )
+    try:
+        text = raw[:-1].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _prune_invalid("intent is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_prune_reject_duplicate_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _prune_invalid("intent is not valid JSON") from exc
+    if not isinstance(data, dict) or set(data.keys()) != _PRUNE_INTENT_KEYS:
+        raise _prune_invalid("intent has an illegal key set")
+    version = data[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise _prune_invalid("intent version must be an int")
+    if version != CHAIN_PRUNE_VERSION:
+        raise _prune_invalid("intent version must be the integer 1")
+    phase = data[PRUNE_INTENT_PHASE]
+    if phase not in (PHASE_PREPARED, PHASE_INSTALLED):
+        raise _prune_invalid(
+            "intent phase must be 'prepared' or 'installed'"
+        )
+    target = data[PRUNE_INTENT_TARGET]
+    _prune_safe_base_name(target, "intent target")
+    for key in (
+        PRUNE_INTENT_PLAN_DIGEST,
+        PRUNE_INTENT_CHECKPOINT_DIGEST,
+        PRUNE_INTENT_NEW_DIGEST,
+    ):
+        if not _prune_is_digest(data[key]):
+            raise _prune_invalid(
+                f"intent {key} must be 64 lowercase hex characters"
+            )
+    old_digest = data[PRUNE_INTENT_OLD_DIGEST]
+    if old_digest is not None and not _prune_is_digest(old_digest):
+        raise _prune_invalid(
+            "intent oldDigest must be null or 64 lowercase hex characters"
+        )
+    _prune_validated_intent_name(
+        data[PRUNE_INTENT_CANDIDATE], "intent candidate", archive_base
+    )
+    predecessor = data[PRUNE_INTENT_PREDECESSOR]
+    if predecessor is not None:
+        _prune_validated_intent_name(
+            predecessor, "intent predecessor", archive_base
+        )
+    if (old_digest is None) != (predecessor is None):
+        raise _prune_invalid(
+            "intent oldDigest and predecessor must both be null or both set"
+        )
+    if _prune_compact(data, trailing_newline=True) != raw:
+        raise _prune_invalid(
+            "intent encoding is not the canonical compact form"
+        )
+    return data
+
+
+def _prune_commit(
+    archive_path: str,
+    target_bytes: bytes,
+    plan_digest: str,
+    checkpoint_digest: str,
+) -> None:
+    """Durably replace one archive with its trimmed bytes.
+
+    Follows the same two-phase boundary as :func:`_atomic_write` but
+    with the intent at ``archive_path + ".prune.txn"`` and only the
+    same-directory candidate, predecessor and intent files: the unique
+    candidate is written, flushed and file-synced, an existing
+    predecessor is hard-linked aside, the ``prepared`` intent is
+    published, the replacement and directory sync follow, the
+    ``installed`` intent is published, and the predecessor and intent
+    are removed last with a final directory sync.  Unlike the ledger
+    writer this function never rolls a failed call back itself: every
+    :class:`OSError` from writing, flushing, file or directory syncing,
+    replacing or deleting propagates unchanged with the candidate,
+    predecessor and intent retained, so :func:`recover_chain_prune`
+    can settle the exact reached phase on a retry.  Unrelated files are
+    never scanned or touched.
+    """
+    with open(archive_path, "rb") as handle:
+        original = handle.read()
+    new_digest = _digest(target_bytes)
+    old_digest = _digest(original)
+
+    tmp_handle, tmp_path = _reserve_tmp_file(archive_path)
+    with tmp_handle as handle:
+        handle.write(target_bytes)
+        handle.flush()
+        os.fsync(handle.fileno())
+    backup_path = _link_predecessor_aside(archive_path)
+
+    def intent(phase: str) -> bytes:
+        return _prune_intent_payload(
+            phase,
+            os.path.basename(archive_path),
+            plan_digest,
+            checkpoint_digest,
+            new_digest,
+            old_digest,
+            os.path.basename(tmp_path),
+            os.path.basename(backup_path),
+        )
+
+    _prune_publish_intent(archive_path, intent(PHASE_PREPARED))
+    os.replace(tmp_path, archive_path)
+    storage._fsync_dir(archive_path)
+    _prune_publish_intent(archive_path, intent(PHASE_INSTALLED))
+    # Cleanup failures are not swallowed: the installed intent and
+    # artifacts stay in place so recovery completes the transaction.
+    os.unlink(backup_path)
+    storage._fsync_dir(archive_path)
+    os.unlink(archive_path + ".prune.txn")
+    storage._fsync_dir(archive_path)
+
+
+def _prune_prepare_one(item: dict, validated_keyring: dict) -> dict:
+    """Authenticate and bind one prune item before its file is touched.
+
+    The plan is parsed structurally, bound to the item checkpoint and
+    authenticated, and the checkpoint is parsed and authenticated
+    against the exact header issuer/version (which must name the
+    checkpoint's own sealer), usable at the header moment with no
+    fallback.  Structural faults raise :class:`InvalidPruneError`;
+    credential faults raise :class:`AuthenticationError`.
+    """
+    plan_raw = item[PRUNE_PLAN]
+    checkpoint = item[PRUNE_CHECKPOINT]
+    header = item[PRUNE_HEADER]
+    issuer = header[VD_ISSUER]
+    key_version = header[KEY_VERSION]
+    moment = header[PRUNE_MOMENT]
+
+    plan_payload, plan_signature, plan_envelope = _prune_parse_plan(plan_raw)
+    checkpoint_digest = hashlib.sha256(checkpoint).hexdigest()
+    if plan_payload[PRUNE_CHECKPOINT] != checkpoint_digest:
+        raise _prune_invalid("the plan is not bound to the item checkpoint")
+    try:
+        cp_payload, cp_signature = _parse_chain_checkpoint(checkpoint)
+    except InvalidCheckpointError as exc:
+        raise _prune_invalid(str(exc)) from exc
+    if cp_payload[VD_ISSUER] != issuer or cp_payload[KEY_VERSION] != key_version:
+        raise AuthenticationError(
+            "the prune header must name the exact checkpoint sealer issuer "
+            "and key version"
+        )
+    entry = _usable_checkpoint_key(
+        validated_keyring, issuer, key_version, moment
+    )
+    secret = entry[SECRET]
+    cp_expected = hmac.new(
+        bytes.fromhex(secret),
+        _checkpoint_compact(cp_payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(cp_expected, cp_signature):
+        raise AuthenticationError(
+            "chain checkpoint signature does not match"
+        )
+    plan_expected = hmac.new(
+        bytes.fromhex(secret),
+        _prune_compact(plan_payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(plan_expected, plan_signature):
+        raise AuthenticationError("prune plan signature does not match")
+    return {
+        "plan_payload": plan_payload,
+        "plan_envelope": plan_envelope,
+        "checkpoint_digest": checkpoint_digest,
+        "plan_digest": hashlib.sha256(plan_raw).hexdigest(),
+        "secret": secret,
+    }
+
+
+def _prune_build_receipt(
+    item: dict,
+    prepared: dict,
+    project: str,
+    status: str,
+) -> bytes:
+    """Build and self-validate the canonical signed receipt for one item.
+
+    Binds the status, the complete plan envelope, the checkpoint
+    digest, the before/after archive digests, the full delete and
+    retain digests, the header moment and version 1.  It is a pure
+    function of the item and outcome, so the first completion and a
+    same-plan re-entry yield byte-identical receipts.
+    """
+    plan_payload = prepared["plan_payload"]
+    moment = item[PRUNE_HEADER][PRUNE_MOMENT]
+    if status == PRUNE_STATUS_DUPLICATE:
+        # Nothing changed: the observed before state already is the
+        # target state, so both digests bind the target bytes.
+        before_digest = after_digest = plan_payload[PRUNE_TARGET][project]
+    else:
+        before_digest = plan_payload[PRUNE_SOURCE][project]
+        after_digest = plan_payload[PRUNE_TARGET][project]
+    payload = {
+        PRUNE_AFTER: after_digest,
+        PRUNE_BEFORE: before_digest,
+        PRUNE_CHECKPOINT: prepared["checkpoint_digest"],
+        PRUNE_DELETE: list(plan_payload[PRUNE_DELETE]),
+        PRUNE_MOMENT: moment,
+        PRUNE_PLAN: prepared["plan_envelope"],
+        PRUNE_RETAIN: list(plan_payload[PRUNE_RETAIN]),
+        PRUNE_STATUS: status,
+        VERSION: CHAIN_PRUNE_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(prepared["secret"]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    receipt = _prune_compact(
+        {TICKET_PAYLOAD: payload, SIGNATURE: signature}
+    )
+    # Self-check: every receipt this module hands out must itself
+    # satisfy the receipt contract and its HMAC and bindings.
+    checked, checked_signature = _prune_parse_receipt(receipt)
+    expected = hmac.new(
+        bytes.fromhex(prepared["secret"]),
+        _prune_compact(checked),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, checked_signature):
+        raise _prune_invalid("issued receipt failed its own signature check")
+    if checked != payload:
+        raise _prune_invalid("issued receipt failed its own binding check")
+    return receipt
+
+
+def _prune_item_error(item_id: str, exc: BaseException) -> dict:
+    return {ID: item_id, PRUNE_RECEIPT: None, PRUNE_ERROR: str(exc)}
+
+
+def _prune_match_project(
+    current: bytes,
+    source_map: dict,
+    target_map: dict,
+) -> tuple[str | None, str | None]:
+    """Classify current archive bytes against one plan's project maps.
+
+    Returns ``(project, branch)`` where branch is ``pruned`` only when
+    the full archive hashes to its project's source digest,
+    ``duplicate`` when it is that project's installed project-marker
+    target, or ``(None, None)`` when the bytes fit no project.
+    """
+    current_digest = hashlib.sha256(current).hexdigest()
+    try:
+        record = _prune_parse_archive(current)
+    except InvalidPruneError:
+        record = None
+    if record is not None and record[PRUNE_PROJECT] in source_map:
+        project = record[PRUNE_PROJECT]
+        if current_digest == source_map[project]:
+            return project, PRUNE_STATUS_PRUNED
+    for candidate_project in target_map:
+        try:
+            _prune_parse_pruned(current, candidate_project)
+        except InvalidPruneError:
+            continue
+        if current_digest == target_map[candidate_project]:
+            return candidate_project, PRUNE_STATUS_DUPLICATE
+    return None, None
+
+
+def _prune_execute_one(item: dict, validated_keyring: dict) -> dict:
+    """Prepare and execute one prune item end to end, fully isolated.
+
+    Preparation (plan/checkpoint parsing, binding and credential
+    checks) and execution share one per-item boundary: an invalid
+    credential -- which raises :class:`AuthenticationError` from
+    :func:`plan_chain_prune` -- is here only recorded for this item,
+    the archive is left unchanged and the batch continues, as are
+    malformed plans and checkpoints, stale archives and filesystem
+    failures.
+
+    A same-plan transaction left in flight is settled in place: an
+    ``installed`` intent for this exact plan is completed to the same
+    ``pruned`` receipt the interrupted first call would have returned,
+    while a ``prepared`` intent is rolled back to the source bytes and
+    the trim is retried -- so first completion and same-plan re-entry
+    return one identical signed receipt.  With no intent, source bytes
+    install the target (``pruned``), target bytes return ``duplicate``
+    and anything else is :class:`StalePruneError`.
+    """
+    item_id = item[ID]
+    try:
+        prepared = _prune_prepare_one(item, validated_keyring)
+    except AuthenticationError as exc:
+        return _prune_item_error(item_id, exc)
+    except (InvalidPruneError, TypeError, ValueError) as exc:
+        return _prune_item_error(item_id, exc)
+
+    path = item[PRUNE_PATH]
+    checkpoint = item[PRUNE_CHECKPOINT]
+    plan_payload = prepared["plan_payload"]
+    source_map = plan_payload[PRUNE_SOURCE]
+    target_map = plan_payload[PRUNE_TARGET]
+
+    try:
+        intent_path = path + ".prune.txn"
+        try:
+            with open(intent_path, "rb") as handle:
+                raw_intent = handle.read()
+            intent_exists = True
+        except FileNotFoundError:
+            raw_intent = None
+            intent_exists = False
+
+        intent_project = None
+        if intent_exists:
+            archive_base = os.path.basename(path)
+            try:
+                intent = _prune_parse_intent(raw_intent, archive_base)
+            except InvalidPruneError as exc:
+                return _prune_item_error(item_id, exc)
+            if intent[PRUNE_INTENT_TARGET] != archive_base:
+                return _prune_item_error(
+                    item_id,
+                    _prune_invalid("intent target does not name its archive"),
+                )
+            if (
+                intent[PRUNE_INTENT_PLAN_DIGEST] != prepared["plan_digest"]
+                or intent[PRUNE_INTENT_CHECKPOINT_DIGEST]
+                != prepared["checkpoint_digest"]
+            ):
+                return _prune_item_error(
+                    item_id,
+                    _prune_stale(
+                        "a prune transaction for a different plan is in "
+                        "progress at this path"
+                    ),
+                )
+            intent_project = next(
+                (
+                    project
+                    for project in target_map
+                    if target_map[project]
+                    == intent[PRUNE_INTENT_NEW_DIGEST]
+                    and source_map.get(project)
+                    == intent[PRUNE_INTENT_OLD_DIGEST]
+                ),
+                None,
+            )
+            if intent_project is None:
+                return _prune_item_error(
+                    item_id,
+                    _prune_stale(
+                        "the in-flight prune intent binds different digests "
+                        "than its plan"
+                    ),
+                )
+            # Settle the in-flight transaction for this exact plan.
+            result = recover_chain_prune(path)
+            if intent[PRUNE_INTENT_PHASE] == PHASE_INSTALLED:
+                if result[STATUS] != STATUS_COMPLETED:
+                    return _prune_item_error(
+                        item_id,
+                        _prune_stale("installed prune could not be completed"),
+                    )
+                receipt = _prune_build_receipt(
+                    item, prepared, intent_project, PRUNE_STATUS_PRUNED
+                )
+                return {
+                    ID: item_id, PRUNE_RECEIPT: receipt, PRUNE_ERROR: None
+                }
+            # prepared: the source bytes are back; the trim is retried
+            # below as a fresh transaction.
+
+        try:
+            with open(path, "rb") as handle:
+                current = handle.read()
+        except FileNotFoundError as exc:
+            return _prune_item_error(
+                item_id,
+                _prune_stale(f"no archive at {path!r}: {exc}"),
+            )
+
+        project, branch = _prune_match_project(
+            current, source_map, target_map
+        )
+        if branch is None:
+            raise _prune_stale(
+                f"archive at {path!r} matches neither the source nor the "
+                "target digest of its prune plan"
+            )
+        if branch == PRUNE_STATUS_PRUNED:
+            trimmed = _prune_pruned_bytes(project)
+            if hashlib.sha256(trimmed).hexdigest() != target_map[project]:
+                raise _prune_invalid(
+                    "the plan target digest does not match the trimmed "
+                    "archive bytes"
+                )
+            _prune_commit(
+                path, trimmed, prepared["plan_digest"],
+                prepared["checkpoint_digest"],
+            )
+        receipt = _prune_build_receipt(item, prepared, project, branch)
+        return {ID: item_id, PRUNE_RECEIPT: receipt, PRUNE_ERROR: None}
+    except (InvalidPruneError, StalePruneError, OSError) as exc:
+        return _prune_item_error(item_id, exc)
+
+
+def prune_chain_archives(items, keyring):
+    """Execute signed chain prune plans in one controlled batch.
+
+    Each item holds exactly a non-empty, batch-unique ``id``, an
+    archive ``path``, the signed ``plan`` bytes from
+    :func:`plan_chain_prune`, the sealing ``checkpoint`` bytes and a
+    ``header`` naming the exact signing ``issuer``/``keyVersion`` (the
+    checkpoint sealer) and the non-negative prune ``moment``.  Only
+    the batch structure and the keyring shape are validated up front.
+
+    Each item then prepares and executes in strict input order and
+    full isolation: invalid credentials, malformed plans or
+    checkpoints, and stale or corrupt archives are recorded for that
+    item alone -- the archive is left unchanged and the batch
+    continues.  When the archive at ``path`` hashes to the plan's
+    source digest for its project, the planned trimmed target is
+    installed in one crash-safe two-phase transaction -- a unique
+    same-directory candidate, the predecessor and a ``.prune.txn``
+    intent whose only phases are ``prepared`` and ``installed``;
+    unrelated files are never scanned -- and the receipt status is
+    ``pruned``.  When the archive already hashes to the target digest
+    (and no same-plan transaction is in flight) nothing is written and
+    the status is ``duplicate``.  An :class:`OSError` raised while
+    writing, flushing, syncing a file or directory, replacing or
+    deleting is recorded for that item with its original text, with
+    the retryable transaction material in place.
+
+    The first completion and a same-plan re-entry (an interrupted
+    transaction settled through :func:`recover_chain_prune` or
+    re-entered while its intent is still present) return one identical
+    signed receipt; the receipt binds the status, the complete plan,
+    the checkpoint, the before/after digests, the delete and retain
+    digests, the moment and version 1.  Returns a fresh list of fresh
+    dicts keyed ``id``, ``receipt`` and ``error`` in input order.
+    """
+    validated_items = _prune_validated_items(items)
+    validated_keyring = _validated_keyring(keyring)
+    return [
+        _prune_execute_one(item, validated_keyring)
+        for item in validated_items
+    ]
+
+
+def recover_chain_prune(path):
+    """Settle one interrupted prune transaction at ``path``.
+
+    Mirrors :func:`recover_ledger` for the intent at
+    ``path + ".prune.txn"`` and touches only the files that intent
+    names.  With no intent the result is ``clean`` -- no artifact is
+    scanned -- and ``digest`` summarizes the current archive bytes, or
+    is ``None`` when ``path`` is missing.
+
+    A ``prepared`` intent means the replacement was never confirmed:
+    the source bytes are kept or restored byte-for-byte from the
+    retained predecessor (the path stays missing when it was missing)
+    and the referenced candidate is deleted; the status is
+    ``rolled-back``.  An ``installed`` intent means the trimmed target
+    is the durable content: the current bytes must hash to
+    ``newDigest``, the remaining referenced artifacts are removed and
+    the status is ``completed``.  The intent is deleted last and the
+    directory synced so a repeated call reports ``clean``.
+
+    Returns a fresh dict keyed ``digest`` and ``status``.  A non-str
+    ``path`` raises :class:`TypeError`; a malformed intent or one whose
+    target, fields, phase, names, digests or necessary artifacts are
+    invalid raises :class:`InvalidPruneError` without touching
+    unrelated files; an :class:`OSError` while reading, replacing,
+    deleting or syncing propagates unchanged with the intent and
+    artifacts retained for a retry.
+    """
+    if not isinstance(path, str):
+        raise TypeError("path must be a str")
+    intent_path = path + ".prune.txn"
+    try:
+        with open(intent_path, "rb") as handle:
+            raw_intent = handle.read()
+    except FileNotFoundError:
+        try:
+            with open(path, "rb") as handle:
+                current = handle.read()
+        except FileNotFoundError:
+            current = None
+        return {
+            "digest": _digest(current) if current is not None else None,
+            STATUS: STATUS_CLEAN,
+        }
+
+    archive_base = os.path.basename(path)
+    intent = _prune_parse_intent(raw_intent, archive_base)
+    if intent[PRUNE_INTENT_TARGET] != archive_base:
+        raise _prune_invalid("intent target does not name its archive")
+    phase = intent[PRUNE_INTENT_PHASE]
+    new_digest = intent[PRUNE_INTENT_NEW_DIGEST]
+    old_digest = intent[PRUNE_INTENT_OLD_DIGEST]
+    directory = os.path.dirname(os.path.abspath(path))
+    candidate_path = os.path.join(directory, intent[PRUNE_INTENT_CANDIDATE])
+    predecessor_path = (
+        os.path.join(directory, intent[PRUNE_INTENT_PREDECESSOR])
+        if intent[PRUNE_INTENT_PREDECESSOR] is not None
+        else None
+    )
+
+    try:
+        with open(path, "rb") as handle:
+            current = handle.read()
+    except FileNotFoundError:
+        current = None
+
+    restore = False
+    remove_path = False
+    if phase == PHASE_PREPARED:
+        current_digest = _digest(current) if current is not None else None
+        if old_digest is None:
+            if current is not None:
+                if current_digest != new_digest:
+                    raise _prune_invalid(
+                        "archive bytes do not match newDigest"
+                    )
+                remove_path = True
+        elif current_digest != old_digest:
+            if current_digest is not None and current_digest != new_digest:
+                raise _prune_invalid(
+                    "archive bytes match neither oldDigest nor newDigest"
+                )
+            try:
+                with open(predecessor_path, "rb") as handle:
+                    predecessor = handle.read()
+            except FileNotFoundError as exc:
+                raise _prune_invalid(
+                    "predecessor artifact is missing"
+                ) from exc
+            if _digest(predecessor) != old_digest:
+                raise _prune_invalid(
+                    "predecessor artifact does not match oldDigest"
+                )
+            restore = True
+    else:
+        if current is None:
+            raise _prune_invalid("archive is missing the installed bytes")
+        if _digest(current) != new_digest:
+            raise _prune_invalid(
+                "archive bytes do not match the installed newDigest"
+            )
+
+    if restore:
+        os.replace(predecessor_path, path)
+        predecessor_path = None
+    elif remove_path:
+        os.unlink(path)
+    for artifact in (candidate_path, predecessor_path):
+        if artifact is None:
+            continue
+        try:
+            os.unlink(artifact)
+        except FileNotFoundError:
+            pass
+    storage._fsync_dir(path)
+    os.unlink(intent_path)
+    storage._fsync_dir(path)
+
+    if phase == PHASE_PREPARED:
+        return {"digest": old_digest, STATUS: STATUS_ROLLED_BACK}
+    return {"digest": new_digest, STATUS: STATUS_COMPLETED}
