@@ -379,6 +379,45 @@ an ``error`` (``None`` exactly when the item verified).  The result
 is a fresh dict with the fixed key order ``items``, ``version``
 (the integer 1); only batch-level or keyring-level faults raise,
 never one item's verification failure.
+
+:func:`adjudicate_recovery` turns those per-site verification results
+into one offline aggregate verdict, still reading no file.  It takes a
+non-empty ``items`` list, a ``policy``, a ``keyring`` and ``moment``.
+Each item contains exactly a non-empty, batch-unique ``id`` and
+``attestation`` bytes -- one canonical compact UTF-8 JSON object with
+recursively sorted keys, non-ASCII preserved and no trailing newline
+or any other trailing byte, carrying exactly ``payload`` and
+``signature``.  The payload binds exactly ``batch``, ``site``,
+``keyVersion`` and ``result`` with no extra fields; ``result`` follows
+the public single-item :func:`verify_recovery_checkpoints` report
+shape (``boundary``, ``digest``, ``error``, ``id``, ``issuer``,
+``keyVersion``, ``status``), and only a ``verified`` result may count.
+The policy binds the authorized ``batch``, a positive ``threshold`` no
+greater than the number of its sites and, per non-empty site, the
+non-empty set of positive key versions that site may use; the keyring
+and moment keep their existing structure, validity and revocation
+rules.  The signature is the lowercase hex HMAC-SHA256 of the
+canonical compact payload bytes under the key selected by the exact
+site and version with no fallback.  A wrong batch or unauthorized
+site/version, unavailable, revoked, not-yet-valid or expired
+credentials, a bad signature and a non-verified result each reject the
+packet with a fixed reason and never count; a single packet with
+illegal encoding, key sets or fields is rejected on its own as
+``invalid-attestation`` and never blocks the other packets.  For one
+site an identical valid packet (same digest and boundary) counts once
+and further copies are ``duplicate``, while differing valid results
+are a self-``contradiction``; valid packets from different sites must
+agree on both digest and boundary, since any disagreement is a fork a
+majority cannot mask.  The result is one canonical compact UTF-8 JSON
+object (sorted keys, non-ASCII preserved, no trailing byte) with the
+top-level keys ``boundary``, ``digest``, ``items``, ``status``,
+``threshold`` and ``version`` (the integer 1): any contradiction or
+cross-site fork yields ``conflicted`` with a null digest and boundary,
+a unique agreed result from at least the threshold of distinct sites
+yields ``accepted``, and every other case ``insufficient``.  Every
+packet is reported -- sorted stably by site then id -- with its
+identity, conclusion, fixed reason and verified boundary, and the
+verdict is independent of input order.
 """
 
 from __future__ import annotations
@@ -5227,3 +5266,603 @@ def verify_recovery_checkpoints(
         ],
         VERSION: CHECKPOINTS_VERSION,
     }
+
+
+# --- Offline multi-site adjudication of recovery attestations ----------------
+
+ADJUDICATE_VERSION = 1
+
+ADJ_BATCH = "batch"
+ADJ_THRESHOLD = "threshold"
+ADJ_SITES = "sites"
+ADJ_SITE = "site"
+ADJ_RESULT = "result"
+ADJ_ATTESTATION = "attestation"
+ADJ_CONCLUSION = "conclusion"
+ADJ_REASON = "reason"
+
+ADJ_STATUS_ACCEPTED = "accepted"
+ADJ_STATUS_CONFLICTED = "conflicted"
+ADJ_STATUS_INSUFFICIENT = "insufficient"
+
+ADJ_CONCLUSION_VALID = "valid"
+ADJ_CONCLUSION_INVALID = "invalid"
+ADJ_CONCLUSION_DUPLICATE = "duplicate"
+REASON_DUPLICATE = "duplicate"
+ADJ_CONCLUSION_CONTRADICTION = "contradiction"
+REASON_CONTRADICTION = "contradiction"
+
+REASON_UNAUTHORIZED_BATCH = "unauthorized-batch"
+REASON_UNAUTHORIZED_SITE = "unauthorized-site"
+REASON_UNAUTHORIZED_VERSION = "unauthorized-version"
+REASON_CREDENTIAL_UNAVAILABLE = "credential-unavailable"
+REASON_REVOKED = "revoked"
+REASON_NOT_YET_VALID = "not-yet-valid"
+REASON_EXPIRED = "expired"
+REASON_BAD_SIGNATURE = "bad-signature"
+REASON_NOT_VERIFIED = "not-verified"
+REASON_INVALID_ATTESTATION = "invalid-attestation"
+
+_ADJ_POLICY_KEYS = frozenset((ADJ_BATCH, ADJ_THRESHOLD, ADJ_SITES))
+_ADJ_ITEM_KEYS = frozenset((ID, ADJ_ATTESTATION))
+_ADJ_ATTESTATION_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_ADJ_PAYLOAD_KEYS = frozenset((
+    ADJ_BATCH,
+    KEY_VERSION,
+    ADJ_RESULT,
+    ADJ_SITE,
+))
+_ADJ_RESULT_KEYS = frozenset((
+    CHECKPOINT_ITEM_BOUNDARY,
+    CP_DIGEST,
+    CHECKPOINT_ITEM_ERROR,
+    ID,
+    CP_ISSUER,
+    CP_KEY_VERSION,
+    STATUS,
+))
+_ADJ_RESULT_STATUSES = frozenset((
+    _VERIFY_VERIFIED,
+    VERIFY_INCOMPLETE,
+    VERIFY_INVALID_CHECKPOINT,
+    VERIFY_INVALID_PAGE,
+    VERIFY_UNAUTHENTICATED,
+))
+_ADJ_BOUNDARY_KEYS = frozenset((CP_LAST_SEQ, CP_TAIL))
+
+
+def _adjudication_invalid(message: str) -> ValueError:
+    return ValueError(f"invalid recovery attestation: {message}")
+
+
+def _reject_duplicate_adjudication_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate attestation keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _adjudication_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _validated_embedded_result(result: object) -> dict:
+    """Validate the embedded single-item batch verification result.
+
+    The result must follow the exact public
+    :func:`verify_recovery_checkpoints` item shape: ``boundary``,
+    ``digest``, ``error``, ``id``, ``issuer``, ``keyVersion`` and
+    ``status``, with ``error`` null exactly when ``status`` is
+    ``verified``.  Any fault is an invalid attestation.
+    """
+    if not isinstance(result, dict):
+        raise _adjudication_invalid("result must be an object")
+    if set(result.keys()) != _ADJ_RESULT_KEYS:
+        raise _adjudication_invalid(
+            "result must contain exactly the keys 'boundary', 'digest', "
+            "'error', 'id', 'issuer', 'keyVersion' and 'status'"
+        )
+    result_id = result[ID]
+    if not isinstance(result_id, str) or result_id == "":
+        raise _adjudication_invalid("result id must be a non-empty str")
+    if not _is_digest(result[CP_DIGEST]):
+        raise _adjudication_invalid(
+            "result digest must be 64 lowercase hex characters"
+        )
+    issuer = result[CP_ISSUER]
+    if not isinstance(issuer, str) or issuer == "":
+        raise _adjudication_invalid("result issuer must be a non-empty str")
+    key_version = result[CP_KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise _adjudication_invalid("result keyVersion must be an int")
+    if key_version <= 0:
+        raise _adjudication_invalid("result keyVersion must be positive")
+    status = result[STATUS]
+    if not isinstance(status, str) or status not in _ADJ_RESULT_STATUSES:
+        raise _adjudication_invalid("result status is not a known status")
+    error = result[CHECKPOINT_ITEM_ERROR]
+    if status == _VERIFY_VERIFIED:
+        if error is not None:
+            raise _adjudication_invalid(
+                "result error must be null when status is verified"
+            )
+    elif not isinstance(error, str) or error == "":
+        raise _adjudication_invalid(
+            "result error must be a non-empty str for a non-verified status"
+        )
+    boundary = result[CHECKPOINT_ITEM_BOUNDARY]
+    if boundary is not None:
+        if not isinstance(boundary, dict) or set(boundary.keys()) != _ADJ_BOUNDARY_KEYS:
+            raise _adjudication_invalid(
+                "result boundary must be null or {'lastSeq', 'tail'}"
+            )
+        last_seq = boundary[CP_LAST_SEQ]
+        if isinstance(last_seq, bool) or not isinstance(last_seq, int):
+            raise _adjudication_invalid("boundary lastSeq must be an int")
+        if last_seq < 0:
+            raise _adjudication_invalid("boundary lastSeq must be >= 0")
+        if not _is_digest(boundary[CP_TAIL]):
+            raise _adjudication_invalid(
+                "boundary tail must be 64 lowercase hex characters"
+            )
+    return {
+        CHECKPOINT_ITEM_BOUNDARY: (
+            None
+            if boundary is None
+            else {CP_LAST_SEQ: boundary[CP_LAST_SEQ], CP_TAIL: boundary[CP_TAIL]}
+        ),
+        CP_DIGEST: result[CP_DIGEST],
+        CHECKPOINT_ITEM_ERROR: error,
+        ID: result_id,
+        CP_ISSUER: issuer,
+        CP_KEY_VERSION: key_version,
+        STATUS: status,
+    }
+
+
+def _parse_adjudication_attestation(raw: object) -> tuple[dict, str]:
+    """Validate one attestation packet into ``(payload, signature)``.
+
+    The packet must be canonical compact UTF-8 JSON with recursively
+    sorted keys and no trailing byte, carrying exactly ``payload`` and
+    ``signature``; the payload carries exactly ``batch``,
+    ``keyVersion``, ``result`` and ``site``, with ``result`` following
+    the public single-item batch verification shape.  A non-bytes
+    argument or any encoding, key-set, field or canonical-form fault
+    raises :class:`ValueError`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("attestation must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _adjudication_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _adjudication_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_adjudication_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _adjudication_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise _adjudication_invalid("must be a JSON object")
+    if set(data.keys()) != _ADJ_ATTESTATION_TOP_KEYS:
+        raise _adjudication_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise _adjudication_invalid("signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
+        raise _adjudication_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise _adjudication_invalid("payload must be an object")
+    if set(payload.keys()) != _ADJ_PAYLOAD_KEYS:
+        raise _adjudication_invalid(
+            "payload must contain exactly the keys 'batch', 'keyVersion', "
+            "'result' and 'site'"
+        )
+    batch = payload[ADJ_BATCH]
+    if not isinstance(batch, str) or batch == "":
+        raise _adjudication_invalid("payload batch must be a non-empty str")
+    site = payload[ADJ_SITE]
+    if not isinstance(site, str) or site == "":
+        raise _adjudication_invalid("payload site must be a non-empty str")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise _adjudication_invalid("payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _adjudication_invalid("payload keyVersion must be positive")
+    _validated_embedded_result(payload[ADJ_RESULT])
+
+    if _checkpoint_compact(data) != raw:
+        raise _adjudication_invalid("encoding is not the canonical compact form")
+    return payload, signature
+
+
+def _validated_adjudication_items(items: object) -> list[dict]:
+    """Validate the adjudication item container before any packet is read.
+
+    A non-list container or a non-dict element, non-str id or non-bytes
+    attestation raises :class:`TypeError`; an empty list, an empty or
+    duplicate id or a wrong item key set raises :class:`ValueError`.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _ADJ_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'attestation' and 'id'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        attestation = item[ADJ_ATTESTATION]
+        if not isinstance(attestation, bytes):
+            raise TypeError(f"{where} attestation must be bytes")
+        validated.append({ID: item_id, ADJ_ATTESTATION: attestation})
+    return validated
+
+
+def _validated_adjudication_policy(policy: object) -> dict:
+    """Validate the adjudication policy into a fresh normalized dict.
+
+    Type faults raise :class:`TypeError` (a :class:`bool` never poses as
+    an int); key-set, batch, threshold, site or version-set faults raise
+    :class:`ValueError`.
+    """
+    if not isinstance(policy, dict):
+        raise TypeError("policy must be a dict")
+    if set(policy.keys()) != _ADJ_POLICY_KEYS:
+        raise ValueError(
+            "policy must contain exactly the keys 'batch', 'sites' and "
+            "'threshold'"
+        )
+    batch = policy[ADJ_BATCH]
+    if not isinstance(batch, str):
+        raise TypeError("policy batch must be a str")
+    if batch == "":
+        raise ValueError("policy batch must be non-empty")
+    threshold = policy[ADJ_THRESHOLD]
+    if isinstance(threshold, bool) or not isinstance(threshold, int):
+        raise TypeError("policy threshold must be an int")
+    if threshold <= 0:
+        raise ValueError("policy threshold must be a positive integer")
+    sites = policy[ADJ_SITES]
+    if not isinstance(sites, dict):
+        raise TypeError("policy sites must be a dict")
+    if not sites:
+        raise ValueError("policy sites must be non-empty")
+    allowed: dict[str, frozenset[int]] = {}
+    for site, versions in sites.items():
+        if not isinstance(site, str):
+            raise TypeError("policy site names must be str")
+        if site == "":
+            raise ValueError("policy site names must be non-empty")
+        if not isinstance(versions, set):
+            raise TypeError(
+                f"allowed versions for site {site!r} must be a set"
+            )
+        site_versions: set[int] = set()
+        for version in versions:
+            if isinstance(version, bool) or not isinstance(version, int):
+                raise TypeError(
+                    f"allowed versions for site {site!r} must be ints"
+                )
+            if version <= 0:
+                raise ValueError(
+                    f"allowed versions for site {site!r} must be positive"
+                )
+            site_versions.add(version)
+        if not site_versions:
+            raise ValueError(
+                f"site {site!r} must allow at least one key version"
+            )
+        allowed[site] = frozenset(site_versions)
+    if threshold > len(allowed):
+        raise ValueError(
+            "policy threshold must not exceed the number of policy sites"
+        )
+    return {
+        ADJ_BATCH: batch,
+        ADJ_THRESHOLD: threshold,
+        ADJ_SITES: allowed,
+    }
+
+
+def _adjudication_item_report(
+    item_id: str,
+    site: str | None,
+    key_version: int | None,
+    digest: str | None,
+    boundary: dict | None,
+    status: str | None,
+    conclusion: str,
+    reason: str | None,
+) -> dict:
+    """One per-item adjudication report with a fixed key order."""
+    return {
+        CHECKPOINT_ITEM_BOUNDARY: boundary,
+        ADJ_CONCLUSION: conclusion,
+        CP_DIGEST: digest,
+        ID: item_id,
+        CP_KEY_VERSION: key_version,
+        ADJ_REASON: reason,
+        ADJ_SITE: site,
+        STATUS: status,
+    }
+
+
+def _adjudicate_one(
+    item: dict,
+    policy: dict,
+    keyring: dict[str, list[dict]],
+    moment: int,
+) -> tuple[dict, tuple[str, str, dict] | None]:
+    """Adjudicate one packet in isolation.
+
+    Returns ``(report, vote)`` where ``vote`` is
+    ``(site, digest, boundary)`` for a packet that counts and ``None``
+    otherwise.  A malformed packet is rejected on its own and never
+    affects the other packets.
+    """
+    item_id = item[ID]
+    attestation = item[ADJ_ATTESTATION]
+    invalid = lambda reason: (
+        _adjudication_item_report(
+            item_id, None, None, None, None, None,
+            ADJ_CONCLUSION_INVALID, reason,
+        ),
+        None,
+    )
+    try:
+        payload, signature = _parse_adjudication_attestation(attestation)
+    except (TypeError, ValueError):
+        return invalid(REASON_INVALID_ATTESTATION)
+
+    site = payload[ADJ_SITE]
+    key_version = payload[KEY_VERSION]
+    result = _validated_embedded_result(payload[ADJ_RESULT])
+    digest = result[CP_DIGEST]
+    boundary = result[CHECKPOINT_ITEM_BOUNDARY]
+    status = result[STATUS]
+
+    def reject(reason: str) -> tuple[dict, None]:
+        return (
+            _adjudication_item_report(
+                item_id, site, key_version, digest, boundary, status,
+                ADJ_CONCLUSION_INVALID, reason,
+            ),
+            None,
+        )
+
+    if payload[ADJ_BATCH] != policy[ADJ_BATCH]:
+        return reject(REASON_UNAUTHORIZED_BATCH)
+    allowed_versions = policy[ADJ_SITES].get(site)
+    if allowed_versions is None:
+        return reject(REASON_UNAUTHORIZED_SITE)
+    if key_version not in allowed_versions:
+        return reject(REASON_UNAUTHORIZED_VERSION)
+
+    entry = None
+    for candidate in keyring.get(site, ()):
+        if candidate[VERSION] == key_version:
+            entry = candidate
+            break
+    if entry is None:
+        return reject(REASON_CREDENTIAL_UNAVAILABLE)
+    if entry[REVOKED]:
+        return reject(REASON_REVOKED)
+    if moment < entry[NOT_BEFORE]:
+        return reject(REASON_NOT_YET_VALID)
+    if moment > entry[NOT_AFTER]:
+        return reject(REASON_EXPIRED)
+
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        return reject(REASON_BAD_SIGNATURE)
+
+    # Only a verified single-item result may cast a vote; every other
+    # authenticated result is rejected with its fixed reason.
+    if status != _VERIFY_VERIFIED:
+        return reject(REASON_NOT_VERIFIED)
+
+    report = _adjudication_item_report(
+        item_id, site, key_version, digest, boundary, status,
+        ADJ_CONCLUSION_VALID, None,
+    )
+    return report, (site, digest, boundary)
+
+
+def adjudicate_recovery(
+    items: list, policy: dict, keyring: dict, moment: int
+) -> bytes:
+    """Adjudicate multi-site recovery attestations offline into JSON bytes.
+
+    ``items`` is a non-empty list; each item is a dict with exactly the
+    keys ``id`` (a non-empty str, unique across the batch) and
+    ``attestation`` (bytes).  The attestation is one canonical compact
+    UTF-8 JSON object -- every object key recursively sorted, non-ASCII
+    preserved, no trailing newline or any other trailing byte --
+    carrying exactly ``payload`` and ``signature``.  The payload binds
+    exactly ``batch``, ``site``, ``keyVersion`` and ``result`` with no
+    extra fields; ``result`` follows the public single-item
+    :func:`verify_recovery_checkpoints` shape (``boundary``, ``digest``,
+    ``error``, ``id``, ``issuer``, ``keyVersion``, ``status``).  The
+    signature is the lowercase hex HMAC-SHA256 of the canonical compact
+    payload bytes under the key the keyring binds to the exact site and
+    version, with no fallback.
+
+    ``policy`` is a dict with exactly ``batch`` (the authorized batch
+    id), ``threshold`` (a positive integer no greater than the number
+    of sites) and ``sites`` (a non-empty mapping of each authorized
+    non-empty site name to its non-empty set of allowed positive key
+    versions).  ``keyring`` follows the :func:`apply_signed_remote`
+    rules and ``moment`` is the current time as a non-negative integer.
+    No file is ever read and no input is modified.
+
+    The item container, policy and keyring are validated in full before
+    any attestation is examined: parameter, container or public field
+    type faults raise :class:`TypeError` (a :class:`bool` never poses as
+    an int) and an empty list, a duplicate id or an illegal threshold,
+    site or version rule raises :class:`ValueError`.  A single packet
+    with illegal encoding, key sets or fields is rejected on its own as
+    ``invalid-attestation`` and never blocks the other packets.
+
+    Packets are authenticated against the *current* keyring with exact
+    site/version selection and no fallback, so the fixed reasons
+    ``unauthorized-batch``, ``unauthorized-site``,
+    ``unauthorized-version``, ``credential-unavailable``, ``revoked``,
+    ``not-yet-valid``, ``expired``, ``bad-signature`` and
+    ``not-verified`` each reject (and never count) their packet.  For
+    one site the same valid packet -- equal digest and boundary --
+    counts once; later identical packets are ``duplicate``, while a
+    different valid result from the same site is a
+    ``contradiction``.  Valid packets from different sites must agree on
+    both digest and boundary: any disagreement is a cross-site conflict
+    that no majority can outvote.
+
+    The returned bytes are one canonical compact UTF-8 JSON object with
+    recursively sorted keys, non-ASCII preserved and no trailing byte,
+    with the top-level keys ``boundary``, ``digest``, ``items``,
+    ``status``, ``threshold`` and ``version`` (the integer 1).  Any
+    contradiction or cross-site disagreement makes ``status``
+    ``conflicted`` with ``digest`` and ``boundary`` null; otherwise the
+    one agreed digest and ``{"lastSeq", "tail"}`` boundary are reported
+    as ``accepted`` once the distinct agreeing sites reach the
+    threshold, and all other cases are ``insufficient`` with both null.
+    Every packet is kept in ``items`` -- sorted stably by site then id
+    -- carrying its ``id``, ``site``, ``keyVersion``, ``digest``,
+    ``boundary``, single-item ``status``, ``conclusion`` (``valid``,
+    ``invalid``, ``duplicate`` or ``contradiction``) and fixed
+    ``reason`` (null only for a valid packet).  The conclusion never
+    depends on input order.
+    """
+    validated_items = _validated_adjudication_items(items)
+    validated_policy = _validated_adjudication_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+
+    reports: list[dict] = []
+    accepted: list[dict] = []
+    for item in validated_items:
+        report, vote = _adjudicate_one(
+            item, validated_policy, validated_keyring, moment
+        )
+        reports.append(report)
+        if vote is not None:
+            site, digest, boundary = vote
+            accepted.append(
+                {
+                    "site": site,
+                    "digest": digest,
+                    "boundary": boundary,
+                    ID: report[ID],
+                    "report": report,
+                }
+            )
+
+    # Per-site accounting is derived from the authenticated, verified
+    # packets keyed by their unique ids, never from input order: for one
+    # site a single agreed content counts once (the smallest-id packet
+    # is the vote, every repeat a duplicate), while two different
+    # contents are a self-contradiction whose representatives each
+    # contradict and whose repeats stay duplicates.
+    by_site: dict[str, list[dict]] = {}
+    for packet in accepted:
+        by_site.setdefault(packet["site"], []).append(packet)
+
+    votes: list[tuple[str, str, dict]] = []
+    contradicted = False
+    for site, packets in by_site.items():
+        groups: dict[tuple[str, str], list[dict]] = {}
+        for packet in packets:
+            content = (
+                packet["digest"],
+                _checkpoint_compact(packet["boundary"]).decode("utf-8"),
+            )
+            groups.setdefault(content, []).append(packet)
+        ordered = sorted(
+            groups.items(), key=lambda kv: min(member[ID] for member in kv[1])
+        )
+        if len(ordered) == 1:
+            members = sorted(ordered[0][1], key=lambda member: member[ID])
+            votes.append((site, members[0]["digest"], members[0]["boundary"]))
+            extras = members[1:]
+        else:
+            contradicted = True
+            extras = []
+            for _content, members in ordered:
+                members = sorted(members, key=lambda member: member[ID])
+                members[0]["report"][ADJ_CONCLUSION] = (
+                    ADJ_CONCLUSION_CONTRADICTION
+                )
+                members[0]["report"][ADJ_REASON] = REASON_CONTRADICTION
+                extras.extend(members[1:])
+        for extra in extras:
+            extra["report"][ADJ_CONCLUSION] = ADJ_CONCLUSION_DUPLICATE
+            extra["report"][ADJ_REASON] = REASON_DUPLICATE
+
+    # Cross-site agreement: every counted vote must name the same digest
+    # and boundary, regardless of how many sites back either side.
+    contents = {(digest, _checkpoint_compact(boundary).decode("utf-8"))
+                for _site, digest, boundary in votes}
+    conflicted = contradicted or len(contents) > 1
+
+    if conflicted:
+        overall_status = ADJ_STATUS_CONFLICTED
+        agreed_digest: str | None = None
+        agreed_boundary: dict | None = None
+    elif len(contents) == 1:
+        agreeing_sites = {site for site, _digest, _boundary in votes}
+        if len(agreeing_sites) >= validated_policy[ADJ_THRESHOLD]:
+            overall_status = ADJ_STATUS_ACCEPTED
+            agreed_digest, agreed_boundary = votes[0][1], votes[0][2]
+        else:
+            overall_status = ADJ_STATUS_INSUFFICIENT
+            agreed_digest, agreed_boundary = None, None
+    else:
+        overall_status = ADJ_STATUS_INSUFFICIENT
+        agreed_digest, agreed_boundary = None, None
+
+    reports.sort(
+        key=lambda report: (
+            report[ADJ_SITE] is not None,
+            report[ADJ_SITE] or "",
+            report[ID],
+        )
+    )
+    result = {
+        CHECKPOINT_ITEM_BOUNDARY: agreed_boundary,
+        ITEMS: reports,
+        STATUS: overall_status,
+        ADJ_THRESHOLD: validated_policy[ADJ_THRESHOLD],
+        VERSION: ADJUDICATE_VERSION,
+        "digest": agreed_digest,
+    }
+    return _checkpoint_compact(result)
