@@ -472,6 +472,28 @@ binding raises :class:`InvalidRecoveryVerdictProofError` (both format
 errors subclass :class:`ValueError`); unknown, revoked, not-yet-valid
 or expired credentials or a signature mismatch raise
 :class:`AuthenticationError`.
+
+:func:`delegate_batch_receipt` and :func:`verify_batch_receipt_chain`
+extend a verified batch receipt into a multi-hop delegation chain,
+entirely offline.  Each hop proof is one canonical compact UTF-8 JSON
+object (recursively sorted keys, non-ASCII preserved, no trailing
+byte) carrying exactly ``payload`` and ``signature``; the payload
+binds exactly ``issuer``, ``keyVersion``, ``moment``, ``audience``,
+``upstream`` and ``version`` (the integer 1), where ``upstream`` is
+the lowercase hex SHA-256 of the base receipt bytes or the previous
+hop's complete proof bytes, and ``signature`` is the lowercase hex
+HMAC-SHA256 of the canonical compact payload under the key selected
+by the exact issuer and version.  The first hop's issuer is the
+receipt issuer, every later issuer the previous hop's audience; hop
+moments never precede their upstream moment nor postdate the
+verification moment, credentials must be usable both at their hop's
+moment and at the verification moment, identities and target domains
+never repeat, self-delegation is forbidden and the last hop's
+audience must equal the expected target.  Illegal delegation
+encoding, key sets, versions or chain bindings raise
+:class:`InvalidReceiptDelegationError` (a :class:`ValueError`)
+naming the first failing hop; credential and signature faults
+raise :class:`AuthenticationError`.
 """
 
 from __future__ import annotations
@@ -7059,6 +7081,7 @@ def _parse_batch_receipt(raw: object) -> tuple[dict, str]:
         raise _receipt_invalid("payload items must be a list")
     if not items:
         raise _receipt_invalid("payload items must be non-empty")
+    seen_ids: set[str] = set()
     for position, item in enumerate(items):
         where = f"item {position}"
         if not isinstance(item, dict):
@@ -7071,6 +7094,11 @@ def _parse_batch_receipt(raw: object) -> tuple[dict, str]:
         item_id = item[ID]
         if not isinstance(item_id, str) or item_id == "":
             raise _receipt_invalid(f"{where} id must be a non-empty str")
+        if item_id in seen_ids:
+            raise _receipt_invalid(
+                f"{where} id {item_id!r} is repeated in the payload items"
+            )
+        seen_ids.add(item_id)
         if not _is_digest(item[CP_DIGEST]):
             raise _receipt_invalid(
                 f"{where} digest must be 64 lowercase hex characters"
@@ -7172,6 +7200,41 @@ def sign_batch_receipt(
     return _checkpoint_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
 
 
+def _verify_batch_receipt_inner(
+    receipt: bytes,
+    validated_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """The verification body of :func:`verify_batch_receipt`.
+
+    Takes an already validated policy and keyring and a validated
+    moment; returns a fresh deep copy of the authenticated payload.
+    """
+    payload, signature = _parse_batch_receipt(receipt)
+    recomputed_policy = hashlib.sha256(
+        _verdict_policy_bytes(validated_policy)
+    ).hexdigest()
+    if payload[RECEIPT_POLICY] != recomputed_policy:
+        raise _receipt_invalid("policy digest does not match the policy")
+    if payload[CP_MOMENT] > moment:
+        raise _receipt_invalid(
+            "moment must not be later than the verification moment"
+        )
+
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION], moment
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError("batch receipt signature does not match")
+    return copy.deepcopy(payload)
+
+
 def verify_batch_receipt(
     receipt: bytes, policy: dict, keyring: dict, moment: int
 ) -> dict:
@@ -7183,9 +7246,10 @@ def verify_batch_receipt(
     recomputes the policy digest over the canonical compact policy
     encoding and the HMAC-SHA256 signature over the canonical compact
     payload bytes, and checks the payload structure, the item order
-    (each report's ``id`` must match its item's ``id``), every report's
-    shape and the moment binding: a receipt whose signing moment is
-    later than the verification moment is rejected.  The key is the one
+    (each report's ``id`` must match its item's ``id``), the item id
+    uniqueness (a repeated id is rejected before any signature check),
+    every report's shape and the moment binding: a receipt whose
+    signing moment is later than the verification moment is rejected.  The key is the one
     the *current* keyring binds to the payload's exact issuer and
     version, usable at the verification moment, so a later revocation or
     expiry rejects the receipt just as it does a replay.
@@ -7213,25 +7277,457 @@ def verify_batch_receipt(
     if moment < 0:
         raise ValueError("moment must be non-negative")
 
-    payload, signature = _parse_batch_receipt(receipt)
-    recomputed_policy = hashlib.sha256(
-        _verdict_policy_bytes(validated_policy)
-    ).hexdigest()
-    if payload[RECEIPT_POLICY] != recomputed_policy:
-        raise _receipt_invalid("policy digest does not match the policy")
-    if payload[CP_MOMENT] > moment:
-        raise _receipt_invalid(
-            "moment must not be later than the verification moment"
+    return _verify_batch_receipt_inner(
+        receipt, validated_policy, validated_keyring, moment
+    )
+
+
+# --- Offline delegation chains over a signed batch receipt -------------------
+
+RECEIPT_DELEGATION_VERSION = 1
+
+AUDIENCE = "audience"
+UPSTREAM = "upstream"
+
+CHAIN_HOPS = "hops"
+CHAIN_RECEIPT = "receipt"
+CHAIN_RECEIPT_DIGEST = "receiptDigest"
+CHAIN_TARGET = "target"
+
+_DELEGATION_PAYLOAD_KEYS = frozenset((
+    VD_ISSUER,
+    KEY_VERSION,
+    CP_MOMENT,
+    AUDIENCE,
+    UPSTREAM,
+    VERSION,
+))
+
+
+class InvalidReceiptDelegationError(ValueError):
+    """A delegation hop fails its canonical contract or chain binding."""
+
+
+def _delegation_invalid(
+    position: int, message: str
+) -> InvalidReceiptDelegationError:
+    """The delegation fault located at the first failing hop."""
+    return InvalidReceiptDelegationError(
+        f"invalid receipt delegation: hop {position}: {message}"
+    )
+
+
+def _parse_delegation_hop(raw: object, position: int) -> tuple[dict, str]:
+    """Validate hop bytes structurally into ``(payload, signature)``.
+
+    A non-bytes hop raises :class:`TypeError`; every encoding, key-set,
+    version, digest or canonical-form fault raises
+    :class:`InvalidReceiptDelegationError` naming the hop.  The chain
+    binding, credential and signature checks are done by
+    :func:`_verify_delegation_chain`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError(f"hop {position} must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _delegation_invalid(
+            position, "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _delegation_invalid(position, "is not valid UTF-8") from exc
+
+    def reject_duplicates(pairs: list[tuple]) -> dict:
+        result: dict = {}
+        for key, value in pairs:
+            if key in result:
+                raise _delegation_invalid(
+                    position, f"duplicate key {key!r} in object"
+                )
+            result[key] = value
+        return result
+
+    try:
+        data = json.loads(text, object_pairs_hook=reject_duplicates)
+    except json.JSONDecodeError as exc:
+        raise _delegation_invalid(position, "is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise _delegation_invalid(position, "must be a JSON object")
+    if set(data.keys()) != _BATCH_RECEIPT_TOP_KEYS:
+        raise _delegation_invalid(
+            position, "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str) or _HEX64.fullmatch(signature) is None:
+        raise _delegation_invalid(
+            position, "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise _delegation_invalid(position, "payload must be an object")
+    if set(payload.keys()) != _DELEGATION_PAYLOAD_KEYS:
+        raise _delegation_invalid(
+            position,
+            "payload must contain exactly the keys 'issuer', 'keyVersion', "
+            "'moment', 'audience', 'upstream' and 'version'",
+        )
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str) or issuer == "":
+        raise _delegation_invalid(
+            position, "payload issuer must be a non-empty str"
+        )
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise _delegation_invalid(
+            position, "payload keyVersion must be an int"
+        )
+    if key_version <= 0:
+        raise _delegation_invalid(
+            position, "payload keyVersion must be positive"
+        )
+    hop_moment = payload[CP_MOMENT]
+    if isinstance(hop_moment, bool) or not isinstance(hop_moment, int):
+        raise _delegation_invalid(position, "payload moment must be an int")
+    if hop_moment < 0:
+        raise _delegation_invalid(
+            position, "payload moment must be non-negative"
+        )
+    audience = payload[AUDIENCE]
+    if not isinstance(audience, str) or audience == "":
+        raise _delegation_invalid(
+            position, "payload audience must be a non-empty str"
+        )
+    if not _is_digest(payload[UPSTREAM]):
+        raise _delegation_invalid(
+            position, "payload upstream must be 64 lowercase hex characters"
+        )
+    version = payload[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise _delegation_invalid(position, "payload version must be an int")
+    if version != RECEIPT_DELEGATION_VERSION:
+        raise _delegation_invalid(
+            position, "payload version must be the integer 1"
+        )
+    if _checkpoint_compact(data) != raw:
+        raise _delegation_invalid(
+            position, "encoding is not the canonical compact form"
+        )
+    return payload, signature
+
+
+def _verify_delegation_chain(
+    hops: list,
+    validated_keyring: dict[str, list[dict]],
+    receipt_payload: dict,
+    receipt_digest: str,
+    moment: int,
+) -> list[dict]:
+    """Verify every hop's parse, chain binding and authentication.
+
+    ``hops`` holds the complete proof bytes of each hop in chain order,
+    ``receipt_payload``/``receipt_digest`` describe the verified base
+    receipt the first hop anchors to and ``moment`` is the current
+    verification moment.  All structural and binding faults raise
+    :class:`InvalidReceiptDelegationError` naming the first failing
+    hop; credential and signature faults raise
+    :class:`AuthenticationError`.  Returns the parsed hop payloads in
+    chain order.
+    """
+    parsed = [
+        _parse_delegation_hop(hop, position)
+        for position, hop in enumerate(hops)
+    ]
+    # The domains along the delegation path -- the receipt issuer and
+    # every hop audience -- must all be distinct; each hop's issuer is
+    # the previous domain by the continuity check, so only the new
+    # audience is tested and added.
+    domains: set[str] = {receipt_payload[VD_ISSUER]}
+    expected_issuer = receipt_payload[VD_ISSUER]
+    upstream_digest = receipt_digest
+    upstream_moment = receipt_payload[CP_MOMENT]
+    for position, (payload, _signature) in enumerate(parsed):
+        issuer = payload[VD_ISSUER]
+        audience = payload[AUDIENCE]
+        hop_moment = payload[CP_MOMENT]
+        if issuer != expected_issuer:
+            raise _delegation_invalid(
+                position,
+                f"issuer {issuer!r} does not continue the chain from "
+                f"{expected_issuer!r}",
+            )
+        if audience == issuer:
+            raise _delegation_invalid(
+                position, "must not delegate to itself"
+            )
+        if payload[UPSTREAM] != upstream_digest:
+            raise _delegation_invalid(
+                position, "upstream digest does not match the previous proof"
+            )
+        if hop_moment < upstream_moment:
+            raise _delegation_invalid(
+                position, "moment must not be earlier than the upstream moment"
+            )
+        if hop_moment > moment:
+            raise _delegation_invalid(
+                position,
+                "moment must not be later than the verification moment",
+            )
+        if audience in domains:
+            raise _delegation_invalid(
+                position,
+                f"identity {audience!r} is repeated in the chain",
+            )
+        domains.add(audience)
+        expected_issuer = audience
+        upstream_digest = hashlib.sha256(hops[position]).hexdigest()
+        upstream_moment = hop_moment
+    for position, (payload, signature) in enumerate(parsed):
+        issuer = payload[VD_ISSUER]
+        key_version = payload[KEY_VERSION]
+        # The credential must be usable both when the hop was signed and
+        # at the current verification moment; selection is exact.
+        entry = _usable_checkpoint_key(
+            validated_keyring, issuer, key_version, payload[CP_MOMENT]
+        )
+        _usable_checkpoint_key(validated_keyring, issuer, key_version, moment)
+        expected_signature = hmac.new(
+            bytes.fromhex(entry[SECRET]),
+            _checkpoint_compact(payload),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(expected_signature, signature):
+            raise AuthenticationError(
+                f"delegation hop {position} signature does not match"
+            )
+    return [payload for payload, _signature in parsed]
+
+
+def delegate_batch_receipt(
+    receipt: bytes,
+    hops: list,
+    policy: dict,
+    keyring: dict,
+    moment: int,
+    issuer: str,
+    version: int,
+    audience: str,
+) -> bytes:
+    """Sign the next delegation hop over a verified batch receipt chain.
+
+    ``receipt`` is a signed batch receipt as :func:`sign_batch_receipt`
+    returns, ``hops`` the existing delegation proofs in chain order
+    (empty for the first delegation), ``policy`` and ``keyring`` follow
+    the :func:`verify_batch_receipt` rules, ``moment`` is the signing
+    and verification time and ``issuer``/``version``/``audience`` name
+    the delegating credentials and the next recipient.  No file is
+    read or written and no argument is modified.
+
+    The base receipt is verified through the exact
+    :func:`verify_batch_receipt` rules and every existing hop through
+    the exact :func:`verify_batch_receipt_chain` rules before anything
+    is signed, so a broken chain is never extended.  The new hop's
+    ``issuer`` must equal the base receipt issuer (first hop) or the
+    previous hop's ``audience``; ``audience`` must differ from
+    ``issuer`` and must not repeat any identity already in the chain;
+    ``moment`` must not be earlier than the upstream moment.
+
+    The proof is one canonical compact UTF-8 JSON object -- every
+    object key recursively sorted, non-ASCII preserved, no trailing
+    byte -- carrying exactly ``payload`` and ``signature``.  The
+    payload binds exactly ``issuer``, ``keyVersion``, ``moment``,
+    ``audience``, ``upstream`` and ``version`` (the integer 1), where
+    ``upstream`` is the lowercase hex SHA-256 of the base receipt bytes
+    (first hop) or the previous hop's complete proof bytes.
+    ``signature`` is the lowercase hex HMAC-SHA256 of the canonical
+    compact payload bytes under the key the keyring binds to the exact
+    issuer and version, with no fallback.
+
+    A non-bytes receipt or hop, or a public field of the wrong type,
+    raises :class:`TypeError` (a :class:`bool` never poses as an int);
+    an empty issuer or audience, a non-positive version or a negative
+    moment raises :class:`ValueError`; an invalid base receipt raises
+    :class:`InvalidBatchReceiptError`; an illegal hop encoding, key
+    set, version or chain binding raises
+    :class:`InvalidReceiptDelegationError` (a :class:`ValueError`
+    subclass) naming the first failing hop; and unknown, revoked,
+    not-yet-valid or expired credentials raise
+    :class:`AuthenticationError`.
+    """
+    if not isinstance(receipt, bytes):
+        raise TypeError("receipt must be bytes")
+    if not isinstance(hops, list):
+        raise TypeError("hops must be a list")
+    for position, hop in enumerate(hops):
+        if not isinstance(hop, bytes):
+            raise TypeError(f"hop {position} must be bytes")
+    validated_policy = _validated_adjudication_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+    if not isinstance(audience, str):
+        raise TypeError("audience must be a str")
+    if audience == "":
+        raise ValueError("audience must be non-empty")
+
+    receipt_payload = _verify_batch_receipt_inner(
+        receipt, validated_policy, validated_keyring, moment
+    )
+    receipt_digest = hashlib.sha256(receipt).hexdigest()
+    payloads = _verify_delegation_chain(
+        hops, validated_keyring, receipt_payload, receipt_digest, moment
+    )
+    if payloads:
+        last = payloads[-1]
+        expected_issuer = last[AUDIENCE]
+        upstream_digest = hashlib.sha256(hops[-1]).hexdigest()
+        upstream_moment = last[CP_MOMENT]
+    else:
+        expected_issuer = receipt_payload[VD_ISSUER]
+        upstream_digest = receipt_digest
+        upstream_moment = receipt_payload[CP_MOMENT]
+    domains: set[str] = {receipt_payload[VD_ISSUER]}
+    for payload in payloads:
+        domains.add(payload[AUDIENCE])
+
+    position = len(hops)
+    if issuer != expected_issuer:
+        raise _delegation_invalid(
+            position,
+            f"issuer {issuer!r} does not continue the chain from "
+            f"{expected_issuer!r}",
+        )
+    if audience == issuer:
+        raise _delegation_invalid(position, "must not delegate to itself")
+    if moment < upstream_moment:
+        raise _delegation_invalid(
+            position, "moment must not be earlier than the upstream moment"
+        )
+    if audience in domains:
+        raise _delegation_invalid(
+            position, f"identity {audience!r} is repeated in the chain"
         )
 
-    entry = _usable_checkpoint_key(
-        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION], moment
-    )
-    expected_signature = hmac.new(
+    entry = _usable_checkpoint_key(validated_keyring, issuer, version, moment)
+    payload = {
+        VD_ISSUER: issuer,
+        KEY_VERSION: version,
+        CP_MOMENT: moment,
+        AUDIENCE: audience,
+        UPSTREAM: upstream_digest,
+        VERSION: RECEIPT_DELEGATION_VERSION,
+    }
+    signature = hmac.new(
         bytes.fromhex(entry[SECRET]),
         _checkpoint_compact(payload),
         hashlib.sha256,
     ).hexdigest()
-    if not hmac.compare_digest(expected_signature, signature):
-        raise AuthenticationError("batch receipt signature does not match")
-    return copy.deepcopy(payload)
+    return _checkpoint_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+def verify_batch_receipt_chain(
+    receipt: bytes,
+    hops: list,
+    policy: dict,
+    keyring: dict,
+    moment: int,
+    target: str,
+) -> dict:
+    """Verify a batch receipt and its whole delegation chain offline.
+
+    Only the receipt bytes, the ``hops`` proof bytes in chain order,
+    the expected ``policy``, the current ``keyring``, the verification
+    ``moment`` and the expected receiving domain ``target`` are
+    consulted -- no file is read or written and no argument is
+    modified.  ``hops`` is a non-empty list; each hop is one canonical
+    compact UTF-8 JSON object carrying exactly ``payload`` and
+    ``signature``, the payload binding exactly ``issuer``,
+    ``keyVersion``, ``moment``, ``audience``, ``upstream`` and
+    ``version`` (the integer 1).
+
+    The base receipt is verified through the exact
+    :func:`verify_batch_receipt` rules.  Every hop is then checked in
+    chain order: the first hop's ``issuer`` must equal the receipt
+    issuer and every later hop's ``issuer`` the previous hop's
+    ``audience``; ``upstream`` must be the lowercase hex SHA-256 of the
+    base receipt bytes (first hop) or the previous hop's complete
+    proof bytes; no hop may delegate to itself and no identity or
+    target domain may repeat within the chain; each hop's ``moment``
+    must not be earlier than its upstream moment nor later than the
+    verification moment; and the last hop's ``audience`` must equal
+    ``target``.  Each hop's signature is the lowercase hex HMAC-SHA256
+    of its canonical compact payload under the key the *current*
+    keyring binds to the hop's exact issuer and version, and that
+    credential must be usable both at the hop's own moment and at the
+    verification moment, so a later revocation or expiry rejects the
+    chain.
+
+    A non-bytes receipt or hop, or a public field of the wrong type,
+    raises :class:`TypeError` (a :class:`bool` never poses as an int);
+    an empty ``hops`` list, an empty ``target`` or a negative moment
+    raises :class:`ValueError`; an invalid base receipt raises
+    :class:`InvalidBatchReceiptError`; an illegal hop encoding, key
+    set, version or chain binding raises
+    :class:`InvalidReceiptDelegationError` (a :class:`ValueError`
+    subclass) naming the first failing hop; and unknown, revoked,
+    not-yet-valid or expired credentials or a signature mismatch raise
+    :class:`AuthenticationError`.
+
+    The result is a fresh mapping with the fixed keys ``hops`` (the
+    verified hop payloads in chain order), ``receipt`` (the verified
+    receipt payload), ``receiptDigest`` (the lowercase hex SHA-256 of
+    the receipt bytes), ``target`` and ``version`` (the integer 1);
+    repeated calls return equal but mutually independent results that
+    share no mutable object.
+    """
+    if not isinstance(receipt, bytes):
+        raise TypeError("receipt must be bytes")
+    if not isinstance(hops, list):
+        raise TypeError("hops must be a list")
+    if not hops:
+        raise ValueError("hops must be a non-empty list")
+    for position, hop in enumerate(hops):
+        if not isinstance(hop, bytes):
+            raise TypeError(f"hop {position} must be bytes")
+    validated_policy = _validated_adjudication_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+    if not isinstance(target, str):
+        raise TypeError("target must be a str")
+    if target == "":
+        raise ValueError("target must be non-empty")
+
+    receipt_payload = _verify_batch_receipt_inner(
+        receipt, validated_policy, validated_keyring, moment
+    )
+    receipt_digest = hashlib.sha256(receipt).hexdigest()
+    payloads = _verify_delegation_chain(
+        hops, validated_keyring, receipt_payload, receipt_digest, moment
+    )
+    last = payloads[-1]
+    if last[AUDIENCE] != target:
+        raise _delegation_invalid(
+            len(hops) - 1,
+            f"audience {last[AUDIENCE]!r} does not match the expected "
+            f"target {target!r}",
+        )
+    return {
+        CHAIN_HOPS: copy.deepcopy(payloads),
+        CHAIN_RECEIPT: receipt_payload,
+        CHAIN_RECEIPT_DIGEST: receipt_digest,
+        CHAIN_TARGET: target,
+        VERSION: RECEIPT_DELEGATION_VERSION,
+    }
