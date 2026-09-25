@@ -472,6 +472,85 @@ binding raises :class:`InvalidRecoveryVerdictProofError` (both format
 errors subclass :class:`ValueError`); unknown, revoked, not-yet-valid
 or expired credentials or a signature mismatch raise
 :class:`AuthenticationError`.
+
+:func:`decide_forks` turns the signed receipt fork proofs
+(:func:`sign_receipt_fork_proof`) into one multi-site
+disposition decision, still entirely offline.  It takes a non-empty
+``items`` list (each item exactly a non-empty, batch-unique ``id`` and
+``proof`` bytes), a ``policy``, a ``keyring``, the current ``moment``
+and the signing ``issuer`` and key ``version``.  The policy carries
+exactly ``action`` (``"isolate"`` or ``"rollback"``), ``base`` (the
+existing ``{"batch","sites","threshold"}`` proof policy), ``sites`` (a
+non-empty map of each authorized non-empty site to its non-empty set of
+allowed positive key versions) and ``threshold`` (a positive integer no
+greater than the site count).  Each proof is first verified through the
+exact :func:`verify_receipt_fork_proof` rules, then authorized by the
+exact signing site and key version with no fallback and authenticated
+against the current keyring; an invalid, unauthorized or unauthenticated
+proof rejects only that item with one fixed reason
+(``invalid-proof``, ``unauthorized-site``, ``unauthorized-version``,
+``credential-unavailable``, ``revoked``, ``not-yet-valid``,
+``expired`` or ``bad-signature``) without affecting the others.  An
+identical proof digest counts once per site (extra copies are
+``duplicate``); different valid proofs from one site are a
+``contradiction``.  The valid proofs of distinct sites must agree on
+every fork boundary made of the base receipt digest, the forking
+upstream and the target domain.  A unique boundary set attested by at
+least the threshold of distinct sites is ``accepted``; a contradiction
+or boundary disagreement is ``conflicted``; every other case is
+``insufficient``.  An accepted decision recommends isolating the
+(deduplicated, ascending) target domains or rolling back to before the
+fork, per the policy action; every other outcome recommends
+``manual-review`` and claims no boundary or target.  The result is one
+canonical compact UTF-8 JSON object (recursively sorted keys, non-ASCII
+preserved, no trailing byte) carrying exactly ``payload`` and
+``signature``; the payload binds exactly ``action``, ``boundaries``,
+``decisions`` (sorted by site then id), ``issuer``, ``keyVersion``,
+``policyDigest`` (the SHA-256 of the canonical policy), ``proofs`` (each
+proof digest in the original input order), ``recommendation``,
+``targets`` and ``version`` (the integer 1); the signature is the
+lowercase hex HMAC-SHA256 of the canonical compact payload bytes under
+the key bound to the exact issuer and version, with no fallback.
+
+:func:`verify_fork_decision` re-checks such a decision entirely offline
+from just the decision bytes, the expected policy, the current keyring
+and the verification moment.  It validates the canonical encoding and
+key sets, recomputes the policy digest and action binding, re-tallies
+the bound per-proof decisions -- row ordering, the original-order proof
+digest bindings, duplicates, contradictions, cross-site boundary
+agreement, the threshold and the claimed boundaries, targets and
+recommendation -- purely from the signed payload, and verifies the
+HMAC against the key the *current* keyring binds to the payload's exact
+issuer and version, usable at the verification moment, so a later
+revocation or expiry rejects the decision.  It returns a fresh dict
+keyed ``action``, ``boundaries``, ``decisions``, ``issuer``,
+``keyVersion``, ``policyDigest``, ``proofDigest`` (the SHA-256 of the
+decision bytes), ``proofs``, ``recommendation``, ``status``,
+``targets`` and ``version`` (the integer 1).  A non-bytes argument or a
+field of the wrong type raises :class:`TypeError` (a :class:`bool`
+never poses as an int); an illegal policy, identifier, version or
+moment raises :class:`ValueError`; an illegal encoding, key set,
+digest, ordering, reference or binding raises
+:class:`InvalidForkDecisionError` (a :class:`ValueError` subclass);
+unknown, revoked, not-yet-valid or expired credentials or a signature
+mismatch raise :class:`AuthenticationError`.
+
+:func:`verify_fork_decisions` verifies a non-empty batch of those
+decisions offline and independently, in strict input order.  Each item
+contains exactly a non-empty, batch-unique ``id`` and the ``decision``
+bytes; the batch and the shared policy, keyring and moment are
+validated in full before any decision is verified, so only a
+batch-level fault raises (container/field faults
+:class:`TypeError`; an empty list, an empty or duplicate id or a wrong
+item key set :class:`ValueError`).  Each decision is then reported in
+input order as ``verified``, ``invalid`` or ``unauthenticated`` with
+the fixed key order ``error``, ``id``, ``result`` and ``status``; a
+failed item keeps a definite, non-empty copy of the original exception
+text and a null result, and no identity of an unauthenticated payload
+enters a result.  Repeated calls return equal but mutually independent
+results.  None of the three entry points reads or writes a file or
+modifies an input, and the existing proof interfaces and module
+commands are unchanged.
 """
 
 from __future__ import annotations
@@ -9075,4 +9154,1302 @@ def verify_receipt_fork_proofs(
             for item in validated_items
         ],
         VERSION: FORK_PROOFS_VERSION,
+    }
+
+
+# --- Offline multi-site disposition decisions over receipt fork proofs --------
+
+FORK_DECISION_VERSION = 1
+
+FD_ACTION = "action"
+FD_BASE = "base"
+FD_BOUNDARIES = "boundaries"
+FD_DECISIONS = "decisions"
+FD_POLICY_DIGEST = "policyDigest"
+FD_PROOFS = "proofs"
+FD_RECOMMENDATION = "recommendation"
+FD_TARGETS = "targets"
+FD_PROOF = "proof"
+FD_SITE = ADJ_SITE
+FD_SITES = ADJ_SITES
+FD_CONCLUSION = ADJ_CONCLUSION
+FD_REASON = ADJ_REASON
+
+FD_ACTION_ISOLATE = "isolate"
+FD_ACTION_ROLLBACK = "rollback"
+_FD_ACTIONS = frozenset((FD_ACTION_ISOLATE, FD_ACTION_ROLLBACK))
+
+FD_RECOMMENDATION_ISOLATE = FD_ACTION_ISOLATE
+FD_RECOMMENDATION_ROLLBACK = FD_ACTION_ROLLBACK
+FD_RECOMMENDATION_MANUAL = "manual-review"
+_FD_RECOMMENDATIONS = frozenset((
+    FD_RECOMMENDATION_ISOLATE,
+    FD_RECOMMENDATION_ROLLBACK,
+    FD_RECOMMENDATION_MANUAL,
+))
+
+FD_STATUS_ACCEPTED = ADJ_STATUS_ACCEPTED
+FD_STATUS_CONFLICTED = ADJ_STATUS_CONFLICTED
+FD_STATUS_INSUFFICIENT = ADJ_STATUS_INSUFFICIENT
+
+FD_CONCLUSION_VALID = ADJ_CONCLUSION_VALID
+FD_CONCLUSION_INVALID = ADJ_CONCLUSION_INVALID
+FD_CONCLUSION_DUPLICATE = ADJ_CONCLUSION_DUPLICATE
+FD_CONCLUSION_CONTRADICTION = ADJ_CONCLUSION_CONTRADICTION
+_FD_CONCLUSIONS = frozenset((
+    FD_CONCLUSION_VALID,
+    FD_CONCLUSION_INVALID,
+    FD_CONCLUSION_DUPLICATE,
+    FD_CONCLUSION_CONTRADICTION,
+))
+
+FD_REASON_INVALID_PROOF = "invalid-proof"
+_FD_INVALID_REASONS = frozenset((
+    FD_REASON_INVALID_PROOF,
+    REASON_UNAUTHORIZED_SITE,
+    REASON_UNAUTHORIZED_VERSION,
+    REASON_CREDENTIAL_UNAVAILABLE,
+    REASON_REVOKED,
+    REASON_NOT_YET_VALID,
+    REASON_EXPIRED,
+    REASON_BAD_SIGNATURE,
+))
+_FD_REASONS = _FD_INVALID_REASONS | frozenset((
+    REASON_DUPLICATE,
+    REASON_CONTRADICTION,
+))
+
+_FD_POLICY_KEYS = frozenset((
+    FD_ACTION,
+    FD_BASE,
+    FD_SITES,
+    ADJ_THRESHOLD,
+))
+_FD_ITEM_KEYS = frozenset((ID, FD_PROOF))
+_FD_DECISION_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_FD_PAYLOAD_KEYS = frozenset((
+    FD_ACTION,
+    FD_BOUNDARIES,
+    FD_DECISIONS,
+    VD_ISSUER,
+    KEY_VERSION,
+    FD_POLICY_DIGEST,
+    FD_PROOFS,
+    FD_RECOMMENDATION,
+    FD_TARGETS,
+    VERSION,
+))
+_FD_BOUNDARY_KEYS = frozenset((
+    DELEGATION_RECEIPT_DIGEST,
+    DELEGATION_TARGET,
+    DELEGATION_UPSTREAM,
+))
+_FD_ROW_KEYS = frozenset((
+    FD_BOUNDARIES,
+    FD_CONCLUSION,
+    ID,
+    KEY_VERSION,
+    CP_DIGEST,
+    FD_REASON,
+    FD_SITE,
+))
+_FD_BATCH_ITEM_KEYS = frozenset((ID, "decision"))
+_FD_VERIFY_VERIFIED = "verified"
+_FD_VERIFY_INVALID = "invalid"
+_FD_VERIFY_UNAUTHENTICATED = "unauthenticated"
+_FD_RESULT_KEYS = (
+    FD_ACTION,
+    FD_BOUNDARIES,
+    FD_DECISIONS,
+    VD_ISSUER,
+    KEY_VERSION,
+    FD_POLICY_DIGEST,
+    FORK_PROOF_DIGEST,
+    FD_PROOFS,
+    FD_RECOMMENDATION,
+    STATUS,
+    FD_TARGETS,
+    VERSION,
+)
+
+
+class InvalidForkDecisionError(ValueError):
+    """A signed fork decision fails its canonical or binding contract."""
+
+
+def _fork_decision_invalid(message: str) -> InvalidForkDecisionError:
+    return InvalidForkDecisionError(f"invalid fork decision: {message}")
+
+
+def _reject_duplicate_fork_decision_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate decision keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _fork_decision_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _validated_boundary_object(value: object, where: str) -> dict:
+    """Validate one ``{'receiptDigest','target','upstream'}`` boundary."""
+    if not isinstance(value, dict):
+        raise TypeError(f"{where} boundary must be an object")
+    if set(value.keys()) != _FD_BOUNDARY_KEYS:
+        raise _fork_decision_invalid(
+            f"{where} boundary must contain exactly the keys 'receiptDigest', "
+            "'target' and 'upstream'"
+        )
+    receipt_digest = value[DELEGATION_RECEIPT_DIGEST]
+    upstream = value[DELEGATION_UPSTREAM]
+    target = value[DELEGATION_TARGET]
+    if not isinstance(receipt_digest, str):
+        raise TypeError(f"{where} receiptDigest must be a str")
+    if not isinstance(upstream, str):
+        raise TypeError(f"{where} upstream must be a str")
+    if not isinstance(target, str):
+        raise TypeError(f"{where} target must be a str")
+    if not _is_digest(receipt_digest):
+        raise _fork_decision_invalid(
+            f"{where} receiptDigest must be 64 lowercase hex characters"
+        )
+    if not _is_digest(upstream):
+        raise _fork_decision_invalid(
+            f"{where} upstream must be 64 lowercase hex characters"
+        )
+    if target == "":
+        raise _fork_decision_invalid(f"{where} target must be non-empty")
+    return {
+        DELEGATION_RECEIPT_DIGEST: receipt_digest,
+        DELEGATION_TARGET: target,
+        DELEGATION_UPSTREAM: upstream,
+    }
+
+
+def _boundary_triples(boundaries: list[dict]) -> tuple[tuple[str, str, str], ...]:
+    """Order-preserving boundary objects to comparable triples."""
+    return tuple(
+        (
+            boundary[DELEGATION_RECEIPT_DIGEST],
+            boundary[DELEGATION_UPSTREAM],
+            boundary[DELEGATION_TARGET],
+        )
+        for boundary in boundaries
+    )
+
+
+def _sorted_boundary_objects(
+    triples: set[tuple[str, str, str]] | frozenset[tuple[str, str, str]]
+) -> list[dict]:
+    """Unique boundary triples sorted as (receiptDigest, upstream, target)."""
+    return [
+        {
+            DELEGATION_RECEIPT_DIGEST: receipt_digest,
+            DELEGATION_TARGET: target,
+            DELEGATION_UPSTREAM: upstream,
+        }
+        for receipt_digest, upstream, target in sorted(triples)
+    ]
+
+
+def _validated_fork_policy(policy: object) -> dict:
+    """Validate the fork decision policy into a fresh normalized dict.
+
+    The policy carries exactly ``action``, ``base``, ``sites`` and
+    ``threshold``; ``base`` follows the exact adjudication policy
+    contract and ``sites``/``threshold`` its per-site version-set and
+    threshold rules.  Type faults raise :class:`TypeError` (a
+    :class:`bool` never poses as an int); every key-set or value fault
+    raises :class:`ValueError`.
+    """
+    if not isinstance(policy, dict):
+        raise TypeError("policy must be a dict")
+    if set(policy.keys()) != _FD_POLICY_KEYS:
+        raise ValueError(
+            "policy must contain exactly the keys 'action', 'base', "
+            "'sites' and 'threshold'"
+        )
+    base = policy[FD_BASE]
+    if not isinstance(base, dict):
+        raise TypeError("policy base must be a dict")
+    validated_base = _validated_adjudication_policy(base)
+    action = policy[FD_ACTION]
+    if not isinstance(action, str):
+        raise TypeError("policy action must be a str")
+    if action not in _FD_ACTIONS:
+        raise ValueError("policy action must be one of 'isolate' or 'rollback'")
+    threshold = policy[ADJ_THRESHOLD]
+    if isinstance(threshold, bool) or not isinstance(threshold, int):
+        raise TypeError("policy threshold must be an int")
+    if threshold <= 0:
+        raise ValueError("policy threshold must be a positive integer")
+    sites = policy[FD_SITES]
+    if not isinstance(sites, dict):
+        raise TypeError("policy sites must be a dict")
+    if not sites:
+        raise ValueError("policy sites must be non-empty")
+    allowed: dict[str, frozenset[int]] = {}
+    for site, versions in sites.items():
+        if not isinstance(site, str):
+            raise TypeError("policy site names must be str")
+        if site == "":
+            raise ValueError("policy site names must be non-empty")
+        if not isinstance(versions, set):
+            raise TypeError(f"allowed versions for site {site!r} must be a set")
+        site_versions: set[int] = set()
+        for key_version in versions:
+            if isinstance(key_version, bool) or not isinstance(key_version, int):
+                raise TypeError(
+                    f"allowed versions for site {site!r} must be ints"
+                )
+            if key_version <= 0:
+                raise ValueError(
+                    f"allowed versions for site {site!r} must be positive"
+                )
+            site_versions.add(key_version)
+        if not site_versions:
+            raise ValueError(f"site {site!r} must allow at least one key version")
+        allowed[site] = frozenset(site_versions)
+    if threshold > len(allowed):
+        raise ValueError(
+            "policy threshold must not exceed the number of policy sites"
+        )
+    return {
+        FD_ACTION: action,
+        FD_BASE: validated_base,
+        FD_SITES: allowed,
+        ADJ_THRESHOLD: threshold,
+    }
+
+
+def _fork_policy_bytes(policy: dict) -> bytes:
+    """Canonical compact bytes of the normalized fork decision policy.
+
+    The nested ``base`` policy is canonicalized exactly as
+    :func:`_verdict_policy_bytes` canonicalizes it; sites are listed
+    ascending with ascending version arrays and every key is sorted.
+    """
+    base = policy[FD_BASE]
+    canonical_base = {
+        ADJ_BATCH: base[ADJ_BATCH],
+        ADJ_SITES: {
+            site: sorted(base[ADJ_SITES][site]) for site in sorted(base[ADJ_SITES])
+        },
+        ADJ_THRESHOLD: base[ADJ_THRESHOLD],
+    }
+    canonical = {
+        FD_ACTION: policy[FD_ACTION],
+        FD_BASE: canonical_base,
+        FD_SITES: {
+            site: sorted(policy[FD_SITES][site])
+            for site in sorted(policy[FD_SITES])
+        },
+        ADJ_THRESHOLD: policy[ADJ_THRESHOLD],
+    }
+    return _checkpoint_compact(canonical)
+
+
+def _validated_fork_items(items: object) -> list[dict]:
+    """Validate the proof-item container before any proof is examined.
+
+    A non-list container or a non-dict element, non-str id or non-bytes
+    proof raises :class:`TypeError`; an empty list, an empty or duplicate
+    id or a wrong item key set raises :class:`ValueError`.  Empty proof
+    bytes are accepted here and rejected per item later.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _FD_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'id' and 'proof'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        proof = item[FD_PROOF]
+        if not isinstance(proof, bytes):
+            raise TypeError(f"{where} proof must be bytes")
+        validated.append({ID: item_id, FD_PROOF: proof})
+    return validated
+
+
+def _fork_proof_boundaries(
+    payload: dict, chains: list[dict]
+) -> frozenset[tuple[str, str, str]]:
+    """The fork boundaries a verified proof claims.
+
+    Each forking edge crossed by a chain contributes one
+    ``(receiptDigest, upstream, target)`` triple -- the base receipt, the
+    forking upstream and that crossing chain's final target domain.  The
+    fork proof's own validation already proved the fork entries and
+    crossing chains, so every named id names a chain material.
+    """
+    targets_by_id = {chain[ID]: chain[DELEGATION_TARGET] for chain in chains}
+    boundaries: set[tuple[str, str, str]] = set()
+    for fork in payload[FORK_PROOF_REPORT][CHAINS_FORKS]:
+        receipt_digest = fork[DELEGATION_RECEIPT_DIGEST]
+        upstream = fork[DELEGATION_UPSTREAM]
+        for chain_id in fork[_FORK_IDS]:
+            boundaries.add(
+                (receipt_digest, upstream, targets_by_id[chain_id])
+            )
+    return frozenset(boundaries)
+
+
+def _fork_decision_row(
+    item_id: str,
+    proof_digest: str,
+    site: str | None,
+    key_version: int | None,
+    boundaries: list[dict] | None,
+    conclusion: str,
+    reason: str | None,
+) -> dict:
+    """One per-proof decision row with the fixed bound key set."""
+    return {
+        FD_BOUNDARIES: boundaries,
+        FD_CONCLUSION: conclusion,
+        ID: item_id,
+        KEY_VERSION: key_version,
+        CP_DIGEST: proof_digest,
+        FD_REASON: reason,
+        FD_SITE: site,
+    }
+
+
+def _decide_fork_one(
+    item: dict,
+    policy: dict,
+    keyring: dict[str, list[dict]],
+    moment: int,
+    base_policy_digest: str,
+) -> dict:
+    """Verify, authorize and authenticate one fork proof in isolation.
+
+    Returns a fresh decision row.  The proof is first checked through the
+    exact :func:`verify_receipt_fork_proof` structural rules, then the
+    signing site and key version are authorized exactly against the
+    policy with no fallback, and finally the HMAC is checked against the
+    current keyring.  Any failure rejects just this row with one fixed
+    reason and never affects the other items.
+    """
+    item_id = item[ID]
+    raw_proof = item[FD_PROOF]
+    proof_digest = hashlib.sha256(raw_proof).hexdigest()
+
+    def structural_invalid() -> dict:
+        return _fork_decision_row(
+            item_id, proof_digest, None, None, None,
+            FD_CONCLUSION_INVALID, FD_REASON_INVALID_PROOF,
+        )
+
+    try:
+        payload, signature, chains = _parse_fork_proof(raw_proof)
+    except (TypeError, ValueError):
+        return structural_invalid()
+
+    site = payload[VD_ISSUER]
+    key_version = payload[KEY_VERSION]
+    try:
+        boundary_triples = _fork_proof_boundaries(payload, chains)
+        boundaries = _sorted_boundary_objects(boundary_triples)
+    except (TypeError, ValueError):
+        return structural_invalid()
+
+    def reject(reason: str) -> dict:
+        return _fork_decision_row(
+            item_id, proof_digest, site, key_version, boundaries,
+            FD_CONCLUSION_INVALID, reason,
+        )
+
+    if payload[RECEIPT_POLICY] != base_policy_digest:
+        # A proof for a different base policy cannot be trusted to name
+        # anything: reject it as a structural mismatch with no identity.
+        return structural_invalid()
+    if payload[CP_MOMENT] > moment:
+        return structural_invalid()
+
+    allowed_versions = policy[FD_SITES].get(site)
+    if allowed_versions is None:
+        return reject(REASON_UNAUTHORIZED_SITE)
+    if key_version not in allowed_versions:
+        return reject(REASON_UNAUTHORIZED_VERSION)
+
+    entry = None
+    for candidate in keyring.get(site, ()):
+        if candidate[VERSION] == key_version:
+            entry = candidate
+            break
+    if entry is None:
+        return reject(REASON_CREDENTIAL_UNAVAILABLE)
+    if entry[REVOKED]:
+        return reject(REASON_REVOKED)
+    if moment < entry[NOT_BEFORE]:
+        return reject(REASON_NOT_YET_VALID)
+    if moment > entry[NOT_AFTER]:
+        return reject(REASON_EXPIRED)
+
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        return reject(REASON_BAD_SIGNATURE)
+
+    return _fork_decision_row(
+        item_id, proof_digest, site, key_version, boundaries,
+        FD_CONCLUSION_VALID, None,
+    )
+
+
+def _tally_fork_rows(
+    rows: list[dict],
+) -> tuple[
+    bool,
+    dict[str, frozenset[tuple[str, str, str]]],
+    dict[str, list[dict]],
+]:
+    """Group authenticated rows per site and detect same-site forks.
+
+    Returns ``(contradicted, votes, representatives)`` where ``votes``
+    maps each non-contradicting site to its one boundary set and
+    ``representatives`` maps each site to the digest-group rows that
+    represent it (the rows marked ``valid``/``contradiction``).
+    """
+    by_site: dict[str, list[dict]] = {}
+    for row in rows:
+        if row[FD_CONCLUSION] in (
+            FD_CONCLUSION_VALID,
+            FD_CONCLUSION_DUPLICATE,
+            FD_CONCLUSION_CONTRADICTION,
+        ):
+            by_site.setdefault(row[FD_SITE], []).append(row)
+
+    contradicted = False
+    votes: dict[str, frozenset[tuple[str, str, str]]] = {}
+    representatives: dict[str, list[dict]] = {}
+    for site, site_rows in by_site.items():
+        groups: dict[str, list[dict]] = {}
+        for row in site_rows:
+            groups.setdefault(row[CP_DIGEST], []).append(row)
+        if len(groups) > 1:
+            contradicted = True
+            reps: list[dict] = []
+            for digest, members in groups.items():
+                members.sort(key=lambda row: row[ID])
+                members[0][FD_CONCLUSION] = FD_CONCLUSION_CONTRADICTION
+                members[0][FD_REASON] = REASON_CONTRADICTION
+                for extra in members[1:]:
+                    extra[FD_CONCLUSION] = FD_CONCLUSION_DUPLICATE
+                    extra[FD_REASON] = REASON_DUPLICATE
+                reps.append(members[0])
+            representatives[site] = reps
+        else:
+            members = sorted(
+                next(iter(groups.values())), key=lambda row: row[ID]
+            )
+            members[0][FD_CONCLUSION] = FD_CONCLUSION_VALID
+            members[0][FD_REASON] = None
+            for extra in members[1:]:
+                extra[FD_CONCLUSION] = FD_CONCLUSION_DUPLICATE
+                extra[FD_REASON] = REASON_DUPLICATE
+            representatives[site] = [members[0]]
+            votes[site] = frozenset(
+                _boundary_triples(members[0][FD_BOUNDARIES])
+            )
+    return contradicted, votes, representatives
+
+
+def decide_forks(
+    items: list,
+    policy: dict,
+    keyring: dict,
+    moment: int,
+    issuer: str,
+    version: int,
+) -> bytes:
+    """Decide a multi-site fork disposition offline and sign the outcome.
+
+    ``items`` is a non-empty list; each item contains exactly a unique,
+    non-empty str ``id`` and ``proof`` bytes produced by
+    :func:`sign_receipt_fork_proof`.  ``policy`` carries exactly
+    ``action`` (``"isolate"`` or ``"rollback"``), ``base`` (the existing
+    ``{"batch","sites","threshold"}`` proof policy), ``sites`` (a
+    non-empty mapping of each authorized non-empty site to its non-empty
+    set of allowed positive key versions) and ``threshold`` (a positive
+    integer no greater than the site count).  ``keyring`` follows the
+    :func:`apply_signed_remote` rules, ``moment`` is the current time as
+    a non-negative integer and ``issuer``/``version`` name the signing
+    credentials.  No file is read or written and no input is modified.
+
+    Every proof is first verified through the existing receipt fork
+    proof rules, then authorized by the exact signing site and key
+    version with no fallback, then authenticated against the current
+    keyring.  An invalid, unauthorized or unauthenticated proof rejects
+    just that item with one fixed reason (``invalid-proof``,
+    ``unauthorized-site``, ``unauthorized-version``,
+    ``credential-unavailable``, ``revoked``, ``not-yet-valid``,
+    ``expired`` or ``bad-signature``) without affecting the others.  An
+    identical proof digest counts once per site -- extras are
+    ``duplicate`` -- while different valid proofs from the same site are
+    a ``contradiction``.  The valid proofs of distinct sites must agree
+    on every fork boundary made of the base receipt digest, the forking
+    upstream and the target domain.
+
+    A unique boundary set attested by at least the threshold of distinct
+    sites is ``accepted``; any contradiction or boundary disagreement is
+    ``conflicted``; everything else is ``insufficient``.  An accepted
+    decision recommends the policy action -- isolate the (deduplicated,
+    ascending) target domains or roll back to before the fork -- while
+    every other outcome recommends ``manual-review`` with no boundary or
+    target claimed.
+
+    The result is one canonical compact UTF-8 JSON object with
+    recursively sorted keys, non-ASCII preserved and no trailing byte,
+    carrying exactly ``payload`` and ``signature``.  The payload binds
+    exactly ``action``, ``boundaries``, ``decisions``, ``issuer``,
+    ``keyVersion``, ``policyDigest`` (the SHA-256 of the canonical
+    policy), ``proofs`` (each proof digest in the original input order),
+    ``recommendation``, ``targets`` and ``version`` (the integer 1);
+    ``signature`` is the lowercase hex HMAC-SHA256 of the canonical
+    compact payload bytes under the key bound to the exact issuer and
+    version, with no fallback.
+
+    A parameter, container or field type fault raises :class:`TypeError`
+    (a :class:`bool` never poses as an int); an empty list, an empty or
+    duplicate id or an illegal policy value raises :class:`ValueError`;
+    unknown, revoked, not-yet-valid or expired signing credentials raise
+    :class:`AuthenticationError`.
+    """
+    validated_items = _validated_fork_items(items)
+    validated_policy = _validated_fork_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+
+    base_policy_digest = hashlib.sha256(
+        _verdict_policy_bytes(validated_policy[FD_BASE])
+    ).hexdigest()
+
+    proof_digests = [
+        hashlib.sha256(item[FD_PROOF]).hexdigest() for item in validated_items
+    ]
+    rows = [
+        _decide_fork_one(
+            item, validated_policy, validated_keyring, moment,
+            base_policy_digest,
+        )
+        for item in validated_items
+    ]
+
+    contradicted, votes, _representatives = _tally_fork_rows(rows)
+
+    boundary_sets = set(votes.values())
+    if contradicted or len(boundary_sets) > 1:
+        status = FD_STATUS_CONFLICTED
+    elif len(boundary_sets) == 1:
+        if len(votes) >= validated_policy[ADJ_THRESHOLD]:
+            status = FD_STATUS_ACCEPTED
+        else:
+            status = FD_STATUS_INSUFFICIENT
+    else:
+        status = FD_STATUS_INSUFFICIENT
+
+    if status == FD_STATUS_ACCEPTED:
+        agreed = next(iter(boundary_sets))
+        boundaries = _sorted_boundary_objects(agreed)
+        targets = sorted({triple[2] for triple in agreed})
+        recommendation = validated_policy[FD_ACTION]
+    else:
+        boundaries = []
+        targets = []
+        recommendation = FD_RECOMMENDATION_MANUAL
+
+    rows.sort(
+        key=lambda row: (
+            row[FD_SITE] is not None,
+            row[FD_SITE] or "",
+            row[ID],
+        )
+    )
+
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, moment
+    )
+    payload = {
+        FD_ACTION: validated_policy[FD_ACTION],
+        FD_BOUNDARIES: boundaries,
+        FD_DECISIONS: [copy.deepcopy(row) for row in rows],
+        VD_ISSUER: issuer,
+        KEY_VERSION: version,
+        FD_POLICY_DIGEST: hashlib.sha256(
+            _fork_policy_bytes(validated_policy)
+        ).hexdigest(),
+        FD_PROOFS: proof_digests,
+        FD_RECOMMENDATION: recommendation,
+        FD_TARGETS: targets,
+        VERSION: FORK_DECISION_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _checkpoint_compact(
+        {TICKET_PAYLOAD: payload, SIGNATURE: signature}
+    )
+
+
+def _parse_fork_decision(raw: object) -> tuple[dict, str]:
+    """Validate decision bytes structurally into ``(payload, signature)``.
+
+    A non-bytes argument or a field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, digest or value-format fault raises
+    :class:`InvalidForkDecisionError`.  The policy, tally and credential
+    bindings are checked by :func:`verify_fork_decision`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("decision must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _fork_decision_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _fork_decision_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_fork_decision_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _fork_decision_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("decision must be a JSON object")
+    if set(data.keys()) != _FD_DECISION_TOP_KEYS:
+        raise _fork_decision_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("decision signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
+        raise _fork_decision_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("decision payload must be an object")
+    if set(payload.keys()) != _FD_PAYLOAD_KEYS:
+        raise _fork_decision_invalid(
+            "payload must contain exactly the keys 'action', 'boundaries', "
+            "'decisions', 'issuer', 'keyVersion', 'policyDigest', 'proofs', "
+            "'recommendation', 'targets' and 'version'"
+        )
+
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("payload issuer must be a str")
+    if issuer == "":
+        raise _fork_decision_invalid("payload issuer must be a non-empty str")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _fork_decision_invalid("payload keyVersion must be positive")
+    action = payload[FD_ACTION]
+    if not isinstance(action, str):
+        raise TypeError("payload action must be a str")
+    if action not in _FD_ACTIONS:
+        raise _fork_decision_invalid(
+            "payload action must be one of 'isolate' or 'rollback'"
+        )
+    recommendation = payload[FD_RECOMMENDATION]
+    if not isinstance(recommendation, str):
+        raise TypeError("payload recommendation must be a str")
+    if recommendation not in _FD_RECOMMENDATIONS:
+        raise _fork_decision_invalid(
+            "payload recommendation must be one of 'isolate', 'rollback' or "
+            "'manual-review'"
+        )
+    policy_digest = payload[FD_POLICY_DIGEST]
+    if not isinstance(policy_digest, str):
+        raise TypeError("payload policyDigest must be a str")
+    if not _is_digest(policy_digest):
+        raise _fork_decision_invalid(
+            "payload policyDigest must be 64 lowercase hex characters"
+        )
+    proofs = payload[FD_PROOFS]
+    if not isinstance(proofs, list):
+        raise TypeError("payload proofs must be a list")
+    if not proofs:
+        raise _fork_decision_invalid("payload proofs must be non-empty")
+    for position, digest in enumerate(proofs):
+        if not isinstance(digest, str):
+            raise TypeError(f"payload proof {position} digest must be a str")
+        if not _is_digest(digest):
+            raise _fork_decision_invalid(
+                f"payload proof {position} digest must be 64 lowercase hex "
+                "characters"
+            )
+
+    decisions = payload[FD_DECISIONS]
+    if not isinstance(decisions, list):
+        raise TypeError("payload decisions must be a list")
+    if not decisions:
+        raise _fork_decision_invalid("payload decisions must be non-empty")
+    parsed_rows: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, row in enumerate(decisions):
+        where = f"payload decision {position}"
+        if not isinstance(row, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(row.keys()) != _FD_ROW_KEYS:
+            raise _fork_decision_invalid(
+                f"{where} must contain exactly the keys 'boundary', "
+                "'conclusion', 'id', 'keyVersion', 'digest', 'reason' and "
+                "'site'"
+            )
+        row_id = row[ID]
+        if not isinstance(row_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if row_id == "":
+            raise _fork_decision_invalid(f"{where} id must be non-empty")
+        if row_id in seen_ids:
+            raise _fork_decision_invalid(f"{where} repeats an id")
+        seen_ids.add(row_id)
+        digest = row[CP_DIGEST]
+        if not isinstance(digest, str):
+            raise TypeError(f"{where} digest must be a str")
+        if not _is_digest(digest):
+            raise _fork_decision_invalid(
+                f"{where} digest must be 64 lowercase hex characters"
+            )
+        site = row[FD_SITE]
+        if site is not None:
+            if not isinstance(site, str):
+                raise TypeError(f"{where} site must be a str or null")
+            if site == "":
+                raise _fork_decision_invalid(f"{where} site must be non-empty")
+        row_key_version = row[KEY_VERSION]
+        if isinstance(row_key_version, bool) or not isinstance(
+            row_key_version, int
+        ):
+            if row_key_version is not None:
+                raise TypeError(f"{where} keyVersion must be an int or null")
+        elif row_key_version <= 0:
+            raise _fork_decision_invalid(f"{where} keyVersion must be positive")
+        if (site is None) != (row_key_version is None):
+            raise _fork_decision_invalid(
+                f"{where} site and keyVersion must be null together"
+            )
+        conclusion = row[FD_CONCLUSION]
+        if not isinstance(conclusion, str):
+            raise TypeError(f"{where} conclusion must be a str")
+        if conclusion not in _FD_CONCLUSIONS:
+            raise _fork_decision_invalid(f"{where} conclusion is not known")
+        reason = row[FD_REASON]
+        if conclusion == FD_CONCLUSION_VALID:
+            if reason is not None:
+                raise _fork_decision_invalid(
+                    f"{where} reason must be null for a valid decision"
+                )
+        else:
+            if not isinstance(reason, str):
+                raise TypeError(f"{where} reason must be a str")
+            if reason not in _FD_REASONS:
+                raise _fork_decision_invalid(f"{where} reason is not known")
+        if conclusion == FD_CONCLUSION_INVALID:
+            if reason not in _FD_INVALID_REASONS:
+                raise _fork_decision_invalid(
+                    f"{where} reason does not match an invalid decision"
+                )
+        elif conclusion != FD_CONCLUSION_VALID:
+            if reason != conclusion:
+                raise _fork_decision_invalid(
+                    f"{where} reason must match its conclusion"
+                )
+        raw_boundaries = row[FD_BOUNDARIES]
+        if raw_boundaries is not None:
+            if not isinstance(raw_boundaries, list):
+                raise TypeError(f"{where} boundaries must be a list or null")
+            if not raw_boundaries:
+                raise _fork_decision_invalid(
+                    f"{where} boundaries must be non-empty for an "
+                    "authenticated proof"
+                )
+            row_boundaries = [
+                _validated_boundary_object(value, where)
+                for value in raw_boundaries
+            ]
+            triples = _boundary_triples(row_boundaries)
+            if len(set(triples)) != len(triples):
+                raise _fork_decision_invalid(
+                    f"{where} boundaries must be unique"
+                )
+            if list(triples) != sorted(triples):
+                raise _fork_decision_invalid(
+                    f"{where} boundaries must be sorted ascending"
+                )
+        parsed_boundaries = raw_boundaries
+        identity_expected = reason != FD_REASON_INVALID_PROOF
+        if identity_expected:
+            if site is None or parsed_boundaries is None:
+                raise _fork_decision_invalid(
+                    f"{where} an authenticated proof must carry its site and "
+                    "boundaries"
+                )
+        else:
+            if site is not None or parsed_boundaries is not None:
+                raise _fork_decision_invalid(
+                    f"{where} an invalid-proof decision must carry no site or "
+                    "boundaries"
+                )
+        parsed_rows.append(
+            {
+                FD_BOUNDARIES: (
+                    None
+                    if parsed_boundaries is None
+                    else [dict(value) for value in parsed_boundaries]
+                ),
+                FD_CONCLUSION: conclusion,
+                ID: row_id,
+                KEY_VERSION: row_key_version,
+                CP_DIGEST: digest,
+                FD_REASON: reason,
+                FD_SITE: site,
+            }
+        )
+
+    bound_boundaries = payload[FD_BOUNDARIES]
+    if not isinstance(bound_boundaries, list):
+        raise TypeError("payload boundaries must be a list")
+    parsed_top_boundaries = [
+        _validated_boundary_object(value, "payload boundaries")
+        for value in bound_boundaries
+    ]
+    top_triples = _boundary_triples(parsed_top_boundaries)
+    if len(set(top_triples)) != len(top_triples) or list(top_triples) != sorted(
+        top_triples
+    ):
+        raise _fork_decision_invalid(
+            "payload boundaries must be unique and sorted ascending"
+        )
+    targets = payload[FD_TARGETS]
+    if not isinstance(targets, list):
+        raise TypeError("payload targets must be a list")
+    for position, target in enumerate(targets):
+        if not isinstance(target, str):
+            raise TypeError(f"payload target {position} must be a str")
+        if target == "":
+            raise _fork_decision_invalid(
+                f"payload target {position} must be non-empty"
+            )
+    if len(set(targets)) != len(targets) or targets != sorted(targets):
+        raise _fork_decision_invalid(
+            "payload targets must be unique and sorted ascending"
+        )
+    decision_version = payload[VERSION]
+    if isinstance(decision_version, bool) or not isinstance(
+        decision_version, int
+    ):
+        raise TypeError("payload version must be an int")
+    if decision_version != FORK_DECISION_VERSION:
+        raise _fork_decision_invalid("payload version must be the integer 1")
+
+    if _checkpoint_compact(data) != raw:
+        raise _fork_decision_invalid(
+            "encoding is not the canonical compact form"
+        )
+    return payload, signature
+
+
+def _reconcile_fork_payload(
+    payload: dict, threshold: int, action: str
+) -> str:
+    """Re-derive every aggregate binding of a parsed decision payload.
+
+    Re-tallies the per-proof rows the signature covers -- row ordering,
+    proof digests, duplicate/contradiction conclusions, the cross-site
+    boundary agreement, the threshold acceptance and the claimed
+    boundaries, targets and recommendation -- without seeing any fork
+    proof.  Any mismatch raises :class:`InvalidForkDecisionError`;
+    otherwise the derived status is returned.
+    """
+    decisions = payload[FD_DECISIONS]
+    proofs = payload[FD_PROOFS]
+    if len(decisions) != len(proofs):
+        raise _fork_decision_invalid(
+            "the decisions must cover every proof and vice versa"
+        )
+    expected_order = sorted(
+        decisions,
+        key=lambda row: (
+            row[FD_SITE] is not None,
+            row[FD_SITE] or "",
+            row[ID],
+        ),
+    )
+    if [row[ID] for row in expected_order] != [
+        row[ID] for row in decisions
+    ]:
+        raise _fork_decision_invalid(
+            "decisions must be sorted by site then id"
+        )
+    decision_digests = [row[CP_DIGEST] for row in decisions]
+    if sorted(decision_digests) != sorted(proofs):
+        raise _fork_decision_invalid(
+            "the bound proof digests must equal the per-decision digests"
+        )
+
+    # Re-derive per-site duplicate/contradiction conclusions and compare
+    # them against the signed rows; no proof bytes are needed because a
+    # digest uniquely names a proof.
+    by_site: dict[str, dict[str, list[dict]]] = {}
+    for row in decisions:
+        if row[FD_CONCLUSION] == FD_CONCLUSION_INVALID:
+            continue
+        by_site.setdefault(row[FD_SITE], {}).setdefault(
+            row[CP_DIGEST], []
+        ).append(row)
+
+    contradicted = False
+    votes: dict[str, frozenset[tuple[str, str, str]]] = {}
+    for site, groups in by_site.items():
+        if len(groups) > 1:
+            contradicted = True
+            expected_conclusion = FD_CONCLUSION_CONTRADICTION
+            expected_reason = REASON_CONTRADICTION
+        else:
+            expected_conclusion = FD_CONCLUSION_VALID
+            expected_reason = None
+            sole_members = sorted(
+                next(iter(groups.values())), key=lambda row: row[ID]
+            )
+            votes[site] = frozenset(
+                _boundary_triples(sole_members[0][FD_BOUNDARIES])
+            )
+        for digest, members_raw in groups.items():
+            members = sorted(members_raw, key=lambda row: row[ID])
+            for index, row in enumerate(members):
+                if index == 0:
+                    if row[FD_CONCLUSION] != expected_conclusion:
+                        raise _fork_decision_invalid(
+                            f"decision {row[ID]!r} has the wrong conclusion"
+                        )
+                    if row[FD_REASON] != expected_reason:
+                        raise _fork_decision_invalid(
+                            f"decision {row[ID]!r} has the wrong reason"
+                        )
+                else:
+                    if row[FD_CONCLUSION] != FD_CONCLUSION_DUPLICATE:
+                        raise _fork_decision_invalid(
+                            f"decision {row[ID]!r} must be a duplicate"
+                        )
+                    if row[FD_REASON] != REASON_DUPLICATE:
+                        raise _fork_decision_invalid(
+                            f"decision {row[ID]!r} must carry the duplicate "
+                            "reason"
+                        )
+            representative = members[0]
+            for row in members[1:]:
+                if _boundary_triples(
+                    row[FD_BOUNDARIES]
+                ) != _boundary_triples(representative[FD_BOUNDARIES]):
+                    raise _fork_decision_invalid(
+                        f"decision {row[ID]!r} duplicates a proof with "
+                        "different boundaries"
+                    )
+
+    boundary_sets = set(votes.values())
+    if contradicted or len(boundary_sets) > 1:
+        status = FD_STATUS_CONFLICTED
+    elif len(boundary_sets) == 1 and len(votes) >= threshold:
+        status = FD_STATUS_ACCEPTED
+    else:
+        status = FD_STATUS_INSUFFICIENT
+
+    if status == FD_STATUS_ACCEPTED:
+        agreed = next(iter(boundary_sets))
+        expected_boundaries = _sorted_boundary_objects(agreed)
+        expected_targets = sorted({triple[2] for triple in agreed})
+        expected_recommendation = action
+    else:
+        expected_boundaries = []
+        expected_targets = []
+        expected_recommendation = FD_RECOMMENDATION_MANUAL
+
+    if payload[FD_BOUNDARIES] != expected_boundaries:
+        raise _fork_decision_invalid(
+            "the bound boundaries do not match the tallied decisions"
+        )
+    if payload[FD_TARGETS] != expected_targets:
+        raise _fork_decision_invalid(
+            "the bound targets do not match the tallied decisions"
+        )
+    if payload[FD_RECOMMENDATION] != expected_recommendation:
+        raise _fork_decision_invalid(
+            "the recommendation does not match the action and tallied status"
+        )
+    return status
+
+
+def _verify_fork_decision(
+    decision: bytes,
+    validated_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one fork decision against already-validated shared materials.
+
+    This is the shared core of :func:`verify_fork_decision` and the batch
+    :func:`verify_fork_decisions`; the caller owns the argument-type and
+    shared-material validation.  The returned dict is freshly built
+    solely from authenticated decision material.
+    """
+    payload, signature = _parse_fork_decision(decision)
+    expected_policy_digest = hashlib.sha256(
+        _fork_policy_bytes(validated_policy)
+    ).hexdigest()
+    if payload[FD_POLICY_DIGEST] != expected_policy_digest:
+        raise _fork_decision_invalid("policy digest does not match the policy")
+    if payload[FD_ACTION] != validated_policy[FD_ACTION]:
+        raise _fork_decision_invalid("action does not match the policy")
+
+    status = _reconcile_fork_payload(
+        payload,
+        validated_policy[ADJ_THRESHOLD],
+        validated_policy[FD_ACTION],
+    )
+
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION], moment
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError("fork decision signature does not match")
+
+    return {
+        key: copy.deepcopy(value)
+        for key, value in (
+            (FD_ACTION, payload[FD_ACTION]),
+            (FD_BOUNDARIES, payload[FD_BOUNDARIES]),
+            (FD_DECISIONS, payload[FD_DECISIONS]),
+            (VD_ISSUER, payload[VD_ISSUER]),
+            (KEY_VERSION, payload[KEY_VERSION]),
+            (FD_POLICY_DIGEST, expected_policy_digest),
+            (FORK_PROOF_DIGEST, hashlib.sha256(decision).hexdigest()),
+            (FD_PROOFS, payload[FD_PROOFS]),
+            (FD_RECOMMENDATION, payload[FD_RECOMMENDATION]),
+            (STATUS, status),
+            (FD_TARGETS, payload[FD_TARGETS]),
+            (VERSION, FORK_DECISION_VERSION),
+        )
+    }
+
+
+def verify_fork_decision(
+    decision: bytes, policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify one signed multi-site fork decision entirely offline.
+
+    Only the decision bytes, the expected ``policy``, the current
+    ``keyring`` and the verification ``moment`` are consulted -- no file
+    is read or written and no argument is modified.  Verification
+    validates the canonical encoding and key sets, recomputes the policy
+    digest, re-tallies the bound per-proof decisions (ordering, digest
+    bindings, duplicates, contradictions, cross-site boundary
+    agreement, threshold, boundaries, targets and recommendation) purely
+    from the signed payload, and checks the HMAC-SHA256 against the key
+    the *current* keyring binds to the payload's exact issuer and
+    version, usable at the verification moment, so a later revocation or
+    expiry rejects the decision with no fallback.
+
+    On success a fresh mapping is returned with the fixed keys
+    ``action``, ``boundaries``, ``decisions``, ``issuer``,
+    ``keyVersion``, ``policyDigest``, ``proofDigest`` (the SHA-256 of the
+    decision bytes), ``proofs``, ``recommendation``, ``status``,
+    ``targets`` and ``version`` (the integer 1).  A non-bytes decision
+    or a field of the wrong type raises :class:`TypeError` (a
+    :class:`bool` never poses as an int); an illegal policy, keyring or
+    moment raises :class:`ValueError`; an illegal encoding, key set,
+    digest, ordering, reference or binding raises
+    :class:`InvalidForkDecisionError` (a :class:`ValueError` subclass);
+    unknown, revoked, not-yet-valid or expired credentials or a
+    signature mismatch raise :class:`AuthenticationError`.
+    """
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    validated_policy = _validated_fork_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+    return _verify_fork_decision(
+        decision, validated_policy, validated_keyring, moment
+    )
+
+
+def _validated_fork_decision_items(items: object) -> list[dict]:
+    """Validate the decision batch before any decision is verified.
+
+    The argument must be a non-empty list of dicts each holding exactly
+    ``id`` (a non-empty str, unique across the batch) and ``decision``
+    (bytes).  Container, element and field type faults raise
+    :class:`TypeError`; an empty list, an empty or duplicate id or a
+    wrong key set raises :class:`ValueError`.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _FD_BATCH_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'decision' and 'id'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        decision = item["decision"]
+        if not isinstance(decision, bytes):
+            raise TypeError(f"{where} decision must be bytes")
+        validated.append({ID: item_id, "decision": decision})
+    return validated
+
+
+def _fork_decision_item_report(
+    item_id: str, status: str, error: str | None, result: dict | None
+) -> dict:
+    """One fork-decision batch report with the fixed key order."""
+    return {
+        CHECKPOINT_ITEM_ERROR: error,
+        ID: item_id,
+        VERDICT_ITEM_RESULT: result,
+        STATUS: status,
+    }
+
+
+def _verify_fork_decision_item(
+    item: dict,
+    validated_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one decision in isolation and report its outcome.
+
+    Unknown, revoked, not-yet-valid or expired credentials or a wrong
+    signature make the item ``unauthenticated``; every encoding,
+    key-set, digest, ordering, reference or binding fault makes it
+    ``invalid``; a passing decision is ``verified``.
+    """
+    item_id = item[ID]
+    decision = item["decision"]
+    try:
+        result = _verify_fork_decision(
+            decision, validated_policy, validated_keyring, moment
+        )
+    except AuthenticationError as exc:
+        return _fork_decision_item_report(
+            item_id, _FD_VERIFY_UNAUTHENTICATED, str(exc), None
+        )
+    except (InvalidForkDecisionError, TypeError) as exc:
+        # A TypeError here can only come from a wrong JSON field type
+        # *inside* the decision bytes; the public argument types were all
+        # validated before the batch ran.
+        return _fork_decision_item_report(
+            item_id, _FD_VERIFY_INVALID, str(exc), None
+        )
+    return _fork_decision_item_report(
+        item_id, _FD_VERIFY_VERIFIED, None, result
+    )
+
+
+def verify_fork_decisions(
+    items: list, policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify a whole batch of multi-site fork decisions entirely offline.
+
+    ``items`` is a non-empty list; each item is a dict with exactly the
+    keys ``id`` (a non-empty str, unique across the batch) and
+    ``decision`` (the bytes :func:`decide_forks` produced).  The batch
+    and the shared ``policy``, ``keyring`` and ``moment`` are validated
+    in full before any decision is verified: container, element or field
+    type faults raise :class:`TypeError` (a :class:`bool` never poses as
+    an int) and an empty list, an empty or duplicate id or a wrong item
+    key set raises :class:`ValueError`; only these batch-level faults
+    raise.
+
+    Each decision is then verified independently, in strict input order,
+    through the exact :func:`verify_fork_decision` rules: one decision's
+    failure never stops a later one or alters an earlier report.
+    Currently unknown, revoked, not-yet-valid or expired credentials or a
+    wrong signature make the item ``unauthenticated``; an illegal
+    encoding, key set, digest, ordering, reference or binding makes it
+    ``invalid``; a passing decision is ``verified``.
+
+    The top-level result is a fresh dict with the fixed keys ``items``
+    and ``version`` (the integer 1); each item report carries, in this
+    key order, ``error`` (null exactly when verified), ``id``,
+    ``result`` (a fresh independent copy of the single-decision result
+    when verified, otherwise null) and ``status``; a failed item keeps a
+    definite, non-empty copy of the original exception text.  Repeated
+    calls return equal but mutually independent results.
+    """
+    validated_items = _validated_fork_decision_items(items)
+    validated_policy = _validated_fork_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+    return {
+        ITEMS: [
+            _verify_fork_decision_item(
+                item, validated_policy, validated_keyring, moment
+            )
+            for item in validated_items
+        ],
+        VERSION: FORK_DECISION_VERSION,
     }
