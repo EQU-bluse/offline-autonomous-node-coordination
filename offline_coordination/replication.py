@@ -612,6 +612,45 @@ a structurally bad receipt only recorded as ``invalid-receipt``); and
 unknown, revoked, not-yet-valid or expired credentials or a wrong
 signature raise :class:`AuthenticationError`.  No file is read or
 written and every existing public interface is unchanged.
+
+:func:`seal_chain_checkpoint` seals a pruned *chain checkpoint* over
+one verified, accepted and unforked target chain of a
+:func:`verify_decision_chains` batch, so a verifier can keep checking
+the chain after the prefix certificates and rounds are dropped.  The
+checkpoint is one canonical compact UTF-8 JSON object carrying exactly
+``payload`` and ``signature``; the payload binds the root digest, the
+stable head digest, the height, the head status, the settlement
+(``commonDigest``) and plan digests, the head policy digest and
+version, the head effective moment, the ordered packet digests, the
+per-stage policy digest history, the ordered evidence prefix digests
+and the sealing moment, and the signature is the HMAC-SHA256 of the
+canonical payload under the exact issuer/version key.  A target that
+is not verified, accepted and fork-free raises :class:`ValueError`.
+
+:func:`verify_chain_suffix` continues verification offline from just
+the checkpoint, the successor packets past the checkpoint head, the
+per-stage policies and the shared material.  An empty suffix returns
+the sealed stable head; otherwise the first successor's predecessor
+digest must equal the checkpoint head digest, its evidence prefix
+count and digests must match the checkpoint and every hop follows the
+exact :func:`verify_decision_chain` rules.  The stage policies start
+at the checkpoint head policy and a version regression is always
+rejected.  The result maps ``rootDigest``, ``headDigest``, ``height``,
+``policyVersion``, ``status`` and ``checkpointDigest``.
+
+:func:`verify_chain_suffixes` verifies a batch of such items (each
+exactly ``id``, ``checkpoint``, ``successors`` and ``policies``) in
+input order and isolation, reporting ``verified``,
+``invalid-checkpoint``, ``invalid-suffix``, ``unauthenticated`` or
+``conflicted``; the same predecessor digest pointing at two distinct
+successors across the verified trajectories is a fork (a mere prefix
+extension is not) and reclassifies every verified chain crossing it as
+``conflicted`` with its result kept.  Checkpoint binding faults raise
+:class:`InvalidCheckpointError`, suffix faults
+:class:`InvalidChainError` and credential or signature faults
+:class:`AuthenticationError`.  None of the three entry points reads or
+writes a file or modifies an input, and the existing chain, anchor,
+command and status behaviour is unchanged.
 """
 
 from __future__ import annotations
@@ -15074,7 +15113,15 @@ def _assert_transition(previous: dict, verdict: dict) -> None:
                 "an accepted decision must not fall back to insufficient"
             )
         if new_status == CD_STATUS_ACCEPTED:
-            if verdict[CD_COMMON] != previous[CD_COMMON]:
+            if previous["kind"] == "checkpoint":
+                # A checkpoint predecessor keeps only the settlement
+                # digest; the recomputed common result must hash to it.
+                same_common = hmac.compare_digest(
+                    verdict[CD_COMMON_DIGEST], previous[CD_COMMON_DIGEST]
+                )
+            else:
+                same_common = verdict[CD_COMMON] == previous[CD_COMMON]
+            if not same_common:
                 raise _chain_invalid(
                     "an accepted decision may only keep the same common result"
                 )
@@ -15180,6 +15227,8 @@ def _assert_evidence_prefix(
     """Dispatch the prefix/extension rule by predecessor kind."""
     if previous["kind"] == "root":
         _root_prefix_matches(previous, evidence, require_extension)
+    elif previous["kind"] == "checkpoint":
+        _checkpoint_prefix_matches(previous, evidence, require_extension)
     else:
         _successor_prefix_matches(previous, evidence, require_extension)
 
@@ -15594,7 +15643,7 @@ def _chain_root_policy(versioned_policy: dict) -> dict:
 def _verify_chain_hop(
     successor: bytes,
     previous_view: dict,
-    previous_packet: bytes,
+    previous_digest: str,
     root_packet_digest: str,
     root_plan_digest: str,
     decision: bytes,
@@ -15609,9 +15658,7 @@ def _verify_chain_hop(
 
     if payload[DS_ROOT_DIGEST] != root_packet_digest:
         raise _chain_invalid("root digest does not match the chain root")
-    if payload[DS_PREDECESSOR_DIGEST] != hashlib.sha256(
-        previous_packet
-    ).hexdigest():
+    if payload[DS_PREDECESSOR_DIGEST] != previous_digest:
         raise _chain_invalid(
             "predecessor digest does not match the previous packet"
         )
@@ -15823,7 +15870,8 @@ def verify_decision_chain(
     previous_packet = root
     for index, successor in enumerate(successors):
         hop = _verify_chain_hop(
-            successor, view, previous_packet, root_digest, root_plan_digest,
+            successor, view, hashlib.sha256(previous_packet).hexdigest(),
+            root_digest, root_plan_digest,
             decision, validated_fork_policy, validated_policies[index],
             validated_policies[index + 1], validated_keyring, verify_moment,
         )
@@ -16310,4 +16358,697 @@ def verify_decision_head(
         CD_POLICY_DIGEST: head_policy_digest,
         DS_POLICY_VERSION: payload[DS_POLICY_VERSION],
         DS_ANCHOR_DIGEST: hashlib.sha256(anchor).hexdigest(),
+    }
+
+
+# -- Chain checkpoints over pruned prefixes ------------------------------------
+
+DS_PACKETS = "packets"
+DS_POLICY_HISTORY = "policies"
+DS_CHECKPOINT_DIGEST = "checkpointDigest"
+
+_DS_CHECKPOINT_PAYLOAD_KEYS = frozenset((
+    DS_ROOT_DIGEST,
+    DS_HEAD_DIGEST,
+    DS_HEIGHT,
+    STATUS,
+    CD_COMMON_DIGEST,
+    CD_PLAN_DIGEST,
+    CD_POLICY_DIGEST,
+    DS_POLICY_VERSION,
+    DS_EFFECTIVE_AT,
+    DS_PACKETS,
+    DS_POLICY_HISTORY,
+    DS_EVIDENCE,
+    CP_MOMENT,
+    VD_ISSUER,
+    KEY_VERSION,
+    VERSION,
+))
+
+_DS_SUFFIX_INVALID_CHECKPOINT = "invalid-checkpoint"
+_DS_SUFFIX_INVALID_SUFFIX = "invalid-suffix"
+
+
+class InvalidCheckpointError(ValueError):
+    """A chain checkpoint packet breaks its binding contract."""
+
+
+def _chain_checkpoint_invalid(message: str) -> InvalidCheckpointError:
+    return InvalidCheckpointError(f"invalid chain checkpoint: {message}")
+
+
+def _reject_duplicate_chain_checkpoint_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate checkpoint keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _chain_checkpoint_invalid(
+                f"duplicate key {key!r} in object"
+            )
+        result[key] = value
+    return result
+
+
+def seal_chain_checkpoint(
+    items: list,
+    target: str,
+    decision: bytes,
+    policy: dict,
+    keyring: dict,
+    moment: int,
+    issuer: str,
+    version: int,
+) -> bytes:
+    """Seal a pruned checkpoint over one verified, accepted chain head.
+
+    The batch is first run through the exact
+    :func:`verify_decision_chains` rules.  A checkpoint is only sealed
+    for the ``target`` chain when it is ``verified`` -- never merely
+    conflicted by a fork in this batch, invalid or unauthenticated --
+    and its head is ``accepted``; otherwise sealing raises
+    :class:`ValueError`.  Other chains in the batch are still checked
+    for forks (a fork reclassifies the target when it shares an edge)
+    but their own failures do not stop the target's checkpoint.
+
+    The checkpoint binds the chain's root digest, stable head digest,
+    height, head status, settlement (``commonDigest``) and plan
+    digests, the head policy digest and version, the head effective
+    moment and the sealing moment, and keeps the ordered packet
+    digests, the per-stage policy digest history and the ordered
+    evidence prefix digests; the pruned certificates and rounds are
+    never carried.  The signature is the HMAC-SHA256 of the canonical
+    checkpoint payload under the exact ``issuer``/``version`` key,
+    usable at ``moment``.
+
+    Returns canonical compact UTF-8 JSON with exactly ``payload`` and
+    ``signature``.  Container/field type faults raise
+    :class:`TypeError`; an empty value, an unknown target id, an
+    illegal version or a target that is not clean, unforked and
+    accepted raises :class:`ValueError`; a signing credential fault
+    raises :class:`AuthenticationError`.  No file is read or written
+    and no input is modified.
+    """
+    validated_items = _validated_decision_chain_batch(items)
+    if not isinstance(target, str):
+        raise TypeError("target must be a str")
+    if target == "":
+        raise ValueError("target must be non-empty")
+    target_index = None
+    for position, item in enumerate(validated_items):
+        if item[ID] == target:
+            target_index = position
+            break
+    if target_index is None:
+        raise ValueError(f"unknown target id {target!r}")
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    _validated_fork_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    seal_moment = _fe_moment(moment, "moment")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+
+    report = verify_decision_chains(
+        items, decision, policy, keyring, seal_moment
+    )
+    # The target alone must be verified (never conflicted by a fork in
+    # this batch, invalid or unauthenticated) and accepted; an
+    # unrelated failing chain never stops its checkpoint.
+    entry_report = report[ITEMS][target_index]
+    if entry_report[STATUS] != _DS_VERIFY_VERIFIED:
+        raise ValueError(
+            "a checkpoint seals only a verified target with no fork"
+        )
+    result = entry_report[VERDICT_ITEM_RESULT]
+    if result[STATUS] != CD_STATUS_ACCEPTED:
+        raise ValueError("a checkpoint seals only an accepted head")
+    target_item = validated_items[target_index]
+    root_packet = target_item[DS_BATCH_ROOTS]
+    successors = target_item[DS_BATCH_SUCCESSORS]
+    packet_digests = [hashlib.sha256(root_packet).hexdigest()]
+    packet_digests.extend(
+        hashlib.sha256(successor).hexdigest() for successor in successors
+    )
+    head_packet = successors[-1] if successors else root_packet
+    if result[DS_HEAD_DIGEST] != hashlib.sha256(head_packet).hexdigest():
+        raise ValueError(
+            "the checkpoint head digest does not match its packet"
+        )
+    if successors:
+        head_payload, _head_sig, _head_evidence = _parse_supersede_packet(
+            head_packet
+        )
+        head_effective = head_payload[DS_EFFECTIVE_AT]
+    else:
+        head_payload, _head_sig = _parse_convergence_decision(head_packet)
+        head_effective = None
+    policy_digests = [
+        _decision_policy_digest(_validated_decision_policy(stage_policy))
+        for stage_policy in target_item[DS_BATCH_POLICIES]
+    ]
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, seal_moment
+    )
+    payload = {
+        DS_ROOT_DIGEST: result[DS_ROOT_DIGEST],
+        DS_HEAD_DIGEST: result[DS_HEAD_DIGEST],
+        DS_HEIGHT: result[DS_HEIGHT],
+        STATUS: result[STATUS],
+        CD_COMMON_DIGEST: head_payload[CD_COMMON_DIGEST],
+        CD_PLAN_DIGEST: head_payload[CD_PLAN_DIGEST],
+        CD_POLICY_DIGEST: policy_digests[-1],
+        DS_POLICY_VERSION: result[DS_POLICY_VERSION],
+        DS_EFFECTIVE_AT: head_effective,
+        DS_PACKETS: packet_digests,
+        DS_POLICY_HISTORY: policy_digests,
+        DS_EVIDENCE: list(head_payload[CD_CERTIFICATES]),
+        CP_MOMENT: seal_moment,
+        VD_ISSUER: issuer,
+        KEY_VERSION: version,
+        VERSION: SUPERSEDE_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _checkpoint_compact(
+        {TICKET_PAYLOAD: payload, SIGNATURE: signature}
+    )
+
+
+def _parse_chain_checkpoint(raw: object) -> tuple[dict, str]:
+    """Validate checkpoint bytes structurally into ``(payload, signature)``.
+
+    A non-bytes argument or a field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, digest, shape or cross-binding fault raises
+    :class:`InvalidCheckpointError`.  The signature itself is checked
+    by the suffix verifier.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("checkpoint must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _chain_checkpoint_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _chain_checkpoint_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_chain_checkpoint_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _chain_checkpoint_invalid("is not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise TypeError("checkpoint must be a JSON object")
+    if set(data.keys()) != _DS_TOP_KEYS:
+        raise _chain_checkpoint_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("checkpoint signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
+        raise _chain_checkpoint_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("checkpoint payload must be an object")
+    if set(payload.keys()) != _DS_CHECKPOINT_PAYLOAD_KEYS:
+        raise _chain_checkpoint_invalid(
+            "payload must contain exactly the keys 'rootDigest', "
+            "'headDigest', 'height', 'status', 'commonDigest', "
+            "'planDigest', 'policyDigest', 'policyVersion', 'effectiveAt', "
+            "'packets', 'policies', 'evidence', 'moment', 'issuer', "
+            "'keyVersion' and 'version'"
+        )
+    for key in (
+        DS_ROOT_DIGEST, DS_HEAD_DIGEST, CD_COMMON_DIGEST, CD_PLAN_DIGEST,
+        CD_POLICY_DIGEST,
+    ):
+        value = payload[key]
+        if not isinstance(value, str):
+            raise TypeError(f"payload {key} must be a str")
+        if not _is_digest(value):
+            raise _chain_checkpoint_invalid(
+                f"payload {key} must be 64 lowercase hex characters"
+            )
+    height = payload[DS_HEIGHT]
+    if isinstance(height, bool) or not isinstance(height, int):
+        raise TypeError("payload height must be an int")
+    if height < 0:
+        raise _chain_checkpoint_invalid("payload height must be non-negative")
+    status = payload[STATUS]
+    if not isinstance(status, str):
+        raise TypeError("payload status must be a str")
+    if status != CD_STATUS_ACCEPTED:
+        raise _chain_checkpoint_invalid(
+            "payload status seals only an accepted head"
+        )
+    policy_version = payload[DS_POLICY_VERSION]
+    if isinstance(policy_version, bool) or not isinstance(
+        policy_version, int
+    ):
+        raise TypeError("payload policyVersion must be an int")
+    if policy_version <= 0:
+        raise _chain_checkpoint_invalid(
+            "payload policyVersion must be positive"
+        )
+    effective = payload[DS_EFFECTIVE_AT]
+    if effective is None:
+        if height != 0:
+            raise _chain_checkpoint_invalid(
+                "payload effectiveAt is null only at height zero"
+            )
+    else:
+        if isinstance(effective, bool) or not isinstance(effective, int):
+            raise TypeError("payload effectiveAt must be an int or null")
+        if effective < 0:
+            raise _chain_checkpoint_invalid(
+                "payload effectiveAt must be non-negative"
+            )
+        if height == 0:
+            raise _chain_checkpoint_invalid(
+                "payload effectiveAt must be null at height zero"
+            )
+    for key in (DS_PACKETS, DS_POLICY_HISTORY, DS_EVIDENCE):
+        digests = payload[key]
+        if not isinstance(digests, list):
+            raise TypeError(f"payload {key} must be a list")
+        if not digests:
+            raise _chain_checkpoint_invalid(f"payload {key} must be non-empty")
+        for position, digest in enumerate(digests):
+            if not isinstance(digest, str):
+                raise TypeError(f"payload {key} {position} must be a str")
+            if not _is_digest(digest):
+                raise _chain_checkpoint_invalid(
+                    f"payload {key} {position} must be 64 lowercase hex "
+                    "characters"
+                )
+    packets = payload[DS_PACKETS]
+    if len(packets) != height + 1:
+        raise _chain_checkpoint_invalid(
+            "payload packets must hold one digest per chain packet"
+        )
+    if packets[0] != payload[DS_ROOT_DIGEST]:
+        raise _chain_checkpoint_invalid(
+            "payload packets must start at the root digest"
+        )
+    if packets[-1] != payload[DS_HEAD_DIGEST]:
+        raise _chain_checkpoint_invalid(
+            "payload packets must end at the head digest"
+        )
+    policies = payload[DS_POLICY_HISTORY]
+    if len(policies) != height + 1:
+        raise _chain_checkpoint_invalid(
+            "payload policies must hold one digest per chain stage"
+        )
+    if policies[-1] != payload[CD_POLICY_DIGEST]:
+        raise _chain_checkpoint_invalid(
+            "payload policies must end at the head policy digest"
+        )
+    moment = payload[CP_MOMENT]
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("payload moment must be an int")
+    if moment < 0:
+        raise _chain_checkpoint_invalid("payload moment must be non-negative")
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("payload issuer must be a str")
+    if issuer == "":
+        raise _chain_checkpoint_invalid(
+            "payload issuer must be a non-empty str"
+        )
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _chain_checkpoint_invalid("payload keyVersion must be positive")
+    checkpoint_version = payload[VERSION]
+    if isinstance(checkpoint_version, bool) or not isinstance(
+        checkpoint_version, int
+    ):
+        raise TypeError("payload version must be an int")
+    if checkpoint_version != SUPERSEDE_VERSION:
+        raise _chain_checkpoint_invalid(
+            "payload version must be the integer 1"
+        )
+    if _checkpoint_compact(data) != raw:
+        raise _chain_checkpoint_invalid(
+            "encoding is not the canonical compact form"
+        )
+    return payload, signature
+
+
+def _checkpoint_prefix_matches(
+    checkpoint_view: dict, evidence: list[dict], require_extension: bool
+) -> None:
+    """A suffix's first hop must extend the checkpoint's evidence digests.
+
+    The checkpoint keeps only the ordered evidence certificate digests
+    (the certificates and rounds are pruned), so the prefix is compared
+    by digest: the bound evidence must cover the checkpoint prefix in
+    order, and an unchanged policy must still add at least one item.
+    """
+    digests = checkpoint_view["evidence_digests"]
+    if len(evidence) < len(digests):
+        raise _chain_invalid(
+            "the evidence sequence must have the checkpoint evidence as a "
+            "prefix"
+        )
+    for position, digest in enumerate(digests):
+        if hashlib.sha256(
+            evidence[position][FC_CERTIFICATE]
+        ).hexdigest() != digest:
+            raise _chain_invalid(
+                "the evidence sequence must have the checkpoint evidence as "
+                "a prefix; history must not be deleted, changed or reordered"
+            )
+    if require_extension and len(evidence) == len(digests):
+        raise _chain_invalid(
+            "an unchanged policy must add at least one evidence item"
+        )
+
+
+def verify_chain_suffix(
+    checkpoint: bytes,
+    successors: list,
+    policies: list,
+    decision: bytes,
+    policy: dict,
+    keyring: dict,
+    moment: int,
+) -> dict:
+    """Continue chain verification offline from a sealed checkpoint.
+
+    ``checkpoint`` is a :func:`seal_chain_checkpoint` packet; it is
+    checked structurally and its HMAC verified against the current
+    keyring (exact issuer/version, usable at ``moment``).
+    ``successors`` is the ordered list of successor packets past the
+    checkpoint head (possibly empty) and ``policies`` the per-stage
+    versioned policies, starting at the checkpoint head policy, so its
+    length is ``len(successors) + 1``.  ``decision``, ``policy``,
+    ``keyring`` and ``moment`` are the shared chain material.
+
+    An empty suffix simply returns the sealed stable head.  Otherwise
+    the first successor's predecessor digest must equal the checkpoint
+    head digest, its evidence prefix count and digests must match the
+    checkpoint evidence (history must not be deleted, changed or
+    reordered) and every hop then follows the exact
+    :func:`verify_decision_chain` root, plan, evidence-growth,
+    policy-version, effective-moment and state-machine rules; a policy
+    version regression is always rejected.
+
+    Returns a fresh mapping with exactly ``rootDigest``, ``headDigest``,
+    ``height``, ``policyVersion``, ``status`` and ``checkpointDigest``
+    (the SHA-256 of the checkpoint bytes).  A non-bytes argument or
+    wrong field type raises :class:`TypeError`; an empty value or a
+    policy count mismatch raises :class:`ValueError`; a bad checkpoint
+    or a stage policy that does not start at the checkpoint head policy
+    raises :class:`InvalidCheckpointError`; a bad successor raises
+    :class:`InvalidChainError`; a signature or credential fault raises
+    :class:`AuthenticationError`.  No file is read or written and no
+    input is modified.
+    """
+    if not isinstance(checkpoint, bytes):
+        raise TypeError("checkpoint must be bytes")
+    payload, signature = _parse_chain_checkpoint(checkpoint)
+    if not isinstance(successors, list):
+        raise TypeError("successors must be a list")
+    for index, successor in enumerate(successors):
+        if not isinstance(successor, bytes):
+            raise TypeError(f"successor {index} must be bytes")
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    validated_fork_policy = _validated_fork_policy(policy)
+    validated_policies = _validated_policy_sequence(policies)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    if len(validated_policies) != len(successors) + 1:
+        raise ValueError(
+            "policies must provide one entry per chain stage (one more "
+            "than the number of successors)"
+        )
+
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION],
+        verify_moment,
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "chain checkpoint signature does not match"
+        )
+
+    head_policy = validated_policies[0]
+    if _decision_policy_digest(head_policy) != payload[CD_POLICY_DIGEST]:
+        raise _chain_checkpoint_invalid(
+            "the stage policy sequence must start at the checkpoint head "
+            "policy"
+        )
+    if head_policy[DS_POLICY_VERSION] != payload[DS_POLICY_VERSION]:
+        raise _chain_checkpoint_invalid(
+            "the stage policy sequence must start at the checkpoint head "
+            "policy version"
+        )
+
+    checkpoint_digest = hashlib.sha256(checkpoint).hexdigest()
+    if not successors:
+        return {
+            DS_ROOT_DIGEST: payload[DS_ROOT_DIGEST],
+            DS_HEAD_DIGEST: payload[DS_HEAD_DIGEST],
+            DS_HEIGHT: payload[DS_HEIGHT],
+            DS_POLICY_VERSION: payload[DS_POLICY_VERSION],
+            STATUS: payload[STATUS],
+            DS_CHECKPOINT_DIGEST: checkpoint_digest,
+        }
+
+    view = {
+        "kind": "checkpoint",
+        DS_ROOT_DIGEST: payload[DS_ROOT_DIGEST],
+        DS_HEIGHT: payload[DS_HEIGHT],
+        STATUS: payload[STATUS],
+        CD_COMMON_DIGEST: payload[CD_COMMON_DIGEST],
+        "policy_digest": payload[CD_POLICY_DIGEST],
+        DS_POLICY_VERSION: payload[DS_POLICY_VERSION],
+        DS_EFFECTIVE_AT: payload[DS_EFFECTIVE_AT],
+        "evidence_digests": list(payload[DS_EVIDENCE]),
+    }
+    head_digest = payload[DS_HEAD_DIGEST]
+    for index, successor in enumerate(successors):
+        hop = _verify_chain_hop(
+            successor, view, head_digest, payload[DS_ROOT_DIGEST],
+            payload[CD_PLAN_DIGEST], decision, validated_fork_policy,
+            validated_policies[index], validated_policies[index + 1],
+            validated_keyring, verify_moment,
+        )
+        view = hop["view"]
+        head_digest = hashlib.sha256(successor).hexdigest()
+
+    return {
+        DS_ROOT_DIGEST: payload[DS_ROOT_DIGEST],
+        DS_HEAD_DIGEST: head_digest,
+        DS_HEIGHT: view[DS_HEIGHT],
+        DS_POLICY_VERSION: view[DS_POLICY_VERSION],
+        STATUS: view[STATUS],
+        DS_CHECKPOINT_DIGEST: checkpoint_digest,
+    }
+
+
+# -- Offline batch verification of chain suffixes ------------------------------
+
+def _validated_suffix_batch(items: object) -> list[dict]:
+    """Validate the suffix batch before any item is verified.
+
+    Each item holds exactly ``id`` (a non-empty str, unique across the
+    batch), ``checkpoint`` (bytes), ``successors`` (a list of bytes)
+    and ``policies`` (a non-empty list with exactly one entry per chain
+    stage).  Container/element/field type faults raise
+    :class:`TypeError`; an empty list, an empty or duplicate id, a
+    wrong key set or a policy count mismatch raises
+    :class:`ValueError`.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != {
+            ID, CHECKPOINT_ITEM_CHECKPOINT, DS_BATCH_SUCCESSORS,
+            DS_BATCH_POLICIES,
+        }:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'id', 'checkpoint', "
+                "'successors' and 'policies'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        checkpoint = item[CHECKPOINT_ITEM_CHECKPOINT]
+        if not isinstance(checkpoint, bytes):
+            raise TypeError(f"{where} checkpoint must be bytes")
+        successors = item[DS_BATCH_SUCCESSORS]
+        if not isinstance(successors, list):
+            raise TypeError(f"{where} successors must be a list")
+        for hop_index, successor in enumerate(successors):
+            if not isinstance(successor, bytes):
+                raise TypeError(
+                    f"{where} successor {hop_index} must be bytes"
+                )
+        policies = item[DS_BATCH_POLICIES]
+        if not isinstance(policies, list):
+            raise TypeError(f"{where} policies must be a list")
+        if not policies:
+            raise ValueError(f"{where} policies must be non-empty")
+        if len(policies) != len(successors) + 1:
+            raise ValueError(
+                f"{where} policies must provide one entry per chain stage "
+                "(one more than the number of successors)"
+            )
+        validated.append({
+            ID: item_id,
+            CHECKPOINT_ITEM_CHECKPOINT: checkpoint,
+            DS_BATCH_SUCCESSORS: list(successors),
+            DS_BATCH_POLICIES: list(policies),
+        })
+    return validated
+
+
+def _suffix_edge_nodes(item: dict) -> list[str]:
+    """The digest trajectory a suffix item walks: checkpoint then hops."""
+    payload, _signature = _parse_chain_checkpoint(
+        item[CHECKPOINT_ITEM_CHECKPOINT]
+    )
+    nodes = list(payload[DS_PACKETS])
+    for successor in item[DS_BATCH_SUCCESSORS]:
+        nodes.append(hashlib.sha256(successor).hexdigest())
+    return nodes
+
+
+def verify_chain_suffixes(
+    items: list, decision: bytes, policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify a batch of checkpoint continuations and spot forks.
+
+    Each item holds exactly a unique ``id``, its ``checkpoint`` bytes,
+    its ordered ``successors`` packets past the checkpoint head and its
+    per-stage ``policies`` sequence (one more than the successors).
+    The whole batch and the shared ``decision``/``policy``, keyring and
+    moment are validated before any item runs; only these batch-level
+    faults raise (container/element/field type faults
+    :class:`TypeError`; an empty list, an empty or duplicate id, a
+    wrong key set or a policy count mismatch :class:`ValueError`).
+
+    Each item is then verified independently, in strict input order,
+    through the exact :func:`verify_chain_suffix` rules: one item's
+    failure never stops a later item or changes an earlier report, and
+    each report keeps the deterministic text of the underlying error.
+    A checkpoint binding fault reports ``invalid-checkpoint``, a suffix
+    fault ``invalid-suffix``, a signature or credential fault
+    ``unauthenticated`` and a passing item ``verified``.
+
+    After verification, the same predecessor digest pointing at two
+    distinct successor packets across the verified trajectories (the
+    checkpoint's ordered packet digests followed by the suffix) is a
+    fork -- a mere prefix extension, the same chain growing longer, is
+    not.  Every verified item crossing a forking edge is reclassified
+    ``conflicted`` with its verified result kept; failed items are
+    never reclassified.
+
+    Returns a fresh dict with fixed keys ``items`` and ``version``
+    (the integer 1); each item report carries, in this key order,
+    ``error`` (null exactly when verified), ``id``, ``result`` (a fresh
+    copy of the suffix summary when verified, otherwise null) and
+    ``status``.  No file is read or written and no input is modified.
+    """
+    validated_items = _validated_suffix_batch(items)
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    _validated_fork_policy(policy)
+    _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+
+    reports: list[dict] = []
+    results: list[dict | None] = []
+    for item in validated_items:
+        item_id = item[ID]
+        try:
+            result = verify_chain_suffix(
+                item[CHECKPOINT_ITEM_CHECKPOINT], item[DS_BATCH_SUCCESSORS],
+                item[DS_BATCH_POLICIES], decision, policy, keyring,
+                verify_moment,
+            )
+        except AuthenticationError as exc:
+            reports.append(_decision_chain_item_report(
+                item_id, _DS_VERIFY_UNAUTHENTICATED, str(exc), None
+            ))
+            results.append(None)
+        except InvalidCheckpointError as exc:
+            reports.append(_decision_chain_item_report(
+                item_id, _DS_SUFFIX_INVALID_CHECKPOINT, str(exc), None
+            ))
+            results.append(None)
+        except (InvalidChainError, TypeError, ValueError) as exc:
+            # A TypeError here is a wrong field type inside a packet or
+            # policy; the public argument types were validated up front.
+            reports.append(_decision_chain_item_report(
+                item_id, _DS_SUFFIX_INVALID_SUFFIX, str(exc), None
+            ))
+            results.append(None)
+        else:
+            reports.append(_decision_chain_item_report(
+                item_id, _DS_VERIFY_VERIFIED, None, result
+            ))
+            results.append(result)
+
+    # Fork detection: one predecessor digest pointing at two distinct
+    # successor digests, ignoring items that did not verify.
+    children: dict[str, set[str]] = {}
+    for item, result in zip(validated_items, results):
+        if result is None:
+            continue
+        nodes = _suffix_edge_nodes(item)
+        for upstream, downstream in zip(nodes, nodes[1:]):
+            children.setdefault(upstream, set()).add(downstream)
+    fork_edges = {
+        upstream for upstream, digests in children.items()
+        if len(digests) > 1
+    }
+    if fork_edges:
+        for item, report, result in zip(validated_items, reports, results):
+            if result is None:
+                continue
+            nodes = _suffix_edge_nodes(item)
+            if any(upstream in fork_edges for upstream in nodes[:-1]):
+                report[STATUS] = _DS_CHAIN_CONFLICTED
+                report[CHECKPOINT_ITEM_ERROR] = _DS_CHAIN_ERROR
+
+    return {
+        ITEMS: reports,
+        VERSION: SUPERSEDE_VERSION,
     }
