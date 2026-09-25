@@ -622,7 +622,7 @@ import hmac
 import json
 import os
 import re
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 from offline_coordination import audit, merge, storage
 
@@ -12356,24 +12356,23 @@ def _reject_duplicate_fork_convergence_keys(pairs: list[tuple]) -> dict:
     return result
 
 
-def _validated_convergence_rounds(rounds: object) -> list[dict]:
-    """Validate the public round chain before any confirmation is checked.
+def _validated_convergence_round_shapes(rounds: object) -> list[dict]:
+    """Validate the public round-chain shape before any chain or proof work.
 
-    Each round carries exactly ``seq``, ``previous`` and ``confirmation``;
-    rounds are numbered consecutively from one, the first round binds no
-    previous confirmation and every later round binds the SHA-256 of the
-    previous round's confirmation bytes.  Container and field type faults
-    raise :class:`TypeError` (a :class:`bool` never poses as an int) and
-    an empty list, a wrong key set or an empty confirmation raises
-    :class:`ValueError`; a sequence gap, reordering, duplicate or broken
-    chain link raises :class:`InvalidForkConvergenceError`.
+    Each round carries exactly ``seq``, ``previous`` and
+    ``confirmation``; only the container and public field contract is
+    checked here (the sequence numbering and previous-confirmation
+    links are the chain contract of
+    :func:`_validated_convergence_rounds`).  Container and field type
+    faults raise :class:`TypeError` (a :class:`bool` never poses as an
+    int) and an empty list, a wrong key set or an empty confirmation
+    raises :class:`ValueError`.
     """
     if not isinstance(rounds, list):
         raise TypeError("rounds must be a list")
     if not rounds:
         raise ValueError("rounds must be a non-empty list")
     validated: list[dict] = []
-    previous_digest: str | None = None
     for position, entry in enumerate(rounds):
         where = f"round {position}"
         if not isinstance(entry, dict):
@@ -12386,11 +12385,6 @@ def _validated_convergence_rounds(rounds: object) -> list[dict]:
         seq = entry[FC_SEQ]
         if isinstance(seq, bool) or not isinstance(seq, int):
             raise TypeError(f"{where} seq must be an int")
-        if seq != position + 1:
-            raise _fork_convergence_invalid(
-                f"{where} seq must be {position + 1}: rounds are numbered "
-                "consecutively from one with no gap, reordering or duplicate"
-            )
         previous = entry[FE_PREVIOUS]
         if previous is not None and not isinstance(previous, str):
             raise TypeError(f"{where} previous must be a str or null")
@@ -12399,6 +12393,36 @@ def _validated_convergence_rounds(rounds: object) -> list[dict]:
             raise TypeError(f"{where} confirmation must be bytes")
         if not confirmation:
             raise ValueError(f"{where} confirmation must be non-empty")
+        validated.append({
+            FC_CONFIRMATION: confirmation,
+            FE_PREVIOUS: previous,
+            FC_SEQ: seq,
+        })
+    return validated
+
+
+def _validated_convergence_rounds(rounds: object) -> list[dict]:
+    """Validate the public round chain before any confirmation is checked.
+
+    The shape contract is validated first through
+    :func:`_validated_convergence_round_shapes`, then the chain
+    contract: rounds are numbered consecutively from one, the first
+    round binds no previous confirmation and every later round binds
+    the SHA-256 of the previous round's confirmation bytes.  A sequence
+    gap, reordering, duplicate or broken chain link raises
+    :class:`InvalidForkConvergenceError`.
+    """
+    validated = _validated_convergence_round_shapes(rounds)
+    previous_digest: str | None = None
+    for position, entry in enumerate(validated):
+        where = f"round {position}"
+        seq = entry[FC_SEQ]
+        if seq != position + 1:
+            raise _fork_convergence_invalid(
+                f"{where} seq must be {position + 1}: rounds are numbered "
+                "consecutively from one with no gap, reordering or duplicate"
+            )
+        previous = entry[FE_PREVIOUS]
         if position == 0:
             if previous is not None:
                 raise _fork_convergence_invalid(
@@ -12408,12 +12432,7 @@ def _validated_convergence_rounds(rounds: object) -> list[dict]:
             raise _fork_convergence_invalid(
                 f"{where} does not chain to the previous confirmation digest"
             )
-        previous_digest = hashlib.sha256(confirmation).hexdigest()
-        validated.append({
-            FC_CONFIRMATION: confirmation,
-            FE_PREVIOUS: previous,
-            FC_SEQ: seq,
-        })
+        previous_digest = hashlib.sha256(entry[FC_CONFIRMATION]).hexdigest()
     return validated
 
 
@@ -12834,17 +12853,25 @@ def _parse_fork_convergence_certificate(raw: object) -> tuple[dict, str]:
     return payload, signature
 
 
-def _verify_fork_convergence(
-    certificate: bytes,
+def _reverified_convergence_certificate(
+    payload: dict,
     validated_rounds: list[dict],
     validated_policy: dict,
     validated_keyring: dict[str, list[dict]],
     decision: bytes,
     moment: int,
-) -> dict:
-    """Verify one convergence certificate against validated materials."""
-    payload, signature = _parse_fork_convergence_certificate(certificate)
+) -> tuple[str, list[dict], str, list[str]]:
+    """Re-check one parsed certificate's content against its round chain.
 
+    This is every binding except the certificate HMAC, shared by
+    :func:`_verify_fork_convergence` and the multi-site convergence
+    adjudication: the decision digest binding, the certification
+    moment, the re-converged plan digest, per-operation results and
+    overall status, and the bound round digests.  Returns
+    ``(plan_digest, results, status, round_digests)``.  A bad
+    confirmation raises :class:`InvalidForkExecutionError`; every other
+    content fault raises :class:`InvalidForkConvergenceError`.
+    """
     if payload[FE_DECISION_DIGEST] != hashlib.sha256(decision).hexdigest():
         raise _fork_convergence_invalid(
             "certificate is bound to a different fork decision"
@@ -12860,14 +12887,34 @@ def _verify_fork_convergence(
         validated_rounds, validated_policy, validated_keyring, decision,
         certified_at,
     )
-    if payload[FE_PLAN_DIGEST] != plan_digest:
-        raise _fork_convergence_invalid(
-            "certificate plan digest does not match the converged rounds"
-        )
     round_digests = [
         hashlib.sha256(entry[FC_CONFIRMATION]).hexdigest()
         for entry in validated_rounds
     ]
+    return plan_digest, results, status, round_digests
+
+
+def _verify_fork_convergence(
+    certificate: bytes,
+    validated_rounds: list[dict],
+    validated_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    decision: bytes,
+    moment: int,
+) -> dict:
+    """Verify one convergence certificate against validated materials."""
+    payload, signature = _parse_fork_convergence_certificate(certificate)
+
+    (
+        plan_digest, results, status, round_digests
+    ) = _reverified_convergence_certificate(
+        payload, validated_rounds, validated_policy, validated_keyring,
+        decision, moment,
+    )
+    if payload[FE_PLAN_DIGEST] != plan_digest:
+        raise _fork_convergence_invalid(
+            "certificate plan digest does not match the converged rounds"
+        )
     if payload[FC_ROUNDS] != round_digests:
         raise _fork_convergence_invalid(
             "certificate round digests do not match the offered rounds"
@@ -12900,7 +12947,7 @@ def _verify_fork_convergence(
     return {
         key: value
         for key, value in (
-            (FC_CERTIFIED_AT, certified_at),
+            (FC_CERTIFIED_AT, payload[FC_CERTIFIED_AT]),
             (FC_CERTIFICATE_DIGEST,
              hashlib.sha256(certificate).hexdigest()),
             (FE_DECISION_DIGEST, payload[FE_DECISION_DIGEST]),
@@ -12971,7 +13018,18 @@ def verify_fork_convergence(
 
 
 def _validated_convergence_items(items: object) -> list[dict]:
-    """Validate the certificate batch before any item is verified."""
+    """Validate the whole certificate batch before any item is verified.
+
+    Every item's complete round chain is shape-validated here as well
+    as the item container, so the key sets, field types, non-bool
+    sequence numbers, confirmation packet bytes and non-empty round
+    lists of *all* items are checked before any certificate is
+    verified: a nested round fault rejects the whole batch
+    (container/field type faults :class:`TypeError`; an empty list, an
+    empty or duplicate id, a wrong item or round key set or an empty
+    round or confirmation :class:`ValueError`).  Only the round chain
+    links and the certificates themselves are examined per item later.
+    """
     if not isinstance(items, list):
         raise TypeError("items must be a list")
     if not items:
@@ -12999,14 +13057,13 @@ def _validated_convergence_items(items: object) -> list[dict]:
         if not isinstance(certificate, bytes):
             raise TypeError(f"{where} certificate must be bytes")
         rounds = item[FC_ROUNDS]
-        if not isinstance(rounds, list):
-            raise TypeError(f"{where} rounds must be a list")
-        if not rounds:
-            raise ValueError(f"{where} rounds must be a non-empty list")
+        # Shape-check every round of every item before any certificate
+        # is verified; only the chain links remain a per-item concern.
+        validated_rounds = _validated_convergence_round_shapes(rounds)
         validated.append({
             FC_CERTIFICATE: certificate,
             ID: item_id,
-            FC_ROUNDS: rounds,
+            FC_ROUNDS: validated_rounds,
         })
     return validated
 
@@ -13063,13 +13120,17 @@ def verify_fork_convergences(
 
     ``items`` is a non-empty list; each item contains exactly a
     non-empty, batch-unique ``id``, the ``certificate`` bytes and the
-    item's non-empty ``rounds`` chain.  The batch and the shared
+    item's non-empty ``rounds`` chain.  The batch -- including every
+    round chain's key sets, field types, non-bool sequence numbers and
+    non-empty confirmation bytes for *all* items -- and the shared
     ``decision``, ``policy``, ``keyring`` and ``moment`` are validated
     in full before any certificate is verified, so only a batch-level
     fault raises (container, element or field type faults
     :class:`TypeError`; an empty list, an empty or duplicate id, a
-    wrong item key set or an empty round list :class:`ValueError`).
-    Each certificate is then handled independently, in strict input
+    wrong item or round key set or an empty round list or confirmation
+    :class:`ValueError`).  Only the round-chain links and the
+    certificate itself remain a per-item concern.  Each certificate is
+    then handled independently, in strict input
     order, through the exact :func:`verify_fork_convergence` rules: one
     item's failure never stops a later item or changes an earlier
     report.  A bad confirmation, an illegal certificate, a broken round
@@ -13102,4 +13163,1345 @@ def verify_fork_convergences(
             for item in validated_items
         ],
         VERSION: FORK_CONVERGENCE_VERSION,
+    }
+
+
+# --- Multi-site offline adjudication of fork convergence certificates ---------
+
+CONVERGENCE_DECISION_VERSION = 1
+
+CD_SITES = ADJ_SITES
+CD_THRESHOLD = ADJ_THRESHOLD
+CD_CONCLUSION = ADJ_CONCLUSION
+CD_DECISION_DIGEST = FE_DECISION_DIGEST
+CD_POLICY_DIGEST = FD_POLICY_DIGEST
+CD_PLAN_DIGEST = FE_PLAN_DIGEST
+CD_CERTIFICATES = "certificates"
+CD_CERTIFICATE_DIGEST = FC_CERTIFICATE_DIGEST
+CD_PACKET_DIGEST = "convergenceDecisionDigest"
+CD_COMMON = "common"
+CD_COMMON_DIGEST = "commonDigest"
+CD_CONVERGENCE = "convergence"
+CD_RESULTS = FE_RESULTS
+
+CD_STATUS_ACCEPTED = ADJ_STATUS_ACCEPTED
+CD_STATUS_CONFLICTED = ADJ_STATUS_CONFLICTED
+CD_STATUS_INSUFFICIENT = ADJ_STATUS_INSUFFICIENT
+_CD_STATUSES = frozenset((
+    CD_STATUS_ACCEPTED,
+    CD_STATUS_CONFLICTED,
+    CD_STATUS_INSUFFICIENT,
+))
+
+CD_CONCLUSION_VALID = ADJ_CONCLUSION_VALID
+CD_CONCLUSION_INVALID = ADJ_CONCLUSION_INVALID
+CD_CONCLUSION_DUPLICATE = ADJ_CONCLUSION_DUPLICATE
+CD_CONCLUSION_CONTRADICTION = ADJ_CONCLUSION_CONTRADICTION
+_CD_CONCLUSIONS = frozenset((
+    CD_CONCLUSION_VALID,
+    CD_CONCLUSION_INVALID,
+    CD_CONCLUSION_DUPLICATE,
+    CD_CONCLUSION_CONTRADICTION,
+))
+CD_REASON_INVALID_CERTIFICATE = "invalid-proof"
+_CD_INVALID_REASONS = frozenset((
+    CD_REASON_INVALID_CERTIFICATE,
+    REASON_UNAUTHORIZED_SITE,
+    REASON_UNAUTHORIZED_VERSION,
+    REASON_CREDENTIAL_UNAVAILABLE,
+    REASON_REVOKED,
+    REASON_NOT_YET_VALID,
+    REASON_EXPIRED,
+    REASON_BAD_SIGNATURE,
+))
+_CD_REASONS = _CD_INVALID_REASONS | frozenset((
+    REASON_DUPLICATE,
+    REASON_CONTRADICTION,
+))
+
+_CD_POLICY_KEYS = frozenset((CD_SITES, CD_THRESHOLD))
+_CD_ITEM_KEYS = frozenset((FC_CERTIFICATE, ID, FC_ROUNDS))
+_CD_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_CD_PAYLOAD_KEYS = frozenset((
+    CD_CERTIFICATES,
+    CD_COMMON,
+    CD_COMMON_DIGEST,
+    CD_DECISION_DIGEST,
+    VD_ISSUER,
+    ITEMS,
+    KEY_VERSION,
+    CD_PLAN_DIGEST,
+    CD_POLICY_DIGEST,
+    STATUS,
+    VERSION,
+))
+_CD_ROW_KEYS = frozenset((
+    CD_CERTIFICATE_DIGEST,
+    CD_CONCLUSION,
+    CD_CONVERGENCE,
+    ID,
+    KEY_VERSION,
+    ADJ_REASON,
+    ADJ_SITE,
+))
+_CD_CONVERGENCE_KEYS = frozenset((CD_PLAN_DIGEST, CD_RESULTS, STATUS))
+_CD_BATCH_ITEM_KEYS = frozenset((ID, "decision"))
+_CD_VERIFY_VERIFIED = "verified"
+_CD_VERIFY_INVALID = "invalid"
+_CD_VERIFY_UNAUTHENTICATED = "unauthenticated"
+_CD_RESULT_KEYS = (
+    CD_CERTIFICATES,
+    CD_COMMON,
+    CD_COMMON_DIGEST,
+    CD_PACKET_DIGEST,
+    CD_DECISION_DIGEST,
+    VD_ISSUER,
+    ITEMS,
+    KEY_VERSION,
+    CD_PLAN_DIGEST,
+    CD_POLICY_DIGEST,
+    STATUS,
+    VERSION,
+)
+
+
+class InvalidConvergenceDecisionError(ValueError):
+    """A signed convergence decision fails its canonical or binding contract."""
+
+
+def _convergence_decision_invalid(message: str) -> InvalidConvergenceDecisionError:
+    return InvalidConvergenceDecisionError(
+        f"invalid convergence decision: {message}"
+    )
+
+
+def _reject_duplicate_convergence_decision_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate decision keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _convergence_decision_invalid(
+                f"duplicate key {key!r} in object"
+            )
+        result[key] = value
+    return result
+
+
+def _validated_convergence_site_policy(policy: object) -> dict:
+    """Validate the convergence site policy into a fresh normalized dict.
+
+    The policy carries exactly ``sites`` and ``threshold``: a non-empty
+    mapping of each authorized non-empty signing site to its non-empty
+    set of allowed positive key versions, and a positive threshold no
+    greater than the number of sites.  Type faults raise
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    key-set or value fault raises :class:`ValueError`.
+    """
+    if not isinstance(policy, dict):
+        raise TypeError("site policy must be a dict")
+    if set(policy.keys()) != _CD_POLICY_KEYS:
+        raise ValueError(
+            "site policy must contain exactly the keys 'sites' and "
+            "'threshold'"
+        )
+    threshold = policy[CD_THRESHOLD]
+    if isinstance(threshold, bool) or not isinstance(threshold, int):
+        raise TypeError("site policy threshold must be an int")
+    if threshold <= 0:
+        raise ValueError("site policy threshold must be a positive integer")
+    sites = policy[CD_SITES]
+    if not isinstance(sites, dict):
+        raise TypeError("site policy sites must be a dict")
+    if not sites:
+        raise ValueError("site policy sites must be non-empty")
+    allowed: dict[str, frozenset[int]] = {}
+    for site, versions in sites.items():
+        if not isinstance(site, str):
+            raise TypeError("site policy site names must be str")
+        if site == "":
+            raise ValueError("site policy site names must be non-empty")
+        if not isinstance(versions, set):
+            raise TypeError(
+                f"allowed versions for site {site!r} must be a set"
+            )
+        site_versions: set[int] = set()
+        for key_version in versions:
+            if isinstance(key_version, bool) or not isinstance(
+                key_version, int
+            ):
+                raise TypeError(
+                    f"allowed versions for site {site!r} must be ints"
+                )
+            if key_version <= 0:
+                raise ValueError(
+                    f"allowed versions for site {site!r} must be positive"
+                )
+            site_versions.add(key_version)
+        if not site_versions:
+            raise ValueError(
+                f"site {site!r} must allow at least one key version"
+            )
+        allowed[site] = frozenset(site_versions)
+    if threshold > len(allowed):
+        raise ValueError(
+            "site policy threshold must not exceed the number of policy sites"
+        )
+    return {CD_SITES: allowed, CD_THRESHOLD: threshold}
+
+
+def _convergence_site_policy_bytes(policy: dict) -> bytes:
+    """Canonical compact bytes of the normalized convergence site policy.
+
+    Sites are listed ascending with ascending version arrays and every
+    key is recursively sorted.
+    """
+    return _checkpoint_compact({
+        CD_SITES: {
+            site: sorted(policy[CD_SITES][site])
+            for site in sorted(policy[CD_SITES])
+        },
+        CD_THRESHOLD: policy[CD_THRESHOLD],
+    })
+
+
+def _validated_convergence_result_rows(
+    rows: object, invalid: Callable[[str], Exception]
+) -> list[dict]:
+    """Validate the bound per-operation convergence rows.
+
+    Each row carries exactly ``operationId``, ``postDigest``,
+    ``result``, ``settledRound`` and ``target`` with the same contract
+    as a fork convergence certificate row.  Field type faults raise
+    :class:`TypeError`; ``invalid`` builds the structural error for
+    every other fault.
+    """
+    if not isinstance(rows, list):
+        raise TypeError("convergence results must be a list")
+    if not rows:
+        raise invalid("convergence results must be non-empty")
+    validated: list[dict] = []
+    for position, row in enumerate(rows):
+        where = f"convergence result {position}"
+        if not isinstance(row, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(row.keys()) != _FC_RESULT_ROW_KEYS:
+            raise invalid(
+                f"{where} must contain exactly the keys 'operationId', "
+                "'postDigest', 'result', 'settledRound' and 'target'"
+            )
+        operation_id = row[FE_OPERATION_ID]
+        if not isinstance(operation_id, str):
+            raise TypeError(f"{where} operationId must be a str")
+        if not _is_digest(operation_id):
+            raise invalid(
+                f"{where} operationId must be 64 lowercase hex characters"
+            )
+        result = row[FE_RESULT]
+        if not isinstance(result, str):
+            raise TypeError(f"{where} result must be a str")
+        if result not in _FC_RESULT_VALUES:
+            raise invalid(f"{where} result is not known")
+        post_digest = row[FE_POST_DIGEST]
+        if post_digest is not None:
+            if not isinstance(post_digest, str):
+                raise TypeError(f"{where} postDigest must be a str or null")
+            if not _is_digest(post_digest):
+                raise invalid(
+                    f"{where} postDigest must be 64 lowercase hex characters"
+                )
+        settled_round = row[FC_SETTLED_ROUND]
+        if settled_round is not None:
+            if isinstance(settled_round, bool) or not isinstance(
+                settled_round, int
+            ):
+                raise TypeError(f"{where} settledRound must be an int or null")
+            if settled_round <= 0:
+                raise invalid(f"{where} settledRound must be positive")
+        target = row[FE_TARGET]
+        if not isinstance(target, str):
+            raise TypeError(f"{where} target must be a str")
+        if target == "":
+            raise invalid(f"{where} target must be non-empty")
+        if result == FE_RESULT_EXECUTED:
+            if post_digest is None or settled_round is None:
+                raise invalid(
+                    f"{where}: an executed result binds its post-state "
+                    "digest and settled round"
+                )
+        elif result == FE_RESULT_FAILED:
+            if post_digest is not None or settled_round is not None:
+                raise invalid(
+                    f"{where}: an unconverged result binds no post-state "
+                    "digest or settled round"
+                )
+        elif settled_round is None:
+            raise invalid(
+                f"{where}: a settled or conflicted result binds its "
+                "settled round"
+            )
+        validated.append({
+            FE_OPERATION_ID: operation_id,
+            FE_POST_DIGEST: post_digest,
+            FE_RESULT: result,
+            FC_SETTLED_ROUND: settled_round,
+            FE_TARGET: target,
+        })
+    return validated
+
+
+def _convergence_content(
+    plan_digest: str, results: list[dict], status: str
+) -> dict:
+    """The complete convergence result two sites must share to agree."""
+    return {
+        CD_PLAN_DIGEST: plan_digest,
+        CD_RESULTS: copy.deepcopy(results),
+        STATUS: status,
+    }
+
+
+def _convergence_decision_row(
+    item_id: str,
+    certificate_digest: str,
+    site: str | None,
+    key_version: int | None,
+    convergence: dict | None,
+    conclusion: str,
+    reason: str | None,
+) -> dict:
+    """One per-certificate decision row with the fixed bound key set."""
+    return {
+        CD_CERTIFICATE_DIGEST: certificate_digest,
+        CD_CONCLUSION: conclusion,
+        CD_CONVERGENCE: convergence,
+        ID: item_id,
+        KEY_VERSION: key_version,
+        ADJ_REASON: reason,
+        ADJ_SITE: site,
+    }
+
+
+def _adjudicate_convergence_one(
+    item: dict,
+    decision: bytes,
+    validated_policy: dict,
+    site_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Review, authorize and authenticate one convergence certificate.
+
+    The certificate is first re-checked through the exact
+    single-certificate content rules (structural parsing, the decision
+    and certification-moment bindings and a full re-convergence of its
+    rounds) without checking its own HMAC; the signing site and key
+    version are then authorized exactly against the site policy, the
+    credential is located in the current keyring with no fallback and
+    the certificate HMAC is checked last.  Any failure rejects just
+    this row with one fixed fork-adjudication reason.
+    """
+    item_id = item[ID]
+    raw_certificate = item[FC_CERTIFICATE]
+    certificate_digest = hashlib.sha256(raw_certificate).hexdigest()
+
+    def structural_invalid() -> dict:
+        return _convergence_decision_row(
+            item_id, certificate_digest, None, None, None,
+            CD_CONCLUSION_INVALID, CD_REASON_INVALID_CERTIFICATE,
+        )
+
+    try:
+        validated_rounds = _validated_convergence_rounds(item[FC_ROUNDS])
+        payload, signature = _parse_fork_convergence_certificate(
+            raw_certificate
+        )
+        site = payload[FE_ISSUER]
+        key_version = payload[KEY_VERSION]
+        (
+            plan_digest, results, status, round_digests
+        ) = _reverified_convergence_certificate(
+            payload, validated_rounds, validated_policy, validated_keyring,
+            decision, moment,
+        )
+        if payload[FE_PLAN_DIGEST] != plan_digest:
+            raise _fork_convergence_invalid(
+                "certificate plan digest does not match the converged rounds"
+            )
+        if payload[FC_ROUNDS] != round_digests:
+            raise _fork_convergence_invalid(
+                "certificate round digests do not match the offered rounds"
+            )
+        if payload[FE_RESULTS] != results:
+            raise _fork_convergence_invalid(
+                "certificate results do not match the re-converged rounds"
+            )
+        if payload[STATUS] != status:
+            raise _fork_convergence_invalid(
+                "certificate status does not match the re-converged rounds"
+            )
+    except AuthenticationError:
+        # A credential named inside the round chain is evidence the
+        # certificate cannot independently review; the certificate is
+        # rejected structurally without claiming a signing identity.
+        return structural_invalid()
+    except (TypeError, ValueError):
+        return structural_invalid()
+
+    convergence = _convergence_content(plan_digest, results, status)
+
+    def reject(reason: str) -> dict:
+        return _convergence_decision_row(
+            item_id, certificate_digest, site, key_version,
+            copy.deepcopy(convergence), CD_CONCLUSION_INVALID, reason,
+        )
+
+    allowed_versions = site_policy[CD_SITES].get(site)
+    if allowed_versions is None:
+        return reject(REASON_UNAUTHORIZED_SITE)
+    if key_version not in allowed_versions:
+        return reject(REASON_UNAUTHORIZED_VERSION)
+
+    entry = None
+    for candidate in validated_keyring.get(site, ()):
+        if candidate[VERSION] == key_version:
+            entry = candidate
+            break
+    if entry is None:
+        return reject(REASON_CREDENTIAL_UNAVAILABLE)
+    if entry[REVOKED]:
+        return reject(REASON_REVOKED)
+    if moment < entry[NOT_BEFORE]:
+        return reject(REASON_NOT_YET_VALID)
+    if moment > entry[NOT_AFTER]:
+        return reject(REASON_EXPIRED)
+
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _fc_certificate_payload_bytes(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        return reject(REASON_BAD_SIGNATURE)
+
+    return _convergence_decision_row(
+        item_id, certificate_digest, site, key_version,
+        copy.deepcopy(convergence), CD_CONCLUSION_VALID, None,
+    )
+
+
+def _convergence_content_key(convergence: dict) -> str:
+    """Canonical text identifying one complete convergence result."""
+    return _checkpoint_compact(convergence).decode("utf-8")
+
+
+def _tally_convergence_rows(
+    rows: list[dict],
+) -> tuple[bool, dict[str, dict]]:
+    """Group authenticated rows per site by their convergence result.
+
+    Returns ``(contradicted, votes)`` where ``votes`` maps each
+    non-contradicting site to its one complete convergence result.
+    Same-site certificates are duplicates only when their complete
+    convergence results agree field for field (regardless of the
+    certificate bytes); any two distinct results from one site are a
+    self-contradiction and that site casts no vote.  Row conclusions
+    and reasons are assigned in place.
+    """
+    by_site: dict[str, list[dict]] = {}
+    for row in rows:
+        if row[CD_CONCLUSION] in (
+            CD_CONCLUSION_VALID,
+            CD_CONCLUSION_DUPLICATE,
+            CD_CONCLUSION_CONTRADICTION,
+        ):
+            by_site.setdefault(row[ADJ_SITE], []).append(row)
+
+    contradicted = False
+    votes: dict[str, dict] = {}
+    for site, site_rows in by_site.items():
+        groups: dict[str, list[dict]] = {}
+        for row in site_rows:
+            groups.setdefault(
+                _convergence_content_key(row[CD_CONVERGENCE]), []
+            ).append(row)
+        if len(groups) > 1:
+            contradicted = True
+            for _content, members_raw in groups.items():
+                members = sorted(members_raw, key=lambda row: row[ID])
+                members[0][CD_CONCLUSION] = CD_CONCLUSION_CONTRADICTION
+                members[0][ADJ_REASON] = REASON_CONTRADICTION
+                for extra in members[1:]:
+                    extra[CD_CONCLUSION] = CD_CONCLUSION_DUPLICATE
+                    extra[ADJ_REASON] = REASON_DUPLICATE
+        else:
+            members = sorted(
+                next(iter(groups.values())), key=lambda row: row[ID]
+            )
+            members[0][CD_CONCLUSION] = CD_CONCLUSION_VALID
+            members[0][ADJ_REASON] = None
+            for extra in members[1:]:
+                extra[CD_CONCLUSION] = CD_CONCLUSION_DUPLICATE
+                extra[ADJ_REASON] = REASON_DUPLICATE
+            votes[site] = members[0][CD_CONVERGENCE]
+    return contradicted, votes
+
+
+def adjudicate_convergence(
+    items: list,
+    decision: bytes,
+    policy: dict,
+    site_policy: dict,
+    keyring: dict,
+    moment: int,
+    issuer: str,
+    version: int,
+) -> bytes:
+    """Adjudicate multi-site fork convergence certificates offline.
+
+    ``items`` is a non-empty list; each item contains exactly a
+    non-empty, batch-unique ``id``, the ``certificate`` bytes and the
+    item's non-empty ``rounds`` chain.  ``decision`` is the original
+    accepted fork decision bytes and ``policy``/``keyring`` the shared
+    fork materials used by the existing single-certificate rules.
+    ``site_policy`` carries exactly ``sites`` (a non-empty mapping of
+    each authorized non-empty signing site to its non-empty set of
+    allowed positive key versions) and ``threshold`` (a positive
+    integer no greater than the site count); ``moment`` is the current
+    non-negative time and ``issuer``/``version`` name the adjudicator
+    signing key.  No file is read or written and no input is modified.
+
+    The item batch (including every round chain's key sets, field
+    types, non-bool sequence numbers and confirmation packet bytes),
+    the shared materials and the site policy are validated in full
+    before any certificate is reviewed: a nested type fault raises
+    :class:`TypeError` (a :class:`bool` never poses as an int) and an
+    empty round list or confirmation, a duplicate id or an illegal
+    policy, threshold, moment, issuer or version raises
+    :class:`ValueError`.
+
+    Each certificate is then handled independently through the exact
+    single-certificate content rules, authorized by the exact signing
+    site and key version against the site policy with no fallback, and
+    authenticated against the current keyring.  An invalid
+    certificate, unavailable/revoked/not-yet-valid/expired credential,
+    unauthorized site or version or wrong signature rejects only that
+    item with the fixed fork-adjudication reason (``invalid-proof``,
+    ``unauthorized-site``, ``unauthorized-version``,
+    ``credential-unavailable``, ``revoked``, ``not-yet-valid``,
+    ``expired`` or ``bad-signature``) and never stops a later item.
+    For one site an identical complete convergence result -- the plan
+    digest, overall status and every operation's result, settled round
+    and post-state digest -- counts once and every extra certificate
+    is a ``duplicate``; distinct complete results are a
+    ``contradiction``.  Distinct sites must agree on the same complete
+    convergence result; any self-contradiction or cross-site
+    disagreement is ``conflicted`` with the common result null and can
+    never be outvoted.  A unique result attested by at least the
+    threshold of distinct sites is ``accepted`` and keeps the complete
+    convergence result; every other outcome is ``insufficient``.
+
+    The result is one canonical compact UTF-8 JSON object with
+    recursively sorted keys, non-ASCII preserved and no trailing byte,
+    carrying exactly ``payload`` and ``signature``.  The payload binds
+    exactly ``certificates`` (each certificate digest in the original
+    input order), ``common`` (the complete shared convergence result,
+    null unless accepted) and ``commonDigest`` (its SHA-256, null
+    unless accepted), ``issuer``, ``keyVersion``, the per-certificate
+    ``items`` (sorted by site then id, each carrying its
+    ``certificateDigest``, ``convergence``, ``conclusion``, ``id``,
+    ``keyVersion``, ``reason`` and ``site``), ``planDigest`` (the one
+    plan digest shared by the counted sites, otherwise null),
+    ``policyDigest`` (the SHA-256 of the canonical site policy),
+    ``status`` and ``version`` (the integer 1); the signature is the
+    lowercase hex HMAC-SHA256 of the canonical compact payload bytes
+    under the key bound to the exact adjudicator issuer and version
+    with no fallback.  Unknown, revoked, not-yet-valid or expired
+    adjudicator credentials raise :class:`AuthenticationError`.
+    """
+    validated_items = _validated_convergence_items(items)
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    validated_policy = _validated_fork_policy(policy)
+    validated_site_policy = _validated_convergence_site_policy(site_policy)
+    validated_keyring = _validated_keyring(keyring)
+    adjudicate_moment = _fe_moment(moment, "moment")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+
+    certificate_digests = [
+        hashlib.sha256(item[FC_CERTIFICATE]).hexdigest()
+        for item in validated_items
+    ]
+    rows = [
+        _adjudicate_convergence_one(
+            item, decision, validated_policy, validated_site_policy,
+            validated_keyring, adjudicate_moment,
+        )
+        for item in validated_items
+    ]
+
+    contradicted, votes = _tally_convergence_rows(rows)
+
+    contents = {
+        _convergence_content_key(convergence): convergence
+        for convergence in votes.values()
+    }
+
+    if contradicted or len(contents) > 1:
+        status = CD_STATUS_CONFLICTED
+    elif len(contents) == 1 and len(votes) >= validated_site_policy[
+        CD_THRESHOLD
+    ]:
+        status = CD_STATUS_ACCEPTED
+    else:
+        status = CD_STATUS_INSUFFICIENT
+
+    if status == CD_STATUS_ACCEPTED:
+        common = copy.deepcopy(next(iter(contents.values())))
+        common_digest = hashlib.sha256(
+            _checkpoint_compact(common)
+        ).hexdigest()
+        bound_plan_digest = common[CD_PLAN_DIGEST]
+    else:
+        common = None
+        common_digest = None
+        bound_plan_digest = None
+
+    rows.sort(
+        key=lambda row: (
+            row[ADJ_SITE] is not None,
+            row[ADJ_SITE] or "",
+            row[ID],
+        )
+    )
+
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, adjudicate_moment
+    )
+    payload = {
+        CD_CERTIFICATES: certificate_digests,
+        CD_COMMON: common,
+        CD_COMMON_DIGEST: common_digest,
+        CD_DECISION_DIGEST: hashlib.sha256(decision).hexdigest(),
+        VD_ISSUER: issuer,
+        ITEMS: [copy.deepcopy(row) for row in rows],
+        KEY_VERSION: version,
+        CD_PLAN_DIGEST: bound_plan_digest,
+        CD_POLICY_DIGEST: hashlib.sha256(
+            _convergence_site_policy_bytes(validated_site_policy)
+        ).hexdigest(),
+        STATUS: status,
+        VERSION: CONVERGENCE_DECISION_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _checkpoint_compact(
+        {TICKET_PAYLOAD: payload, SIGNATURE: signature}
+    )
+
+
+def _parse_convergence_decision(raw: object) -> tuple[dict, str]:
+    """Validate convergence decision bytes into ``(payload, signature)``.
+
+    A non-bytes argument or a field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, digest, ordering or shape fault raises
+    :class:`InvalidConvergenceDecisionError`.  The policy, tally and
+    credential bindings are checked by
+    :func:`verify_convergence_decision`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("decision must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _convergence_decision_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _convergence_decision_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_convergence_decision_keys,
+        )
+    except json.JSONDecodeError as exc:
+        raise _convergence_decision_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("decision must be a JSON object")
+    if set(data.keys()) != _CD_TOP_KEYS:
+        raise _convergence_decision_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("decision signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
+        raise _convergence_decision_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("decision payload must be an object")
+    if set(payload.keys()) != _CD_PAYLOAD_KEYS:
+        raise _convergence_decision_invalid(
+            "payload must contain exactly the keys 'certificates', 'common', "
+            "'commonDigest', 'decisionDigest', 'issuer', 'items', "
+            "'keyVersion', 'planDigest', 'policyDigest', 'status' and "
+            "'version'"
+        )
+
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("payload issuer must be a str")
+    if issuer == "":
+        raise _convergence_decision_invalid(
+            "payload issuer must be a non-empty str"
+        )
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _convergence_decision_invalid(
+            "payload keyVersion must be positive"
+        )
+    policy_digest = payload[CD_POLICY_DIGEST]
+    if not isinstance(policy_digest, str):
+        raise TypeError("payload policyDigest must be a str")
+    if not _is_digest(policy_digest):
+        raise _convergence_decision_invalid(
+            "payload policyDigest must be 64 lowercase hex characters"
+        )
+    decision_digest = payload[CD_DECISION_DIGEST]
+    if not isinstance(decision_digest, str):
+        raise TypeError("payload decisionDigest must be a str")
+    if not _is_digest(decision_digest):
+        raise _convergence_decision_invalid(
+            "payload decisionDigest must be 64 lowercase hex characters"
+        )
+    plan_digest = payload[CD_PLAN_DIGEST]
+    if plan_digest is not None:
+        if not isinstance(plan_digest, str):
+            raise TypeError("payload planDigest must be a str or null")
+        if not _is_digest(plan_digest):
+            raise _convergence_decision_invalid(
+                "payload planDigest must be 64 lowercase hex characters"
+            )
+    status = payload[STATUS]
+    if not isinstance(status, str):
+        raise TypeError("payload status must be a str")
+    if status not in _CD_STATUSES:
+        raise _convergence_decision_invalid("payload status is not known")
+    version = payload[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("payload version must be an int")
+    if version != CONVERGENCE_DECISION_VERSION:
+        raise _convergence_decision_invalid(
+            "payload version must be the integer 1"
+        )
+
+    certificates = payload[CD_CERTIFICATES]
+    if not isinstance(certificates, list):
+        raise TypeError("payload certificates must be a list")
+    if not certificates:
+        raise _convergence_decision_invalid(
+            "payload certificates must be non-empty"
+        )
+    for position, digest in enumerate(certificates):
+        if not isinstance(digest, str):
+            raise TypeError(
+                f"payload certificate {position} digest must be a str"
+            )
+        if not _is_digest(digest):
+            raise _convergence_decision_invalid(
+                f"payload certificate {position} digest must be 64 lowercase "
+                "hex characters"
+            )
+
+    common = payload[CD_COMMON]
+    common_digest = payload[CD_COMMON_DIGEST]
+    if common is None:
+        if common_digest is not None:
+            if not isinstance(common_digest, str):
+                raise TypeError(
+                    "payload commonDigest must be a str or null"
+                )
+            raise _convergence_decision_invalid(
+                "a null common result binds no common digest"
+            )
+    else:
+        common = _validated_bound_convergence(common, "payload common")
+        if not isinstance(common_digest, str):
+            raise TypeError("payload commonDigest must be a str")
+        if not _is_digest(common_digest):
+            raise _convergence_decision_invalid(
+                "payload commonDigest must be 64 lowercase hex characters"
+            )
+        expected_common_digest = hashlib.sha256(
+            _checkpoint_compact(common)
+        ).hexdigest()
+        if common_digest != expected_common_digest:
+            raise _convergence_decision_invalid(
+                "payload commonDigest does not match the common result"
+            )
+    if status == CD_STATUS_ACCEPTED:
+        if common is None:
+            raise _convergence_decision_invalid(
+                "an accepted decision must keep the common convergence result"
+            )
+    elif common is not None:
+        raise _convergence_decision_invalid(
+            "only an accepted decision may keep a common convergence result"
+        )
+
+    parsed_rows = _validated_convergence_decision_rows(payload[ITEMS])
+
+    if common is not None and common[CD_PLAN_DIGEST] != plan_digest:
+        raise _convergence_decision_invalid(
+            "the common result must share the bound plan digest"
+        )
+
+    if _checkpoint_compact(data) != raw:
+        raise _convergence_decision_invalid(
+            "encoding is not the canonical compact form"
+        )
+    return payload, signature
+
+
+def _validated_bound_convergence(value: object, where: str) -> dict:
+    """Validate one complete convergence result bound in a decision."""
+    if not isinstance(value, dict):
+        raise TypeError(f"{where} must be an object")
+    if set(value.keys()) != _CD_CONVERGENCE_KEYS:
+        raise _convergence_decision_invalid(
+            f"{where} must contain exactly the keys 'planDigest', 'results' "
+            "and 'status'"
+        )
+    plan_digest = value[CD_PLAN_DIGEST]
+    if not isinstance(plan_digest, str):
+        raise TypeError(f"{where} planDigest must be a str")
+    if not _is_digest(plan_digest):
+        raise _convergence_decision_invalid(
+            f"{where} planDigest must be 64 lowercase hex characters"
+        )
+    convergence_status = value[STATUS]
+    if not isinstance(convergence_status, str):
+        raise TypeError(f"{where} status must be a str")
+    if convergence_status not in _FE_STATUSES:
+        raise _convergence_decision_invalid(f"{where} status is not known")
+    results = _validated_convergence_result_rows(
+        value[CD_RESULTS], _convergence_decision_invalid
+    )
+    return {
+        CD_PLAN_DIGEST: plan_digest,
+        CD_RESULTS: results,
+        STATUS: convergence_status,
+    }
+
+
+def _validated_convergence_decision_rows(raw_rows: object) -> list[dict]:
+    """Validate the per-certificate rows of a parsed decision packet."""
+    if not isinstance(raw_rows, list):
+        raise TypeError("payload items must be a list")
+    if not raw_rows:
+        raise _convergence_decision_invalid("payload items must be non-empty")
+    parsed_rows: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, row in enumerate(raw_rows):
+        where = f"payload item {position}"
+        if not isinstance(row, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(row.keys()) != _CD_ROW_KEYS:
+            raise _convergence_decision_invalid(
+                f"{where} must contain exactly the keys 'certificateDigest', "
+                "'convergence', 'conclusion', 'id', 'keyVersion', 'reason' "
+                "and 'site'"
+            )
+        row_id = row[ID]
+        if not isinstance(row_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if row_id == "":
+            raise _convergence_decision_invalid(f"{where} id must be non-empty")
+        if row_id in seen_ids:
+            raise _convergence_decision_invalid(f"{where} repeats an id")
+        seen_ids.add(row_id)
+        certificate_digest = row[CD_CERTIFICATE_DIGEST]
+        if not isinstance(certificate_digest, str):
+            raise TypeError(f"{where} certificateDigest must be a str")
+        if not _is_digest(certificate_digest):
+            raise _convergence_decision_invalid(
+                f"{where} certificateDigest must be 64 lowercase hex "
+                "characters"
+            )
+        site = row[ADJ_SITE]
+        if site is not None:
+            if not isinstance(site, str):
+                raise TypeError(f"{where} site must be a str or null")
+            if site == "":
+                raise _convergence_decision_invalid(
+                    f"{where} site must be non-empty"
+                )
+        row_key_version = row[KEY_VERSION]
+        if isinstance(row_key_version, bool) or not isinstance(
+            row_key_version, int
+        ):
+            if row_key_version is not None:
+                raise TypeError(f"{where} keyVersion must be an int or null")
+        elif row_key_version <= 0:
+            raise _convergence_decision_invalid(
+                f"{where} keyVersion must be positive"
+            )
+        if (site is None) != (row_key_version is None):
+            raise _convergence_decision_invalid(
+                f"{where} site and keyVersion must be null together"
+            )
+        conclusion = row[CD_CONCLUSION]
+        if not isinstance(conclusion, str):
+            raise TypeError(f"{where} conclusion must be a str")
+        if conclusion not in _CD_CONCLUSIONS:
+            raise _convergence_decision_invalid(
+                f"{where} conclusion is not known"
+            )
+        reason = row[ADJ_REASON]
+        if conclusion == CD_CONCLUSION_VALID:
+            if reason is not None:
+                raise _convergence_decision_invalid(
+                    f"{where} reason must be null for a valid item"
+                )
+        else:
+            if not isinstance(reason, str):
+                raise TypeError(f"{where} reason must be a str")
+            if reason not in _CD_REASONS:
+                raise _convergence_decision_invalid(
+                    f"{where} reason is not known"
+                )
+        if conclusion == CD_CONCLUSION_INVALID:
+            if reason not in _CD_INVALID_REASONS:
+                raise _convergence_decision_invalid(
+                    f"{where} reason does not match an invalid item"
+                )
+        elif conclusion != CD_CONCLUSION_VALID:
+            if reason != conclusion:
+                raise _convergence_decision_invalid(
+                    f"{where} reason must match its conclusion"
+                )
+        raw_convergence = row[CD_CONVERGENCE]
+        if raw_convergence is not None:
+            parsed_convergence = _validated_bound_convergence(
+                raw_convergence, f"{where} convergence"
+            )
+        else:
+            parsed_convergence = None
+        identity_expected = reason != CD_REASON_INVALID_CERTIFICATE
+        if identity_expected:
+            if site is None or parsed_convergence is None:
+                raise _convergence_decision_invalid(
+                    f"{where} an authenticated item must carry its site and "
+                    "convergence result"
+                )
+        else:
+            if site is not None or parsed_convergence is not None:
+                raise _convergence_decision_invalid(
+                    f"{where} an invalid-proof item must carry no site or "
+                    "convergence result"
+                )
+        parsed_rows.append({
+            CD_CERTIFICATE_DIGEST: certificate_digest,
+            CD_CONCLUSION: conclusion,
+            CD_CONVERGENCE: parsed_convergence,
+            ID: row_id,
+            KEY_VERSION: row_key_version,
+            ADJ_REASON: reason,
+            ADJ_SITE: site,
+        })
+    return parsed_rows
+
+
+def _reconcile_convergence_payload(
+    payload: dict, threshold: int
+) -> str:
+    """Re-derive every aggregate binding of a parsed decision payload.
+
+    Re-tallies the per-certificate rows the signature covers -- row
+    ordering, certificate digests, duplicate/contradiction conclusions,
+    cross-site agreement, the threshold acceptance, the bound plan
+    digest and the common result and digest -- without seeing any
+    certificate or round.  Any mismatch raises
+    :class:`InvalidConvergenceDecisionError`; otherwise the derived
+    status is returned.
+    """
+    rows = payload[ITEMS]
+    certificates = payload[CD_CERTIFICATES]
+    if len(rows) != len(certificates):
+        raise _convergence_decision_invalid(
+            "the items must cover every certificate and vice versa"
+        )
+    expected_order = sorted(
+        rows,
+        key=lambda row: (
+            row[ADJ_SITE] is not None,
+            row[ADJ_SITE] or "",
+            row[ID],
+        ),
+    )
+    if [row[ID] for row in expected_order] != [row[ID] for row in rows]:
+        raise _convergence_decision_invalid(
+            "items must be sorted by site then id"
+        )
+    row_digests = [row[CD_CERTIFICATE_DIGEST] for row in rows]
+    if sorted(row_digests) != sorted(certificates):
+        raise _convergence_decision_invalid(
+            "the bound certificate digests must equal the per-item digests"
+        )
+
+    # Re-derive the same-site duplicate/contradiction markings; a digest
+    # never needs to be seen because the complete convergence result is
+    # bound verbatim in every row.
+    by_site: dict[str, dict[str, list[dict]]] = {}
+    for row in rows:
+        if row[CD_CONCLUSION] == CD_CONCLUSION_INVALID:
+            continue
+        by_site.setdefault(row[ADJ_SITE], {}).setdefault(
+            _convergence_content_key(row[CD_CONVERGENCE]), []
+        ).append(row)
+
+    contradicted = False
+    votes: dict[str, dict] = {}
+    for site, groups in by_site.items():
+        if len(groups) > 1:
+            contradicted = True
+            expected_conclusion = CD_CONCLUSION_CONTRADICTION
+            expected_reason = REASON_CONTRADICTION
+        else:
+            expected_conclusion = CD_CONCLUSION_VALID
+            expected_reason = None
+            votes[site] = next(iter(groups.values()))[0][CD_CONVERGENCE]
+        for _content, members_raw in groups.items():
+            members = sorted(members_raw, key=lambda row: row[ID])
+            for index, row in enumerate(members):
+                if index == 0:
+                    if row[CD_CONCLUSION] != expected_conclusion:
+                        raise _convergence_decision_invalid(
+                            f"item {row[ID]!r} has the wrong conclusion"
+                        )
+                    if row[ADJ_REASON] != expected_reason:
+                        raise _convergence_decision_invalid(
+                            f"item {row[ID]!r} has the wrong reason"
+                        )
+                else:
+                    if row[CD_CONCLUSION] != CD_CONCLUSION_DUPLICATE:
+                        raise _convergence_decision_invalid(
+                            f"item {row[ID]!r} must be a duplicate"
+                        )
+                    if row[ADJ_REASON] != REASON_DUPLICATE:
+                        raise _convergence_decision_invalid(
+                            f"item {row[ID]!r} must carry the duplicate reason"
+                        )
+            representative = members[0]
+            for row in members[1:]:
+                if row[CD_CONVERGENCE] != representative[CD_CONVERGENCE]:
+                    raise _convergence_decision_invalid(
+                        f"item {row[ID]!r} duplicates a different convergence "
+                        "result"
+                    )
+
+    contents = {
+        _convergence_content_key(convergence): convergence
+        for convergence in votes.values()
+    }
+    if contradicted or len(contents) > 1:
+        status = CD_STATUS_CONFLICTED
+    elif len(contents) == 1 and len(votes) >= threshold:
+        status = CD_STATUS_ACCEPTED
+    else:
+        status = CD_STATUS_INSUFFICIENT
+
+    if status == CD_STATUS_ACCEPTED:
+        expected_common = next(iter(contents.values()))
+        expected_common_digest = hashlib.sha256(
+            _checkpoint_compact(expected_common)
+        ).hexdigest()
+        expected_plan_digest = expected_common[CD_PLAN_DIGEST]
+    else:
+        expected_common = None
+        expected_common_digest = None
+        expected_plan_digest = None
+    if payload[CD_PLAN_DIGEST] != expected_plan_digest:
+        raise _convergence_decision_invalid(
+            "the bound plan digest does not match the tallied items"
+        )
+    if payload[CD_COMMON] != expected_common:
+        raise _convergence_decision_invalid(
+            "the bound common result does not match the tallied items"
+        )
+    if payload[CD_COMMON_DIGEST] != expected_common_digest:
+        raise _convergence_decision_invalid(
+            "the bound common digest does not match the tallied items"
+        )
+    if payload[STATUS] != status:
+        raise _convergence_decision_invalid(
+            "the status does not match the tallied items"
+        )
+    return status
+
+
+def _verify_convergence_decision(
+    decision_packet: bytes,
+    decision: bytes,
+    validated_site_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one convergence decision against validated shared materials."""
+    payload, signature = _parse_convergence_decision(decision_packet)
+    if payload[CD_DECISION_DIGEST] != hashlib.sha256(decision).hexdigest():
+        raise _convergence_decision_invalid(
+            "decision digest does not match the fork decision"
+        )
+    expected_policy_digest = hashlib.sha256(
+        _convergence_site_policy_bytes(validated_site_policy)
+    ).hexdigest()
+    if payload[CD_POLICY_DIGEST] != expected_policy_digest:
+        raise _convergence_decision_invalid(
+            "policy digest does not match the site policy"
+        )
+
+    status = _reconcile_convergence_payload(
+        payload, validated_site_policy[CD_THRESHOLD]
+    )
+
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION], moment
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "convergence decision signature does not match"
+        )
+
+    return {
+        key: copy.deepcopy(value)
+        for key, value in (
+            (CD_CERTIFICATES, payload[CD_CERTIFICATES]),
+            (CD_COMMON, payload[CD_COMMON]),
+            (CD_COMMON_DIGEST, payload[CD_COMMON_DIGEST]),
+            (CD_PACKET_DIGEST, hashlib.sha256(decision_packet).hexdigest()),
+            (CD_DECISION_DIGEST, payload[CD_DECISION_DIGEST]),
+            (VD_ISSUER, payload[VD_ISSUER]),
+            (ITEMS, payload[ITEMS]),
+            (KEY_VERSION, payload[KEY_VERSION]),
+            (CD_PLAN_DIGEST, payload[CD_PLAN_DIGEST]),
+            (CD_POLICY_DIGEST, expected_policy_digest),
+            (STATUS, status),
+            (VERSION, CONVERGENCE_DECISION_VERSION),
+        )
+    }
+
+
+def verify_convergence_decision(
+    decision_packet: bytes,
+    decision: bytes,
+    site_policy: dict,
+    keyring: dict,
+    moment: int,
+) -> dict:
+    """Verify one signed multi-site convergence decision entirely offline.
+
+    Only the decision packet, the original fork ``decision`` bytes, the
+    expected ``site_policy``, the current ``keyring`` and the
+    verification ``moment`` are consulted -- no file is read or written
+    and no argument is modified.  Verification validates the canonical
+    encoding and key sets, recomputes the fork decision and site policy
+    digests, re-tallies the bound per-certificate items (row ordering,
+    the original-order certificate digest bindings, duplicates,
+    contradictions, cross-site agreement, the threshold, the plan
+    digest and the common result and digest) purely from the signed
+    payload, and checks the HMAC-SHA256 against the key the current
+    keyring binds to the payload's exact issuer and version, usable at
+    the verification moment, so a later revocation or expiry rejects
+    the decision with no fallback.
+
+    On success a fresh mapping is returned with the fixed keys
+    ``certificates``, ``common``, ``commonDigest``,
+    ``convergenceDecisionDigest`` (the SHA-256 of the decision packet),
+    ``decisionDigest`` (the bound SHA-256 of the original fork decision
+    bytes), ``issuer``, ``items``, ``keyVersion``, ``planDigest``,
+    ``policyDigest``, ``status`` and ``version`` (the integer 1).  A
+    non-bytes argument or a field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); an
+    illegal site policy, keyring or moment raises :class:`ValueError`;
+    an illegal encoding, key set, digest, ordering, reference or
+    binding raises :class:`InvalidConvergenceDecisionError` (a
+    :class:`ValueError` subclass); unknown, revoked, not-yet-valid or
+    expired credentials or a signature mismatch raise
+    :class:`AuthenticationError`.
+    """
+    if not isinstance(decision_packet, bytes):
+        raise TypeError("decision must be bytes")
+    if not isinstance(decision, bytes):
+        raise TypeError("fork decision must be bytes")
+    validated_site_policy = _validated_convergence_site_policy(site_policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    return _verify_convergence_decision(
+        decision_packet, decision, validated_site_policy, validated_keyring,
+        verify_moment,
+    )
+
+
+def _validated_convergence_decision_batch_items(
+    items: object
+) -> list[dict]:
+    """Validate the decision batch before any decision is verified.
+
+    The argument must be a non-empty list of dicts each holding exactly
+    ``id`` (a non-empty str, unique across the batch) and ``decision``
+    (bytes).  Container, element and field type faults raise
+    :class:`TypeError`; an empty list, an empty or duplicate id or a
+    wrong key set raises :class:`ValueError`.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _CD_BATCH_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'decision' and 'id'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        decision_packet = item["decision"]
+        if not isinstance(decision_packet, bytes):
+            raise TypeError(f"{where} decision must be bytes")
+        validated.append({ID: item_id, "decision": decision_packet})
+    return validated
+
+
+def _convergence_decision_item_report(
+    item_id: str, status: str, error: str | None, result: dict | None
+) -> dict:
+    """One convergence-decision batch report with the fixed key order."""
+    return {
+        CHECKPOINT_ITEM_ERROR: error,
+        ID: item_id,
+        VERDICT_ITEM_RESULT: result,
+        STATUS: status,
+    }
+
+
+def _verify_convergence_decision_item(
+    item: dict,
+    decision: bytes,
+    validated_site_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one decision in isolation and report its outcome.
+
+    Unknown, revoked, not-yet-valid or expired credentials or a wrong
+    signature make the item ``unauthenticated``; every encoding,
+    key-set, digest, ordering, reference or binding fault makes it
+    ``invalid``; a passing decision is ``verified``.
+    """
+    item_id = item[ID]
+    decision_packet = item["decision"]
+    try:
+        result = _verify_convergence_decision(
+            decision_packet, decision, validated_site_policy,
+            validated_keyring, moment,
+        )
+    except AuthenticationError as exc:
+        return _convergence_decision_item_report(
+            item_id, _CD_VERIFY_UNAUTHENTICATED, str(exc), None
+        )
+    except (InvalidConvergenceDecisionError, TypeError) as exc:
+        # A TypeError here can only come from a wrong JSON field type
+        # inside the decision bytes; the public argument types were all
+        # validated before the batch ran.
+        return _convergence_decision_item_report(
+            item_id, _CD_VERIFY_INVALID, str(exc), None
+        )
+    return _convergence_decision_item_report(
+        item_id, _CD_VERIFY_VERIFIED, None, result
+    )
+
+
+def verify_convergence_decisions(
+    items: list,
+    decision: bytes,
+    site_policy: dict,
+    keyring: dict,
+    moment: int,
+) -> dict:
+    """Verify a whole batch of multi-site convergence decisions offline.
+
+    ``items`` is a non-empty list; each item is a dict with exactly the
+    keys ``id`` (a non-empty str, unique across the batch) and
+    ``decision`` (the bytes :func:`adjudicate_convergence` produced).
+    The batch and the shared fork ``decision`` bytes, ``site_policy``,
+    ``keyring`` and ``moment`` are validated in full before any
+    decision is verified: container, element or field type faults raise
+    :class:`TypeError` (a :class:`bool` never poses as an int) and an
+    empty list, an empty or duplicate id or a wrong item key set
+    raises :class:`ValueError`; only these batch-level faults raise.
+
+    Each decision is then verified independently, in strict input
+    order, through the exact :func:`verify_convergence_decision`
+    rules: one decision's failure never stops a later one or alters an
+    earlier report.  Currently unknown, revoked, not-yet-valid or
+    expired credentials or a wrong signature make the item
+    ``unauthenticated``; an illegal encoding, key set, digest,
+    ordering, reference or binding makes it ``invalid``; a passing
+    decision is ``verified``.
+
+    The top-level result is a fresh dict with the fixed keys ``items``
+    and ``version`` (the integer 1); each item report carries, in this
+    key order, ``error`` (null exactly when verified), ``id``,
+    ``result`` (a fresh independent copy of the single-decision result
+    when verified, otherwise null) and ``status``; a failed item keeps
+    a definite, non-empty copy of the original exception text.
+    Repeated calls return equal but mutually independent results.  No
+    file is read or written and no input is modified.
+    """
+    validated_items = _validated_convergence_decision_batch_items(items)
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    validated_site_policy = _validated_convergence_site_policy(site_policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    return {
+        ITEMS: [
+            _verify_convergence_decision_item(
+                item, decision, validated_site_policy, validated_keyring,
+                verify_moment,
+            )
+            for item in validated_items
+        ],
+        VERSION: CONVERGENCE_DECISION_VERSION,
     }
