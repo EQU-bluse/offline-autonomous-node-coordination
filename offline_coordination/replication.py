@@ -476,6 +476,7 @@ or expired credentials or a signature mismatch raise
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import hmac
 import json
@@ -6739,3 +6740,498 @@ def verify_recovery_verdicts(
         ],
         VERSION: VERDICTS_VERSION,
     }
+
+
+# --- Offline signed receipt of a batch verdict verification ------------------
+
+BATCH_RECEIPT_VERSION = 1
+
+RECEIPT_POLICY = "policy"
+RECEIPT_ITEM_REPORT = "report"
+
+_BATCH_RECEIPT_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_BATCH_RECEIPT_PAYLOAD_KEYS = frozenset((
+    VD_ISSUER,
+    KEY_VERSION,
+    CP_MOMENT,
+    RECEIPT_POLICY,
+    ITEMS,
+    VERSION,
+))
+_BATCH_RECEIPT_ITEM_KEYS = frozenset((ID, CP_DIGEST, RECEIPT_ITEM_REPORT))
+_BATCH_RECEIPT_REPORT_KEYS = frozenset(_VERDICT_BATCH_REPORT_KEYS)
+_BATCH_RECEIPT_REPORT_STATUSES = frozenset((
+    _VERIFY_VERIFIED,
+    VERIFY_UNAUTHENTICATED,
+    VERIFY_INVALID_PROOF,
+))
+
+
+class InvalidBatchReceiptError(ValueError):
+    """A signed batch receipt fails its canonical contract."""
+
+
+def _receipt_invalid(message: str) -> InvalidBatchReceiptError:
+    return InvalidBatchReceiptError(f"invalid batch receipt: {message}")
+
+
+def _validated_receipt_boundary(boundary: object, where: str) -> None:
+    """Require a receipt boundary to be null or a ``lastSeq``/``tail`` pair."""
+    if boundary is None:
+        return
+    if not isinstance(boundary, dict):
+        raise _receipt_invalid(f"{where} boundary must be an object or null")
+    if set(boundary.keys()) != _ADJ_BOUNDARY_KEYS:
+        raise _receipt_invalid(
+            f"{where} boundary must be null or {{'lastSeq', 'tail'}}"
+        )
+    last_seq = boundary[CP_LAST_SEQ]
+    if isinstance(last_seq, bool) or not isinstance(last_seq, int):
+        raise _receipt_invalid(f"{where} boundary lastSeq must be an int")
+    if last_seq < 0:
+        raise _receipt_invalid(f"{where} boundary lastSeq must be >= 0")
+    if not _is_digest(boundary[CP_TAIL]):
+        raise _receipt_invalid(
+            f"{where} boundary tail must be 64 lowercase hex characters"
+        )
+
+
+def _validated_receipt_verdict_item(item: object, where: str) -> None:
+    """Validate one adjudication item report inside a verified result.
+
+    Mirrors the per-item rules a verdict carries, so a receipt only ever
+    binds a result :func:`verify_recovery_verdict` could have produced.
+    """
+    if not isinstance(item, dict):
+        raise _receipt_invalid(f"{where} must be an object")
+    if set(item.keys()) != _ADJ_ITEM_REPORT_KEYS:
+        raise _receipt_invalid(
+            f"{where} must contain exactly the keys 'boundary', "
+            "'conclusion', 'digest', 'id', 'keyVersion', 'reason', "
+            "'site' and 'status'"
+        )
+    item_id = item[ID]
+    if not isinstance(item_id, str) or item_id == "":
+        raise _receipt_invalid(f"{where} id must be a non-empty str")
+    site = item[ADJ_SITE]
+    if site is not None and (not isinstance(site, str) or site == ""):
+        raise _receipt_invalid(f"{where} site must be a non-empty str or null")
+    key_version = item[CP_KEY_VERSION]
+    if key_version is not None:
+        if isinstance(key_version, bool) or not isinstance(key_version, int):
+            raise _receipt_invalid(f"{where} keyVersion must be an int or null")
+        if key_version <= 0:
+            raise _receipt_invalid(f"{where} keyVersion must be positive")
+    digest = item[CP_DIGEST]
+    if digest is not None and not _is_digest(digest):
+        raise _receipt_invalid(
+            f"{where} digest must be null or 64 lowercase hex characters"
+        )
+    status = item[STATUS]
+    if status is not None and (
+        not isinstance(status, str) or status not in _ADJ_RESULT_STATUSES
+    ):
+        raise _receipt_invalid(f"{where} status is not a known result status")
+    _validated_receipt_boundary(item[CHECKPOINT_ITEM_BOUNDARY], where)
+    conclusion = item[ADJ_CONCLUSION]
+    if not isinstance(conclusion, str) or conclusion not in (
+        ADJ_CONCLUSION_VALID,
+        ADJ_CONCLUSION_INVALID,
+        ADJ_CONCLUSION_DUPLICATE,
+        ADJ_CONCLUSION_CONTRADICTION,
+    ):
+        raise _receipt_invalid(f"{where} conclusion is not known")
+    reason = item[ADJ_REASON]
+    if conclusion == ADJ_CONCLUSION_VALID:
+        if reason is not None:
+            raise _receipt_invalid(
+                f"{where} reason must be null for a valid packet"
+            )
+    elif not isinstance(reason, str) or reason == "":
+        raise _receipt_invalid(f"{where} reason must be a non-empty str")
+
+
+def _validated_receipt_result(result: object, where: str) -> None:
+    """Validate the verified single-entry result bound into a report.
+
+    The shape is exactly the public :func:`verify_recovery_verdict`
+    result: the fixed keys ``batch``, ``issuer``, ``keyVersion``,
+    ``signedAt``, ``policyDigest``, ``verdictDigest``, ``status``,
+    ``digest``, ``boundary``, ``items`` and ``version`` (the integer 1),
+    with the accepted-only digest and boundary pairing the verdict
+    itself enforces.
+    """
+    if not isinstance(result, dict):
+        raise _receipt_invalid(f"{where} result must be an object")
+    if set(result.keys()) != frozenset(_VERDICT_RESULT_KEYS):
+        raise _receipt_invalid(
+            f"{where} result must contain exactly the keys 'batch', "
+            "'issuer', 'keyVersion', 'signedAt', 'policyDigest', "
+            "'verdictDigest', 'status', 'digest', 'boundary', 'items' "
+            "and 'version'"
+        )
+    if not isinstance(result[ADJ_BATCH], str) or result[ADJ_BATCH] == "":
+        raise _receipt_invalid(f"{where} result batch must be a non-empty str")
+    if not isinstance(result[VD_ISSUER], str) or result[VD_ISSUER] == "":
+        raise _receipt_invalid(
+            f"{where} result issuer must be a non-empty str"
+        )
+    key_version = result[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise _receipt_invalid(f"{where} result keyVersion must be an int")
+    if key_version <= 0:
+        raise _receipt_invalid(f"{where} result keyVersion must be positive")
+    signed_at = result[VD_SIGNED_AT]
+    if isinstance(signed_at, bool) or not isinstance(signed_at, int):
+        raise _receipt_invalid(f"{where} result signedAt must be an int")
+    if signed_at < 0:
+        raise _receipt_invalid(f"{where} result signedAt must be non-negative")
+    if not _is_digest(result[VD_POLICY_DIGEST]):
+        raise _receipt_invalid(
+            f"{where} result policyDigest must be 64 lowercase hex characters"
+        )
+    if not _is_digest(result[VD_VERDICT_DIGEST]):
+        raise _receipt_invalid(
+            f"{where} result verdictDigest must be 64 lowercase hex characters"
+        )
+    version = result[VERSION]
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != RECOVERY_VERDICT_VERSION
+    ):
+        raise _receipt_invalid(f"{where} result version must be the integer 1")
+    status = result[STATUS]
+    if status not in (
+        ADJ_STATUS_ACCEPTED,
+        ADJ_STATUS_CONFLICTED,
+        ADJ_STATUS_INSUFFICIENT,
+    ):
+        raise _receipt_invalid(
+            f"{where} result status is not a known verdict status"
+        )
+    digest = result[CP_DIGEST]
+    if digest is not None and not _is_digest(digest):
+        raise _receipt_invalid(
+            f"{where} result digest must be null or 64 lowercase hex "
+            "characters"
+        )
+    if (status == ADJ_STATUS_ACCEPTED) != (digest is not None):
+        raise _receipt_invalid(
+            f"{where} result digest must be present exactly when accepted"
+        )
+    boundary = result[CHECKPOINT_ITEM_BOUNDARY]
+    _validated_receipt_boundary(boundary, f"{where} result")
+    if (status == ADJ_STATUS_ACCEPTED) != (boundary is not None):
+        raise _receipt_invalid(
+            f"{where} result boundary must be present exactly when accepted"
+        )
+    items = result[ITEMS]
+    if not isinstance(items, list):
+        raise _receipt_invalid(f"{where} result items must be a list")
+    for position, item in enumerate(items):
+        _validated_receipt_verdict_item(item, f"{where} result item {position}")
+
+
+def _validated_receipt_report(report: object, item_id: str, where: str) -> None:
+    """Validate one batch verification report bound into a receipt item.
+
+    The report must follow the public :func:`verify_recovery_verdicts`
+    item shape -- ``error``, ``id``, ``result`` and ``status`` -- with
+    ``error`` null and ``result`` present exactly when ``verified``, and
+    its ``id`` must equal the receipt item's ``id``, keeping the
+    positional binding between the ordered items and their reports.
+    """
+    if not isinstance(report, dict):
+        raise _receipt_invalid(f"{where} report must be an object")
+    if set(report.keys()) != _BATCH_RECEIPT_REPORT_KEYS:
+        raise _receipt_invalid(
+            f"{where} report must contain exactly the keys 'error', 'id', "
+            "'result' and 'status'"
+        )
+    report_id = report[ID]
+    if not isinstance(report_id, str) or report_id == "":
+        raise _receipt_invalid(f"{where} report id must be a non-empty str")
+    if report_id != item_id:
+        raise _receipt_invalid(
+            f"{where} report id does not match the item id"
+        )
+    status = report[STATUS]
+    if not isinstance(status, str) or status not in (
+        _BATCH_RECEIPT_REPORT_STATUSES
+    ):
+        raise _receipt_invalid(f"{where} report status is not a known status")
+    error = report[CHECKPOINT_ITEM_ERROR]
+    result = report[VERDICT_ITEM_RESULT]
+    if status == _VERIFY_VERIFIED:
+        if error is not None:
+            raise _receipt_invalid(
+                f"{where} report error must be null when verified"
+            )
+        _validated_receipt_result(result, where)
+    else:
+        if not isinstance(error, str) or error == "":
+            raise _receipt_invalid(
+                f"{where} report error must be a non-empty str for a failure"
+            )
+        if result is not None:
+            raise _receipt_invalid(
+                f"{where} report result must be null for a failure"
+            )
+
+
+def _parse_batch_receipt(raw: object) -> tuple[dict, str]:
+    """Validate receipt bytes structurally into ``(payload, signature)``.
+
+    A non-bytes argument raises :class:`TypeError`; every encoding,
+    key-set, version, digest, report-shape or canonical-form fault
+    raises :class:`InvalidBatchReceiptError`.  The policy, moment,
+    credential and signature bindings are checked by
+    :func:`verify_batch_receipt`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("receipt must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _receipt_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _receipt_invalid("is not valid UTF-8") from exc
+
+    def reject_duplicates(pairs: list[tuple]) -> dict:
+        result: dict = {}
+        for key, value in pairs:
+            if key in result:
+                raise _receipt_invalid(f"duplicate key {key!r} in object")
+            result[key] = value
+        return result
+
+    try:
+        data = json.loads(text, object_pairs_hook=reject_duplicates)
+    except json.JSONDecodeError as exc:
+        raise _receipt_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise _receipt_invalid("must be a JSON object")
+    if set(data.keys()) != _BATCH_RECEIPT_TOP_KEYS:
+        raise _receipt_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str) or _HEX64.fullmatch(signature) is None:
+        raise _receipt_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise _receipt_invalid("payload must be an object")
+    if set(payload.keys()) != _BATCH_RECEIPT_PAYLOAD_KEYS:
+        raise _receipt_invalid(
+            "payload must contain exactly the keys 'issuer', 'keyVersion', "
+            "'moment', 'policy', 'items' and 'version'"
+        )
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str) or issuer == "":
+        raise _receipt_invalid("payload issuer must be a non-empty str")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise _receipt_invalid("payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _receipt_invalid("payload keyVersion must be positive")
+    moment = payload[CP_MOMENT]
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise _receipt_invalid("payload moment must be an int")
+    if moment < 0:
+        raise _receipt_invalid("payload moment must be non-negative")
+    if not _is_digest(payload[RECEIPT_POLICY]):
+        raise _receipt_invalid(
+            "payload policy must be 64 lowercase hex characters"
+        )
+    version = payload[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise _receipt_invalid("payload version must be an int")
+    if version != BATCH_RECEIPT_VERSION:
+        raise _receipt_invalid("payload version must be the integer 1")
+    items = payload[ITEMS]
+    if not isinstance(items, list):
+        raise _receipt_invalid("payload items must be a list")
+    if not items:
+        raise _receipt_invalid("payload items must be non-empty")
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise _receipt_invalid(f"{where} must be an object")
+        if set(item.keys()) != _BATCH_RECEIPT_ITEM_KEYS:
+            raise _receipt_invalid(
+                f"{where} must contain exactly the keys 'id', 'digest' "
+                "and 'report'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str) or item_id == "":
+            raise _receipt_invalid(f"{where} id must be a non-empty str")
+        if not _is_digest(item[CP_DIGEST]):
+            raise _receipt_invalid(
+                f"{where} digest must be 64 lowercase hex characters"
+            )
+        _validated_receipt_report(item[RECEIPT_ITEM_REPORT], item_id, where)
+
+    if _checkpoint_compact(data) != raw:
+        raise _receipt_invalid("encoding is not the canonical compact form")
+    return payload, signature
+
+
+def sign_batch_receipt(
+    items: list,
+    policy: dict,
+    keyring: dict,
+    moment: int,
+    issuer: str,
+    version: int,
+) -> bytes:
+    """Sign a batch verdict verification into an offline receipt.
+
+    ``items`` is the same non-empty list of ``{"id", "proof"}`` dicts
+    :func:`verify_recovery_verdicts` takes; ``policy`` is the same
+    ``{"batch", "sites", "threshold"}`` object, ``keyring`` follows the
+    :func:`apply_signed_remote` rules, ``moment`` is the signing time
+    and ``issuer``/``version`` name the signing credentials.  No file is
+    read or written and no argument is modified.
+
+    The batch runs through the exact :func:`verify_recovery_verdicts`
+    rules: batch-level faults raise directly (container, element or
+    public field type faults raise :class:`TypeError` -- a :class:`bool`
+    never poses as an int -- and an empty list, an empty or duplicate
+    id, a wrong item key set, an empty issuer or a non-positive version
+    raises :class:`ValueError`), while one proof's failure never stops
+    the batch and is recorded in that item's report with its original
+    status, error and a null ``result``.
+
+    The receipt is one canonical compact UTF-8 JSON object -- every
+    object key recursively sorted, non-ASCII preserved, no trailing
+    newline or any other trailing byte -- carrying exactly ``payload``
+    and ``signature``.  The payload binds exactly ``issuer``,
+    ``keyVersion``, ``moment``, ``policy``, ``items`` and ``version``
+    (the integer 1).  ``policy`` is the lowercase hex SHA-256 of the
+    canonical compact policy encoding (sites ascending, each site's
+    versions an ascending array).  Each payload item, in the original
+    input order with no sorting, deduplication or replacement, carries
+    exactly ``id``, ``digest`` (the lowercase hex SHA-256 of that item's
+    original proof bytes) and ``report`` (that item's batch verification
+    report, bound verbatim).  ``signature`` is the lowercase hex
+    HMAC-SHA256 of the canonical compact payload bytes under the key the
+    keyring binds to the exact issuer and version, with no fallback;
+    unknown credentials and a revoked, not-yet-valid or expired key
+    raise :class:`AuthenticationError`.
+    """
+    validated_items = _validated_verdict_items(items)
+    validated_policy = _validated_adjudication_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+
+    entry = _usable_checkpoint_key(validated_keyring, issuer, version, moment)
+    reports = [
+        _verify_verdict_item(item, validated_policy, validated_keyring, moment)
+        for item in validated_items
+    ]
+    receipt_items = [
+        {
+            ID: item[ID],
+            CP_DIGEST: hashlib.sha256(item[VERDICT_ITEM_PROOF]).hexdigest(),
+            RECEIPT_ITEM_REPORT: report,
+        }
+        for item, report in zip(validated_items, reports)
+    ]
+    payload = {
+        VD_ISSUER: issuer,
+        KEY_VERSION: version,
+        CP_MOMENT: moment,
+        RECEIPT_POLICY: hashlib.sha256(
+            _verdict_policy_bytes(validated_policy)
+        ).hexdigest(),
+        ITEMS: receipt_items,
+        VERSION: BATCH_RECEIPT_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _checkpoint_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+def verify_batch_receipt(
+    receipt: bytes, policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify a signed batch receipt entirely offline.
+
+    Only the receipt bytes, the expected ``policy``, the current
+    ``keyring`` and the verification ``moment`` are consulted -- no file
+    is read or written and no argument is modified.  Verification
+    recomputes the policy digest over the canonical compact policy
+    encoding and the HMAC-SHA256 signature over the canonical compact
+    payload bytes, and checks the payload structure, the item order
+    (each report's ``id`` must match its item's ``id``), every report's
+    shape and the moment binding: a receipt whose signing moment is
+    later than the verification moment is rejected.  The key is the one
+    the *current* keyring binds to the payload's exact issuer and
+    version, usable at the verification moment, so a later revocation or
+    expiry rejects the receipt just as it does a replay.
+
+    A non-bytes receipt or a public field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); an
+    invalid policy, keyring or moment raises :class:`ValueError`; an
+    illegal encoding, key set, version, digest, report shape or binding
+    raises :class:`InvalidBatchReceiptError` (a :class:`ValueError`
+    subclass); and unknown, revoked, not-yet-valid or expired
+    credentials or a signature mismatch raise
+    :class:`AuthenticationError`.
+
+    The result is a fresh deep copy of the authenticated payload with
+    the fixed keys ``issuer``, ``keyVersion``, ``moment``, ``policy``,
+    ``items`` and ``version``; repeated calls return equal but mutually
+    independent results that share no mutable object.
+    """
+    if not isinstance(receipt, bytes):
+        raise TypeError("receipt must be bytes")
+    validated_policy = _validated_adjudication_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+
+    payload, signature = _parse_batch_receipt(receipt)
+    recomputed_policy = hashlib.sha256(
+        _verdict_policy_bytes(validated_policy)
+    ).hexdigest()
+    if payload[RECEIPT_POLICY] != recomputed_policy:
+        raise _receipt_invalid("policy digest does not match the policy")
+    if payload[CP_MOMENT] > moment:
+        raise _receipt_invalid(
+            "moment must not be later than the verification moment"
+        )
+
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION], moment
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError("batch receipt signature does not match")
+    return copy.deepcopy(payload)
