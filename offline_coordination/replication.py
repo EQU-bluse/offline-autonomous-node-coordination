@@ -612,6 +612,56 @@ a structurally bad receipt only recorded as ``invalid-receipt``); and
 unknown, revoked, not-yet-valid or expired credentials or a wrong
 signature raise :class:`AuthenticationError`.  No file is read or
 written and every existing public interface is unchanged.
+
+:func:`certify_fork_convergence` adds an offline multi-round
+convergence certificate on top of those confirmations.  It takes a
+non-empty list of rounds in strict round order; each round binds only
+its consecutive number (starting at one), the previous round's summary
+(null for round one) and a non-empty list of confirmation packets
+produced in that round, plus the original decision, the policy and
+keyring, the certification moment and the signing issuer and version.
+Every confirmation is re-checked through the exact
+:func:`verify_fork_confirmation` rules at the certification moment and
+must bind the same plan, decision and policy; the rounds must number
+consecutively from one (a gap, reordering or repetition is rejected),
+chain their summaries exactly and use strictly increasing aggregation
+moments (the largest ``aggregatedAt`` in each round).  A ``failed``
+operation may advance in a later round to ``executed`` or ``rejected``;
+a settled execution or rejection is never reversed or exchanged and an
+executed post-state digest is never changed, or the operation becomes
+``conflicted``.  The overall status is ``conflicted``, ``rejected``,
+``partial`` or ``confirmed`` in that precedence.  The canonical
+``{payload, signature}`` certificate binds the round summaries, the
+plan/decision/policy digests, the final per-operation results
+(operation id, target domain, conclusion, settling round and
+post-state digest in plan order), the overall status and the issuance
+identity and moment; the signature is HMAC-SHA256 of the canonical
+payload under the exact issuer/version key.
+
+:func:`verify_fork_convergence` and the batch
+:func:`verify_fork_convergences` re-check those certificates entirely
+offline.  Verification re-runs every confirmation under the
+single-packet rules, recomputes the round numbering, summary chain and
+strictly increasing moments, re-folds the per-operation results and
+overall status, checks every digest and ordering binding, rejects a
+certification moment later than the verification moment and verifies
+the HMAC against the exact issuer/version key usable at that moment, so
+later revocation or expiry rejects the certificate.  Batch items (an
+``id``, the ``certificate`` bytes and that certificate's original
+``rounds``) are validated up front and handled in strict input order
+and isolation as ``verified``, ``invalid`` or ``unauthenticated`` with
+a null result and definite error on failure.  Across the three entry
+points a parameter, container or public field type fault raises
+:class:`TypeError` (a :class:`bool` never poses as an int); an empty
+batch or round, an empty or duplicate id, a wrong key set or an illegal
+moment raises :class:`ValueError`; a bad confirmation raises
+:class:`InvalidForkExecutionError` and a bad certificate or
+convergence relationship raises
+:class:`InvalidForkConvergenceError` (both :class:`ValueError`
+subclasses); unknown, revoked, not-yet-valid or expired credentials or
+a wrong signature raise :class:`AuthenticationError`.  No file is read
+or written, no input is modified and the existing plans,
+confirmations, batch verifications and commands are unchanged.
 """
 
 from __future__ import annotations
@@ -12282,4 +12332,946 @@ def verify_fork_confirmations(
             for item in validated_items
         ],
         VERSION: FORK_EXECUTION_VERSION,
+    }
+
+
+# --- Offline multi-round fork convergence certificates -----------------------
+
+FORK_CONVERGENCE_VERSION = 1
+
+FC_ROUND = "round"
+FC_ROUNDS_INPUT = "rounds"
+FC_PREVIOUS_SUMMARY = "previousSummary"
+FC_CONFIRMATIONS = "confirmations"
+FC_PLAN_DIGEST = "planDigest"
+FC_DECISION_DIGEST = "decisionDigest"
+FC_POLICY_DIGEST = FE_POLICY_DIGEST
+FC_RESULTS = "results"
+FC_SETTLED_ROUND = "settledRound"
+FC_TARGET = FE_TARGET
+FC_POST_DIGEST = FE_POST_DIGEST
+FC_ISSUER = TICKET_ISSUER
+FC_CERTIFIED_AT = "certifiedAt"
+FC_ROUND_SUMMARIES = "roundSummaries"
+FC_CERTIFICATE_DIGEST = "certificateDigest"
+
+FC_STATUS_CONFIRMED = FE_STATUS_CONFIRMED
+FC_STATUS_PARTIAL = FE_STATUS_PARTIAL
+FC_STATUS_REJECTED = FE_STATUS_REJECTED
+FC_STATUS_CONFLICTED = ADJ_STATUS_CONFLICTED
+_FC_STATUSES = frozenset((
+    FC_STATUS_CONFIRMED,
+    FC_STATUS_PARTIAL,
+    FC_STATUS_REJECTED,
+    FC_STATUS_CONFLICTED,
+))
+_FC_CONCLUSIONS = frozenset((
+    FE_RESULT_EXECUTED,
+    FE_RESULT_REJECTED,
+    FE_RESULT_FAILED,
+    FC_STATUS_CONFLICTED,
+))
+
+_FC_ROUND_KEYS = frozenset((
+    FC_ROUND,
+    FC_PREVIOUS_SUMMARY,
+    FC_CONFIRMATIONS,
+))
+_FC_CERTIFICATE_PAYLOAD_KEYS = frozenset((
+    FC_CERTIFIED_AT,
+    FC_DECISION_DIGEST,
+    FC_ISSUER,
+    KEY_VERSION,
+    FC_PLAN_DIGEST,
+    FC_POLICY_DIGEST,
+    FC_RESULTS,
+    FC_ROUND_SUMMARIES,
+    STATUS,
+    VERSION,
+))
+_FC_RESULT_KEYS = frozenset((
+    FE_OPERATION_ID,
+    FC_POST_DIGEST,
+    FE_RESULT,
+    FC_SETTLED_ROUND,
+    FC_TARGET,
+))
+_FC_BATCH_ITEM_KEYS = frozenset((ID, "certificate", FC_ROUNDS_INPUT))
+_FC_VERIFY_VERIFIED = "verified"
+_FC_VERIFY_INVALID = "invalid"
+_FC_VERIFY_UNAUTHENTICATED = "unauthenticated"
+_FC_VERIFY_RESULT_KEYS = (
+    FC_CERTIFIED_AT,
+    FC_CERTIFICATE_DIGEST,
+    FC_DECISION_DIGEST,
+    FC_ISSUER,
+    KEY_VERSION,
+    FC_PLAN_DIGEST,
+    FC_POLICY_DIGEST,
+    FC_RESULTS,
+    FC_ROUNDS_INPUT,
+    FC_ROUND_SUMMARIES,
+    STATUS,
+    VERSION,
+)
+
+
+class InvalidForkConvergenceError(ValueError):
+    """A fork convergence certificate or multi-round relationship is invalid."""
+
+
+def _fc_invalid(message: str) -> InvalidForkConvergenceError:
+    return InvalidForkConvergenceError(
+        f"invalid fork convergence: {message}"
+    )
+
+
+def _reject_duplicate_fork_convergence_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` rejecting duplicate convergence object keys."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _fc_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _validated_fc_rounds(rounds: object) -> list[dict]:
+    """Validate the public rounds argument before any packet is opened.
+
+    Each round is a dict with exactly ``round``, ``previousSummary`` and
+    ``confirmations``: rounds number consecutively from one (so a gap,
+    reordering or repetition is impossible), round one carries a null
+    previous summary and every later round a lowercase hex digest, and
+    each round binds a non-empty list of non-empty confirmation bytes.
+    Container/element type faults raise :class:`TypeError`; empty,
+    numbering, key-set or digest faults raise :class:`ValueError`.
+    """
+    if not isinstance(rounds, list):
+        raise TypeError("rounds must be a list")
+    if not rounds:
+        raise ValueError("rounds must be a non-empty list")
+    validated: list[dict] = []
+    seen_numbers: set[int] = set()
+    for position, entry in enumerate(rounds):
+        where = f"round {position}"
+        if not isinstance(entry, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(entry.keys()) != _FC_ROUND_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'round', "
+                "'previousSummary' and 'confirmations'"
+            )
+        number = entry[FC_ROUND]
+        if isinstance(number, bool) or not isinstance(number, int):
+            raise TypeError(f"{where} round number must be an int")
+        if number != position + 1:
+            raise ValueError(
+                f"rounds must number consecutively from one: position "
+                f"{position} carries round {number}"
+            )
+        if number in seen_numbers:
+            raise ValueError(f"round {number} is repeated")
+        seen_numbers.add(number)
+        previous = entry[FC_PREVIOUS_SUMMARY]
+        if position == 0:
+            if previous is not None:
+                raise ValueError("round 1 previousSummary must be null")
+        else:
+            if previous is None:
+                raise ValueError(
+                    f"{where} previousSummary must chain to the previous "
+                    "round, not null"
+                )
+            if not isinstance(previous, str):
+                raise TypeError(
+                    f"{where} previousSummary must be a str or null"
+                )
+            if not _is_digest(previous):
+                raise ValueError(
+                    f"{where} previousSummary must be 64 lowercase hex "
+                    "characters"
+                )
+        confirmations = entry[FC_CONFIRMATIONS]
+        if not isinstance(confirmations, list):
+            raise TypeError(f"{where} confirmations must be a list")
+        if not confirmations:
+            raise ValueError(f"{where} confirmations must be a non-empty list")
+        for index, confirmation in enumerate(confirmations):
+            if not isinstance(confirmation, bytes):
+                raise TypeError(
+                    f"{where} confirmation {index} must be bytes"
+                )
+        validated.append({
+            FC_ROUND: number,
+            FC_PREVIOUS_SUMMARY: previous,
+            FC_CONFIRMATIONS: list(confirmations),
+        })
+    return validated
+
+
+def _fc_confirmation_plan_bytes(raw: bytes) -> bytes:
+    """Extract the canonical plan bytes bound inside one confirmation."""
+    try:
+        envelope = json.loads(raw.decode("utf-8"))
+        plan = envelope[TICKET_PAYLOAD][FE_PLAN]
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise _fork_execution_invalid(
+            "a verified confirmation binds no plan"
+        ) from exc
+    return _checkpoint_compact(plan)
+
+
+def _fc_round_summary(
+    number: int, previous_summary: str | None, confirmation_digests: list[str]
+) -> str:
+    """The chained SHA-256 summary of one round.
+
+    It feeds the round number, the previous round's summary (null for
+    round one) and the confirmation packet digests in their round order.
+    """
+    return hashlib.sha256(_checkpoint_compact({
+        FC_CONFIRMATIONS: confirmation_digests,
+        FC_PREVIOUS_SUMMARY: previous_summary,
+        FC_ROUND: number,
+    })).hexdigest()
+
+
+def _fc_initial_state(parsed_plan: dict) -> list[dict]:
+    """Every planned operation starts unfinished, notionally settled at 0."""
+    return [
+        {
+            FE_OPERATION_ID: operation[FE_OPERATION_ID],
+            FC_POST_DIGEST: None,
+            FE_RESULT: FE_RESULT_FAILED,
+            FC_SETTLED_ROUND: 0,
+            FC_TARGET: operation[FE_TARGET],
+        }
+        for operation in parsed_plan[FE_OPERATIONS]
+    ]
+
+
+def _fc_mark_conflicted(current: dict, round_number: int) -> None:
+    """Settle an operation as conflicted in the given round."""
+    current[FE_RESULT] = FC_STATUS_CONFLICTED
+    current[FC_POST_DIGEST] = None
+    current[FC_SETTLED_ROUND] = round_number
+
+
+def _fc_fold_round(
+    state: list[dict], round_number: int, verified: list[dict]
+) -> None:
+    """Fold one round's verified confirmations into the convergence state.
+
+    A ``failed`` operation may advance to ``executed`` or ``rejected``;
+    a settled execution or rejection is never reversed or exchanged and
+    an executed post-state digest never changes, or the operation becomes
+    ``conflicted``.  A failed packet never moves a settled operation and
+    a conflicted operation stays conflicted.  The executed post-state
+    digest is taken from the counted (non-rejected) execution reason
+    rows, which the confirmation tally guarantees agree within one
+    confirmation.
+    """
+    by_id = {row[FE_OPERATION_ID]: row for row in state}
+    for confirmation in verified:
+        executed_posts: dict[str, str] = {}
+        for reason_row in confirmation[FE_REASONS]:
+            if (
+                reason_row[ADJ_REASON] is None
+                and reason_row[FE_RESULT] == FE_RESULT_EXECUTED
+            ):
+                executed_posts.setdefault(
+                    reason_row[FE_OPERATION_ID],
+                    reason_row[FE_POST_DIGEST],
+                )
+        for op_result in confirmation[FE_RESULTS]:
+            operation_id = op_result[FE_OPERATION_ID]
+            current = by_id[operation_id]
+            incoming = op_result[FE_RESULT]
+            current_result = current[FE_RESULT]
+            if current_result == FC_STATUS_CONFLICTED:
+                continue
+            if current_result == FE_RESULT_FAILED:
+                if incoming == FE_RESULT_FAILED:
+                    continue
+                if incoming == FE_RESULT_EXECUTED:
+                    current[FE_RESULT] = FE_RESULT_EXECUTED
+                    current[FC_POST_DIGEST] = executed_posts[operation_id]
+                    current[FC_SETTLED_ROUND] = round_number
+                else:
+                    current[FE_RESULT] = FE_RESULT_REJECTED
+                    current[FC_POST_DIGEST] = None
+                    current[FC_SETTLED_ROUND] = round_number
+                continue
+            if incoming == FE_RESULT_FAILED:
+                continue
+            if current_result == FE_RESULT_EXECUTED:
+                if incoming != FE_RESULT_EXECUTED or (
+                    executed_posts.get(operation_id)
+                    != current[FC_POST_DIGEST]
+                ):
+                    _fc_mark_conflicted(current, round_number)
+            elif current_result == FE_RESULT_REJECTED:
+                if incoming != FE_RESULT_REJECTED:
+                    _fc_mark_conflicted(current, round_number)
+
+
+def _fc_overall_status(state: list[dict]) -> str:
+    """Overall status from the folded state."""
+    results = {row[FE_RESULT] for row in state}
+    if FC_STATUS_CONFLICTED in results:
+        return FC_STATUS_CONFLICTED
+    if FE_RESULT_REJECTED in results:
+        return FC_STATUS_REJECTED
+    if FE_RESULT_FAILED in results:
+        return FC_STATUS_PARTIAL
+    return FC_STATUS_CONFIRMED
+
+
+def _fc_process_rounds(
+    validated_rounds: list[dict],
+    parsed_plan: dict,
+    decision: bytes,
+    validated_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> tuple[list[dict], list[str]]:
+    """Verify every round, enforce the chain and moments, and fold them.
+
+    Each confirmation is re-checked through the exact
+    :func:`verify_fork_confirmation` rules at the certification or
+    verification ``moment`` and must bind the same plan.  The bound
+    previous summaries must chain exactly and the rounds' aggregation
+    moments (the largest ``aggregatedAt`` in each round) must be
+    strictly increasing.  Returns ``(state, round_summaries)``.
+    """
+    plan_digest = hashlib.sha256(
+        _checkpoint_compact(parsed_plan)
+    ).hexdigest()
+    state = _fc_initial_state(parsed_plan)
+    summaries: list[str] = []
+    previous_summary: str | None = None
+    previous_round_moment: int | None = None
+    for entry in validated_rounds:
+        number = entry[FC_ROUND]
+        if entry[FC_PREVIOUS_SUMMARY] != previous_summary:
+            if number == 1:
+                raise _fc_invalid("round 1 previousSummary must be null")
+            raise _fc_invalid(
+                f"round {number} previousSummary breaks the summary chain"
+            )
+        round_moment: int | None = None
+        verified: list[dict] = []
+        confirmation_digests: list[str] = []
+        for index, raw in enumerate(entry[FC_CONFIRMATIONS]):
+            outcome = _verify_fork_confirmation(
+                raw, validated_policy, validated_keyring, decision, moment
+            )
+            if outcome[FE_PLAN_DIGEST] != plan_digest:
+                raise _fc_invalid(
+                    f"round {number} confirmation {index} is bound to a "
+                    "different plan"
+                )
+            aggregated_at = outcome[FE_AGGREGATED_AT]
+            if round_moment is None or aggregated_at > round_moment:
+                round_moment = aggregated_at
+            verified.append(outcome)
+            confirmation_digests.append(
+                outcome[FE_CONFIRMATION_DIGEST]
+            )
+        if (
+            previous_round_moment is not None
+            and round_moment <= previous_round_moment
+        ):
+            raise _fc_invalid(
+                f"round {number} aggregation moment must be strictly "
+                "greater than the previous round's"
+            )
+        _fc_fold_round(state, number, verified)
+        summary = _fc_round_summary(
+            number, previous_summary, confirmation_digests
+        )
+        summaries.append(summary)
+        previous_summary = summary
+        previous_round_moment = round_moment
+    return state, summaries
+
+
+def certify_fork_convergence(
+    rounds: list,
+    decision: bytes,
+    policy: dict,
+    keyring: dict,
+    moment: int,
+    issuer: str,
+    version: int,
+) -> bytes:
+    """Certify that multi-round fork execution confirmations converge.
+
+    ``rounds`` is a non-empty list in strict round order; every round
+    contains exactly its consecutive ``round`` number (starting at one),
+    the ``previousSummary`` (null for round one, the previous round's
+    summary afterwards) and a non-empty list of the canonical
+    confirmation packets :func:`confirm_fork_execution` produced in that
+    round.  ``decision`` is the original accepted fork decision and
+    ``policy``/``keyring`` the shared fork policy and current keyring;
+    ``moment`` is the certification moment and ``issuer``/``version``
+    name the signing key.
+
+    Every confirmation is re-checked through the exact
+    :func:`verify_fork_confirmation` rules at the certification moment
+    (so a confirmation signed for a later moment is not certifiable) and
+    all confirmations must bind the same plan, decision and policy.
+    Rounds number consecutively from one, chain their summaries exactly
+    and use strictly increasing aggregation moments; a gap, broken
+    link, reordering or repetition is rejected.
+
+    Operations converge in plan order: ``failed`` may advance to
+    ``executed`` or ``rejected`` in later rounds; a settled execution or
+    rejection is never reversed or exchanged and an executed post-state
+    digest never changes (new evidence never replaces old evidence), or
+    the operation becomes ``conflicted``.  Any conflict makes the
+    overall status ``conflicted``; otherwise any rejection makes it
+    ``rejected``; an unfinished operation makes it ``partial``; and full
+    convergence is ``confirmed``.
+
+    The result is one canonical compact UTF-8 JSON object with
+    recursively sorted keys, non-ASCII preserved and no trailing byte,
+    carrying exactly ``payload`` and ``signature``.  The payload binds
+    the round summaries in order, the plan and decision digests, the
+    final per-operation results (operation id, target domain,
+    conclusion, settling round and post-state digest, in plan order),
+    the overall status and the issuance identity and moment; the
+    signature is the lowercase hex HMAC-SHA256 of the canonical compact
+    payload bytes under the exact issuer/version key.
+
+    A parameter, container or public field type fault raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); an empty
+    batch or round, an empty issuer, a non-positive version or an
+    illegal moment raises :class:`ValueError`; a bad confirmation raises
+    :class:`InvalidForkExecutionError`; a broken convergence
+    relationship raises :class:`InvalidForkConvergenceError`; unknown,
+    revoked, not-yet-valid or expired credentials or a wrong signature
+    raise :class:`AuthenticationError`.  No file is read or written and
+    no input is modified.
+    """
+    validated_rounds = _validated_fc_rounds(rounds)
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    validated_policy = _validated_fork_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    certify_moment = _fe_moment(moment, "moment")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+
+    # The first round's first confirmation establishes the plan every
+    # round must bind; verifying it first surfaces packet and credential
+    # faults with their native classification.
+    first_outcome = _verify_fork_confirmation(
+        validated_rounds[0][FC_CONFIRMATIONS][0],
+        validated_policy, validated_keyring, decision, certify_moment,
+    )
+    plan_bytes = _fc_confirmation_plan_bytes(
+        validated_rounds[0][FC_CONFIRMATIONS][0]
+    )
+    parsed_plan = _parse_fork_execution_plan(plan_bytes)
+    policy_digest = hashlib.sha256(
+        _fork_policy_bytes(validated_policy)
+    ).hexdigest()
+    if parsed_plan[FE_DECISION_DIGEST] != hashlib.sha256(
+        decision
+    ).hexdigest():
+        raise _fork_execution_invalid(
+            "the round plan is bound to a different decision"
+        )
+    if parsed_plan[FE_POLICY_DIGEST] != policy_digest:
+        raise _fork_execution_invalid(
+            "the round plan policy digest does not match the policy"
+        )
+
+    state, summaries = _fc_process_rounds(
+        validated_rounds, parsed_plan, decision, validated_policy,
+        validated_keyring, certify_moment,
+    )
+
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, certify_moment
+    )
+    payload = {
+        FC_CERTIFIED_AT: certify_moment,
+        FC_DECISION_DIGEST: parsed_plan[FE_DECISION_DIGEST],
+        FC_ISSUER: issuer,
+        KEY_VERSION: version,
+        FC_PLAN_DIGEST: first_outcome[FE_PLAN_DIGEST],
+        FC_POLICY_DIGEST: policy_digest,
+        FC_RESULTS: state,
+        FC_ROUND_SUMMARIES: summaries,
+        STATUS: _fc_overall_status(state),
+        VERSION: FORK_CONVERGENCE_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _checkpoint_compact(
+        {TICKET_PAYLOAD: payload, SIGNATURE: signature}
+    )
+
+
+def _parse_fork_convergence_certificate(raw: object) -> tuple[dict, str]:
+    """Validate certificate bytes structurally into ``(payload, signature)``.
+
+    A non-bytes argument or a wrong public field type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, digest or value-format fault raises
+    :class:`InvalidForkConvergenceError`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("certificate must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _fc_invalid(
+            "certificate must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _fc_invalid("certificate is not valid UTF-8") from exc
+    try:
+        envelope = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_fork_convergence_keys,
+        )
+    except json.JSONDecodeError as exc:
+        raise _fc_invalid("certificate is not valid JSON") from exc
+    if not isinstance(envelope, dict):
+        raise TypeError("certificate must be a JSON object")
+    if set(envelope.keys()) != _FE_RECEIPT_TOP_KEYS:
+        raise _fc_invalid(
+            "certificate must contain exactly 'payload' and 'signature'"
+        )
+    signature = envelope[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("certificate signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
+        raise _fc_invalid(
+            "certificate signature must be 64 lowercase hex characters"
+        )
+    payload = envelope[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("certificate payload must be an object")
+    if set(payload.keys()) != _FC_CERTIFICATE_PAYLOAD_KEYS:
+        raise _fc_invalid(
+            "certificate payload must contain exactly the keys "
+            "'certifiedAt', 'decisionDigest', 'issuer', 'keyVersion', "
+            "'planDigest', 'policyDigest', 'results', 'roundSummaries', "
+            "'status' and 'version'"
+        )
+    issuer = payload[FC_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("certificate issuer must be a str")
+    if issuer == "":
+        raise _fc_invalid("certificate issuer must be non-empty")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("certificate keyVersion must be an int")
+    if key_version <= 0:
+        raise _fc_invalid("certificate keyVersion must be positive")
+    certified_at = payload[FC_CERTIFIED_AT]
+    if isinstance(certified_at, bool) or not isinstance(certified_at, int):
+        raise TypeError("certificate certifiedAt must be an int")
+    if certified_at < 0:
+        raise _fc_invalid("certificate certifiedAt must be >= 0")
+    for name in (FC_DECISION_DIGEST, FC_PLAN_DIGEST, FC_POLICY_DIGEST):
+        value = payload[name]
+        if not isinstance(value, str):
+            raise TypeError(f"certificate {name} must be a str")
+        if not _is_digest(value):
+            raise _fc_invalid(
+                f"certificate {name} must be 64 lowercase hex characters"
+            )
+    status = payload[STATUS]
+    if not isinstance(status, str):
+        raise TypeError("certificate status must be a str")
+    if status not in _FC_STATUSES:
+        raise _fc_invalid("certificate status is not known")
+    version = payload[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("certificate version must be an int")
+    if version != FORK_CONVERGENCE_VERSION:
+        raise _fc_invalid("certificate version must be the integer 1")
+
+    summaries = payload[FC_ROUND_SUMMARIES]
+    if not isinstance(summaries, list):
+        raise TypeError("certificate roundSummaries must be a list")
+    if not summaries:
+        raise _fc_invalid("certificate roundSummaries must be non-empty")
+    for position, summary in enumerate(summaries):
+        if not isinstance(summary, str):
+            raise TypeError(
+                f"certificate roundSummary {position} must be a str"
+            )
+        if not _is_digest(summary):
+            raise _fc_invalid(
+                f"certificate roundSummary {position} must be 64 lowercase "
+                "hex characters"
+            )
+
+    results = payload[FC_RESULTS]
+    if not isinstance(results, list):
+        raise TypeError("certificate results must be a list")
+    if not results:
+        raise _fc_invalid("certificate results must be non-empty")
+    for position, row in enumerate(results):
+        where = f"certificate result {position}"
+        if not isinstance(row, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(row.keys()) != _FC_RESULT_KEYS:
+            raise _fc_invalid(
+                f"{where} must contain exactly 'operationId', 'postDigest', "
+                "'result', 'settledRound' and 'target'"
+            )
+        operation_id = row[FE_OPERATION_ID]
+        if not isinstance(operation_id, str):
+            raise TypeError(f"{where} operationId must be a str")
+        if not _is_digest(operation_id):
+            raise _fc_invalid(
+                f"{where} operationId must be 64 lowercase hex characters"
+            )
+        target = row[FC_TARGET]
+        if not isinstance(target, str):
+            raise TypeError(f"{where} target must be a str")
+        if target == "":
+            raise _fc_invalid(f"{where} target must be non-empty")
+        conclusion = row[FE_RESULT]
+        if not isinstance(conclusion, str):
+            raise TypeError(f"{where} result must be a str")
+        if conclusion not in _FC_CONCLUSIONS:
+            raise _fc_invalid(f"{where} result is not known")
+        settled_round = row[FC_SETTLED_ROUND]
+        if isinstance(settled_round, bool) or not isinstance(
+            settled_round, int
+        ):
+            raise TypeError(f"{where} settledRound must be an int")
+        if settled_round < 0:
+            raise _fc_invalid(f"{where} settledRound must be >= 0")
+        post_digest = row[FC_POST_DIGEST]
+        if post_digest is not None:
+            if not isinstance(post_digest, str):
+                raise TypeError(f"{where} postDigest must be a str or null")
+            if not _is_digest(post_digest):
+                raise _fc_invalid(
+                    f"{where} postDigest must be 64 lowercase hex characters"
+                )
+
+    if _checkpoint_compact(envelope) != raw:
+        raise _fc_invalid(
+            "certificate encoding is not the canonical compact form"
+        )
+    return payload, signature
+
+
+def _verify_fork_convergence(
+    certificate: bytes,
+    validated_rounds: list[dict],
+    decision: bytes,
+    validated_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one certificate against already-validated shared materials."""
+    payload, signature = _parse_fork_convergence_certificate(certificate)
+
+    if payload[FC_CERTIFIED_AT] > moment:
+        raise _fc_invalid(
+            "certification moment must not be later than the verification "
+            "moment"
+        )
+
+    first_raw = validated_rounds[0][FC_CONFIRMATIONS][0]
+    first_outcome = _verify_fork_confirmation(
+        first_raw, validated_policy, validated_keyring, decision, moment
+    )
+    plan_bytes = _fc_confirmation_plan_bytes(first_raw)
+    parsed_plan = _parse_fork_execution_plan(plan_bytes)
+    policy_digest = hashlib.sha256(
+        _fork_policy_bytes(validated_policy)
+    ).hexdigest()
+    decision_digest = hashlib.sha256(decision).hexdigest()
+
+    if first_outcome[FE_PLAN_DIGEST] != payload[FC_PLAN_DIGEST]:
+        raise _fc_invalid(
+            "the round plan digest does not match the bound plan digest"
+        )
+    if payload[FC_PLAN_DIGEST] != hashlib.sha256(plan_bytes).hexdigest():
+        raise _fc_invalid("the bound plan digest does not match the plan")
+    if payload[FC_DECISION_DIGEST] != decision_digest:
+        raise _fc_invalid(
+            "the bound decision digest does not match the offered decision"
+        )
+    if parsed_plan[FE_DECISION_DIGEST] != decision_digest:
+        raise _fork_execution_invalid(
+            "the round plan is bound to a different decision"
+        )
+    if payload[FC_POLICY_DIGEST] != policy_digest:
+        raise _fc_invalid(
+            "the bound policy digest does not match the canonical policy"
+        )
+    if parsed_plan[FE_POLICY_DIGEST] != policy_digest:
+        raise _fork_execution_invalid(
+            "the round plan policy digest does not match the policy"
+        )
+
+    state, summaries = _fc_process_rounds(
+        validated_rounds, parsed_plan, decision, validated_policy,
+        validated_keyring, moment,
+    )
+    if summaries != payload[FC_ROUND_SUMMARIES]:
+        raise _fc_invalid(
+            "the bound round summaries do not match the recomputed chain"
+        )
+    expected_order = [
+        operation[FE_OPERATION_ID]
+        for operation in parsed_plan[FE_OPERATIONS]
+    ]
+    if [row[FE_OPERATION_ID] for row in payload[FC_RESULTS]] != expected_order:
+        raise _fc_invalid(
+            "the bound results must follow the plan operations in order"
+        )
+    if [row[FC_TARGET] for row in payload[FC_RESULTS]] != [
+        operation[FE_TARGET] for operation in parsed_plan[FE_OPERATIONS]
+    ]:
+        raise _fc_invalid(
+            "the bound result targets must follow the plan operations"
+        )
+    if state != payload[FC_RESULTS]:
+        raise _fc_invalid(
+            "the bound results do not match the re-folded convergence state"
+        )
+    if payload[STATUS] != _fc_overall_status(state):
+        raise _fc_invalid(
+            "the bound overall status does not match the re-folded state"
+        )
+
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring,
+        payload[FC_ISSUER],
+        payload[KEY_VERSION],
+        moment,
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "fork convergence certificate signature does not match"
+        )
+
+    return {
+        FC_CERTIFIED_AT: payload[FC_CERTIFIED_AT],
+        FC_CERTIFICATE_DIGEST: hashlib.sha256(certificate).hexdigest(),
+        FC_DECISION_DIGEST: decision_digest,
+        FC_ISSUER: payload[FC_ISSUER],
+        KEY_VERSION: payload[KEY_VERSION],
+        FC_PLAN_DIGEST: payload[FC_PLAN_DIGEST],
+        FC_POLICY_DIGEST: policy_digest,
+        FC_RESULTS: copy.deepcopy(state),
+        FC_ROUNDS_INPUT: [
+            {
+                FC_CONFIRMATIONS: [
+                    hashlib.sha256(raw).hexdigest()
+                    for raw in entry[FC_CONFIRMATIONS]
+                ],
+                FC_PREVIOUS_SUMMARY: entry[FC_PREVIOUS_SUMMARY],
+                FC_ROUND: entry[FC_ROUND],
+            }
+            for entry in validated_rounds
+        ],
+        FC_ROUND_SUMMARIES: list(summaries),
+        STATUS: payload[STATUS],
+        VERSION: FORK_CONVERGENCE_VERSION,
+    }
+
+
+def verify_fork_convergence(
+    certificate: bytes,
+    rounds: list,
+    decision: bytes,
+    policy: dict,
+    keyring: dict,
+    moment: int,
+) -> dict:
+    """Verify one multi-round fork convergence certificate entirely offline.
+
+    Only the certificate bytes, the original ``rounds`` (each with the
+    round number, previous summary and its confirmation packets), the
+    original ``decision`` bytes, the expected ``policy``, the current
+    ``keyring`` and the verification ``moment`` are consulted -- no file
+    is read or written and no argument is modified.  Every confirmation
+    is re-checked through the exact :func:`verify_fork_confirmation`
+    rules and must bind the same plan, decision and policy; the round
+    numbering, previous-summary chain and strictly increasing
+    aggregation moments are recomputed, as are the round summaries, the
+    per-operation fold and the overall status, all of which must match
+    the signed payload.  The HMAC-SHA256 is checked against the exact
+    issuer/version key usable at the verification moment, so a later
+    revocation or expiry rejects the certificate.
+
+    On success a fresh mapping is returned with the fixed keys
+    ``certifiedAt``, ``certificateDigest``, ``decisionDigest``,
+    ``issuer``, ``keyVersion``, ``planDigest``, ``policyDigest``,
+    ``results``, ``rounds``, ``roundSummaries``, ``status`` and
+    ``version`` (the integer 1).  A non-bytes argument or a wrong public
+    field type raises :class:`TypeError` (a :class:`bool` never poses as
+    an int); an illegal round list, policy, keyring or moment raises
+    :class:`ValueError`; a bad confirmation raises
+    :class:`InvalidForkExecutionError`; an illegal certificate or a
+    broken convergence relationship raises
+    :class:`InvalidForkConvergenceError` (a :class:`ValueError`
+    subclass); unknown, revoked, not-yet-valid or expired credentials or
+    a wrong signature raise :class:`AuthenticationError`.
+    """
+    if not isinstance(certificate, bytes):
+        raise TypeError("certificate must be bytes")
+    validated_rounds = _validated_fc_rounds(rounds)
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    validated_policy = _validated_fork_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    return _verify_fork_convergence(
+        certificate, validated_rounds, decision, validated_policy,
+        validated_keyring, verify_moment,
+    )
+
+
+def _validated_fc_items(items: object) -> list[dict]:
+    """Validate a convergence certificate batch before anything is verified."""
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _FC_BATCH_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'certificate', 'id' "
+                "and 'rounds'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        certificate = item["certificate"]
+        if not isinstance(certificate, bytes):
+            raise TypeError(f"{where} certificate must be bytes")
+        rounds = _validated_fc_rounds(item[FC_ROUNDS_INPUT])
+        validated.append(
+            {ID: item_id, "certificate": certificate, FC_ROUNDS_INPUT: rounds}
+        )
+    return validated
+
+
+def _fc_item_report(
+    item_id: str, status: str, error: str | None, result: dict | None
+) -> dict:
+    """One convergence batch report with the fixed key order."""
+    return {
+        CHECKPOINT_ITEM_ERROR: error,
+        ID: item_id,
+        VERDICT_ITEM_RESULT: result,
+        STATUS: status,
+    }
+
+
+def _verify_fc_item(
+    item: dict,
+    decision: bytes,
+    validated_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one certificate in isolation and report its outcome."""
+    item_id = item[ID]
+    try:
+        result = _verify_fork_convergence(
+            item["certificate"], item[FC_ROUNDS_INPUT], decision,
+            validated_policy, validated_keyring, moment,
+        )
+    except AuthenticationError as exc:
+        return _fc_item_report(
+            item_id, _FC_VERIFY_UNAUTHENTICATED, str(exc), None
+        )
+    except (InvalidForkConvergenceError, InvalidForkExecutionError,
+            TypeError) as exc:
+        # A TypeError here can only come from a wrong JSON field type
+        # inside the certificate bytes; the public arguments were all
+        # validated before the batch ran.
+        return _fc_item_report(item_id, _FC_VERIFY_INVALID, str(exc), None)
+    return _fc_item_report(item_id, _FC_VERIFY_VERIFIED, None, result)
+
+
+def verify_fork_convergences(
+    items: list, decision: bytes, policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify a whole batch of fork convergence certificates offline.
+
+    ``items`` is a non-empty list; each item contains exactly a
+    non-empty, batch-unique ``id``, the ``certificate`` bytes and the
+    non-empty ``rounds`` list holding that certificate's original
+    rounds.  The batch and the shared ``decision``, ``policy``,
+    ``keyring`` and ``moment`` are validated in full -- container,
+    element or field type faults raise :class:`TypeError` and an empty
+    list, an empty rounds list, an empty or duplicate id, a wrong item
+    key set or an illegal moment raises :class:`ValueError` (a
+    :class:`bool` never poses as an int) -- before any certificate is
+    verified, so only such a batch-level fault raises.  Each certificate
+    is then checked independently, in strict input order, through the
+    exact :func:`verify_fork_convergence` rules: one failure never stops
+    a later item or changes an earlier report, a bad confirmation,
+    certificate or convergence relationship makes it ``invalid`` and
+    unknown, revoked, not-yet-valid or expired credentials or a wrong
+    signature make it ``unauthenticated``.
+
+    The top-level result is a fresh dict with the fixed keys ``items``
+    and ``version`` (the integer 1); each item report carries, in this
+    key order, ``error`` (null exactly when verified), ``id``,
+    ``result`` (a fresh independent copy of the single-certificate
+    result when verified, null otherwise) and ``status``; a failed item
+    keeps a definite, non-empty copy of the original exception text and
+    no identity of an unauthenticated payload enters a result.
+    Repeated calls return equal but mutually independent results.  No
+    file is read or written and no input is modified.
+    """
+    validated_items = _validated_fc_items(items)
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    validated_policy = _validated_fork_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    return {
+        ITEMS: [
+            _verify_fc_item(
+                item, decision, validated_policy, validated_keyring,
+                verify_moment,
+            )
+            for item in validated_items
+        ],
+        VERSION: FORK_CONVERGENCE_VERSION,
     }
