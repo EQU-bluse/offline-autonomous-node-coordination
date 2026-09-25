@@ -40,8 +40,8 @@ BOUNDARY = {"lastSeq": 5, "tail": "aa" * 32}
 OTHER_BOUNDARY = {"lastSeq": 6, "tail": "dd" * 32}
 
 RESULT_KEYS = [
-    "batch", "boundary", "digest", "issuer", "items", "keyVersion",
-    "policyDigest", "signedAt", "status", "verdictDigest", "version",
+    "batch", "issuer", "keyVersion", "signedAt", "policyDigest",
+    "verdictDigest", "status", "digest", "boundary", "items", "version",
 ]
 
 
@@ -539,12 +539,43 @@ class ProofStructureTest(unittest.TestCase):
                 text.encode("utf-8"), policy(), keyring(), MOMENT
             )
 
-    def test_illegal_verdict_inside_proof_is_a_verdict_error(self):
-        data = json.loads(self.proof)
-        data["payload"]["verdict"] = {"unexpected": True}
-        with self.assertRaises(InvalidRecoveryVerdictError):
+    def test_illegal_verdict_inside_proof_is_a_proof_error(self):
+        # The bound verdict is part of the proof payload: every illegal
+        # structure, field type or canonical encoding is a proof fault,
+        # not a standalone verdict fault or a bare TypeError.
+        bad_structures = [
+            {"unexpected": True},
+        ]
+        for replacement in bad_structures:
+            data = json.loads(self.proof)
+            data["payload"]["verdict"] = replacement
+            with self.subTest(replacement=replacement):
+                with self.assertRaises(InvalidRecoveryVerdictProofError):
+                    verify_recovery_verdict(
+                        compact(data), policy(), keyring(), MOMENT
+                    )
+        # A wrong field *type* inside the bound verdict is likewise a
+        # proof error rather than escaping as a TypeError.
+        typed = json.loads(self.proof)
+        typed["payload"]["verdict"]["version"] = "1"
+        with self.assertRaises(InvalidRecoveryVerdictProofError):
             verify_recovery_verdict(
-                compact(data), policy(), keyring(), MOMENT
+                compact(typed), policy(), keyring(), MOMENT
+            )
+        # A non-canonical bound verdict carrying a duplicate nested key
+        # is also a proof error.
+        data = json.loads(self.proof)
+        verdict_text = compact(data["payload"]["verdict"]).decode("utf-8")
+        tampered_verdict = verdict_text.replace(
+            '"status":"accepted"', '"status":"accepted","status":"accepted"',
+            1,
+        )
+        proof_text = compact(data).decode("utf-8").replace(
+            verdict_text, tampered_verdict, 1
+        )
+        with self.assertRaises(InvalidRecoveryVerdictProofError):
+            verify_recovery_verdict(
+                proof_text.encode("utf-8"), policy(), keyring(), MOMENT
             )
 
 
