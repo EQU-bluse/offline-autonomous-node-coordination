@@ -551,6 +551,80 @@ enters a result.  Repeated calls return equal but mutually independent
 results.  None of the three entry points reads or writes a file or
 modifies an input, and the existing proof interfaces and module
 commands are unchanged.
+
+:func:`plan_fork_execution` turns an accepted fork decision into a
+site execution plan, still entirely offline.  It takes the decision
+bytes, the original ``policy``, the current ``keyring``, the
+generation ``moment`` and the expiry ``expires``; the decision is
+re-verified through the exact :func:`verify_fork_decision` rules and
+any conclusion other than ``accepted`` raises :class:`ValueError`.
+The plan is one canonical compact UTF-8 JSON object (recursively
+sorted keys, non-ASCII preserved, no trailing byte) binding exactly
+``action``, ``boundaries``, ``decisionDigest``, ``expires``,
+``moment``, ``operations``, ``policyDigest``, ``targets`` and
+``version`` (the integer 1) -- never the un-adopted proofs.  Each
+ascending target domain gets exactly one operation whose ``id`` is the
+SHA-256 of the canonical bytes of the decision digest, the action, the
+target domain and the related boundary objects; an ``isolate``
+operation requires the target domain to still be active while a
+``rollback`` operation binds the base receipts and forking upstreams
+of the related boundaries as its execution precondition.
+
+:func:`confirm_fork_execution` aggregates the site execution receipts
+for such a plan into one signed confirmation.  It takes the plan, the
+original decision and policy, a non-empty ``receipts`` list (each item
+exactly a non-empty, batch-unique ``id`` and ``receipt`` bytes), the
+current ``keyring`` and the aggregation ``issuer``, ``version`` and
+``moment``.  Each receipt binds the plan digest, one operation, its
+site and key version, its moment and the pre-digest of the operation
+precondition, plus the post-digest when it reports ``executed``; the
+receipt site must equal the operation target and the exact key must be
+usable at both the receipt moment and the aggregation moment.  A
+receipt that fails its encoding or any binding rejects just that item
+with one fixed reason (``invalid-receipt``, ``decision-replaced``,
+``unknown-operation``, ``outside-validity``,
+``precondition-mismatch``, ``unauthorized-site``,
+``credential-unavailable``, ``revoked``, ``not-yet-valid``,
+``expired``, ``bad-signature`` or ``out-of-order``); an identical
+receipt digest counts once per operation (extras are ``duplicate``)
+and different valid results or post digests for one operation are a
+``contradiction``.  Any contradiction makes an operation
+``conflicted``; otherwise an explicit rejection makes it
+``rejected``, a missing or failed execution makes it ``partial`` and
+a clean execution makes it ``confirmed``, and the worst operation in
+that order forms the overall ``conflicted``, ``rejected``,
+``partial`` or ``confirmed`` status.  The signed payload binds
+exactly ``decisionDigest``, ``issuer``, ``keyVersion``, ``moment``,
+``operations``, ``planDigest``, ``receipts`` (each digest, conclusion
+and reason in the original input order), ``status`` and ``version``,
+encoded with the same canonical rules as the plan.
+
+:func:`verify_fork_confirmation` re-checks such a confirmation
+entirely offline from the confirmation bytes, the plan, the original
+decision and policy, the receipt bytes, the current keyring and the
+verification moment: it re-derives every per-receipt outcome,
+per-operation conclusion and the overall status, re-checks every
+digest binding and verifies the HMAC against the key the *current*
+keyring binds to the payload's exact issuer and version, usable at
+the verification moment.  It returns a fresh dict keyed
+``confirmationDigest``, ``decisionDigest``, ``issuer``,
+``keyVersion``, ``moment``, ``operations``, ``planDigest``,
+``receipts``, ``status`` and ``version`` (the integer 1).
+:func:`verify_fork_confirmations` verifies a non-empty batch of those
+confirmations independently, in strict input order, reporting each as
+``verified``, ``invalid`` or ``unauthenticated`` with the fixed key
+order ``error``, ``id``, ``result`` and ``status``.  A parameter,
+container or public field type fault raises :class:`TypeError` (a
+:class:`bool` never poses as an int); an empty value, a duplicate
+identifier or an illegal moment raises :class:`ValueError`; an
+illegal plan or confirmation encoding, digest, ordering or binding
+raises :class:`InvalidForkExecutionError` (a :class:`ValueError`
+subclass) while the same faults inside a receipt are only recorded as
+``invalid-receipt``; unknown, revoked, not-yet-valid or expired
+credentials or a wrong signature at aggregation signing or
+confirmation verification raise :class:`AuthenticationError`.  None
+of the four entry points reads or writes a file, and the existing
+public behavior is unchanged.
 """
 
 from __future__ import annotations
@@ -10452,4 +10526,1607 @@ def verify_fork_decisions(
             for item in validated_items
         ],
         VERSION: FORK_DECISION_VERSION,
+    }
+
+
+FORK_EXECUTION_VERSION = 1
+
+FE_ACTION = FD_ACTION
+FE_BOUNDARIES = FD_BOUNDARIES
+FE_CONCLUSION = ADJ_CONCLUSION
+FE_DECISION_DIGEST = "decisionDigest"
+FE_DIGEST = CP_DIGEST
+FE_EXPIRES = "expires"
+FE_KIND = "kind"
+FE_MOMENT = CP_MOMENT
+FE_OPERATIONS = "operations"
+FE_PLAN_DIGEST = "planDigest"
+FE_POLICY_DIGEST = FD_POLICY_DIGEST
+FE_PRECONDITION = "precondition"
+FE_RECEIPTS = "receipts"
+FE_TARGETS = FD_TARGETS
+FE_UPSTREAMS = "upstreams"
+
+FE_CONFIRMATION = "confirmation"
+FE_OPERATION = "operation"
+FE_POST = "post"
+FE_PRE = "pre"
+FE_RECEIPT = "receipt"
+FE_RESULT = "result"
+FE_TARGET = DELEGATION_TARGET
+
+FE_PRECONDITION_ISOLATE = "target-active"
+FE_PRECONDITION_ROLLBACK = "fork-rollback"
+
+FE_RESULT_EXECUTED = "executed"
+FE_RESULT_REJECTED = "rejected"
+FE_RESULT_FAILED = "failed"
+_FE_RESULTS = frozenset((
+    FE_RESULT_EXECUTED,
+    FE_RESULT_REJECTED,
+    FE_RESULT_FAILED,
+))
+
+FE_CONCLUSION_EXECUTED = FE_RESULT_EXECUTED
+FE_CONCLUSION_REJECTED = FE_RESULT_REJECTED
+FE_CONCLUSION_FAILED = FE_RESULT_FAILED
+FE_CONCLUSION_DUPLICATE = ADJ_CONCLUSION_DUPLICATE
+FE_CONCLUSION_CONTRADICTION = ADJ_CONCLUSION_CONTRADICTION
+FE_CONCLUSION_INVALID_RECEIPT = "invalid-receipt"
+_FE_ITEM_CONCLUSIONS = frozenset((
+    FE_CONCLUSION_EXECUTED,
+    FE_CONCLUSION_REJECTED,
+    FE_CONCLUSION_FAILED,
+    FE_CONCLUSION_DUPLICATE,
+    FE_CONCLUSION_CONTRADICTION,
+    FE_CONCLUSION_INVALID_RECEIPT,
+))
+
+FE_STATUS_CONFIRMED = "confirmed"
+FE_STATUS_CONFLICTED = "conflicted"
+FE_STATUS_REJECTED = "rejected"
+FE_STATUS_PARTIAL = "partial"
+_FE_STATUSES = frozenset((
+    FE_STATUS_CONFIRMED,
+    FE_STATUS_CONFLICTED,
+    FE_STATUS_REJECTED,
+    FE_STATUS_PARTIAL,
+))
+
+FE_REASON_INVALID_RECEIPT = "invalid-receipt"
+FE_REASON_DECISION_REPLACED = "decision-replaced"
+FE_REASON_UNKNOWN_OPERATION = "unknown-operation"
+FE_REASON_OUTSIDE_VALIDITY = "outside-validity"
+FE_REASON_PRECONDITION_MISMATCH = "precondition-mismatch"
+FE_REASON_OUT_OF_ORDER = "out-of-order"
+_FE_INVALID_RECEIPT_REASONS = frozenset((
+    FE_REASON_INVALID_RECEIPT,
+    FE_REASON_DECISION_REPLACED,
+    FE_REASON_UNKNOWN_OPERATION,
+    FE_REASON_OUTSIDE_VALIDITY,
+    FE_REASON_PRECONDITION_MISMATCH,
+    FE_REASON_OUT_OF_ORDER,
+    REASON_UNAUTHORIZED_SITE,
+    REASON_CREDENTIAL_UNAVAILABLE,
+    REASON_REVOKED,
+    REASON_NOT_YET_VALID,
+    REASON_EXPIRED,
+    REASON_BAD_SIGNATURE,
+))
+
+_FE_PLAN_KEYS = frozenset((
+    FE_ACTION,
+    FE_BOUNDARIES,
+    FE_DECISION_DIGEST,
+    FE_EXPIRES,
+    FE_MOMENT,
+    FE_OPERATIONS,
+    FE_POLICY_DIGEST,
+    FE_TARGETS,
+    VERSION,
+))
+_FE_OPERATION_KEYS = frozenset((ID, FE_PRECONDITION, FE_TARGET))
+_FE_PRECONDITION_ISOLATE_KEYS = frozenset((FE_KIND, FE_TARGET))
+_FE_PRECONDITION_ROLLBACK_KEYS = frozenset((
+    FE_KIND,
+    FE_RECEIPTS,
+    FE_UPSTREAMS,
+))
+_FE_RECEIPT_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_FE_RECEIPT_PAYLOAD_KEYS = frozenset((
+    KEY_VERSION,
+    FE_MOMENT,
+    FE_OPERATION,
+    FE_PLAN_DIGEST,
+    FE_POST,
+    FE_PRE,
+    FE_RESULT,
+    ADJ_SITE,
+    VERSION,
+))
+_FE_CONFIRMATION_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_FE_CONFIRMATION_PAYLOAD_KEYS = frozenset((
+    FE_DECISION_DIGEST,
+    VD_ISSUER,
+    KEY_VERSION,
+    FE_MOMENT,
+    FE_OPERATIONS,
+    FE_PLAN_DIGEST,
+    FE_RECEIPTS,
+    STATUS,
+    VERSION,
+))
+_FE_ITEM_REPORT_KEYS = frozenset((FE_CONCLUSION, FE_DIGEST, ID, ADJ_REASON))
+_FE_OPERATION_REPORT_KEYS = frozenset((FE_CONCLUSION, FE_OPERATION, FE_TARGET))
+_FE_RECEIPT_ITEM_KEYS = frozenset((ID, FE_RECEIPT))
+_FE_CONFIRMATION_ITEM_KEYS = frozenset((FE_CONFIRMATION, ID))
+_FE_VERIFY_VERIFIED = "verified"
+_FE_VERIFY_INVALID = "invalid"
+_FE_VERIFY_UNAUTHENTICATED = "unauthenticated"
+
+
+class InvalidForkExecutionError(ValueError):
+    """A fork execution plan or confirmation fails its binding contract."""
+
+
+def _fork_execution_invalid(message: str) -> InvalidForkExecutionError:
+    return InvalidForkExecutionError(f"invalid fork execution: {message}")
+
+
+def _reject_duplicate_fork_execution_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _fork_execution_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _validated_execution_boundary(value: object, where: str) -> dict:
+    """Validate one plan boundary exactly like a decision boundary."""
+    if not isinstance(value, dict):
+        raise TypeError(f"{where} boundary must be an object")
+    if set(value.keys()) != _FD_BOUNDARY_KEYS:
+        raise _fork_execution_invalid(
+            f"{where} boundary must contain exactly the keys 'receiptDigest', "
+            "'target' and 'upstream'"
+        )
+    receipt_digest = value[DELEGATION_RECEIPT_DIGEST]
+    target = value[DELEGATION_TARGET]
+    upstream = value[DELEGATION_UPSTREAM]
+    if not isinstance(receipt_digest, str):
+        raise TypeError(f"{where} receiptDigest must be a str")
+    if not isinstance(target, str):
+        raise TypeError(f"{where} target must be a str")
+    if not isinstance(upstream, str):
+        raise TypeError(f"{where} upstream must be a str")
+    if not _is_digest(receipt_digest):
+        raise _fork_execution_invalid(
+            f"{where} receiptDigest must be 64 lowercase hex characters"
+        )
+    if target == "":
+        raise _fork_execution_invalid(f"{where} target must be non-empty")
+    if not _is_digest(upstream):
+        raise _fork_execution_invalid(
+            f"{where} upstream must be 64 lowercase hex characters"
+        )
+    return {
+        DELEGATION_RECEIPT_DIGEST: receipt_digest,
+        DELEGATION_TARGET: target,
+        DELEGATION_UPSTREAM: upstream,
+    }
+
+
+def _validated_execution_precondition(
+    value: object, action: str, target: str, where: str
+) -> dict:
+    """Validate one operation precondition against the plan action."""
+    if not isinstance(value, dict):
+        raise TypeError(f"{where} precondition must be an object")
+    kind = value.get(FE_KIND)
+    if action == FD_ACTION_ISOLATE:
+        if set(value.keys()) != _FE_PRECONDITION_ISOLATE_KEYS:
+            raise _fork_execution_invalid(
+                f"{where} precondition must contain exactly the keys 'kind' "
+                "and 'target'"
+            )
+        if kind != FE_PRECONDITION_ISOLATE:
+            raise _fork_execution_invalid(
+                f"{where} precondition kind must be 'target-active'"
+            )
+        if value[FE_TARGET] != target:
+            raise _fork_execution_invalid(
+                f"{where} precondition target must be the operation target"
+            )
+        return {FE_KIND: FE_PRECONDITION_ISOLATE, FE_TARGET: target}
+    if set(value.keys()) != _FE_PRECONDITION_ROLLBACK_KEYS:
+        raise _fork_execution_invalid(
+            f"{where} precondition must contain exactly the keys 'kind', "
+            "'receipts' and 'upstreams'"
+        )
+    if kind != FE_PRECONDITION_ROLLBACK:
+        raise _fork_execution_invalid(
+            f"{where} precondition kind must be 'fork-rollback'"
+        )
+    precondition: dict = {FE_KIND: FE_PRECONDITION_ROLLBACK}
+    for key in (FE_RECEIPTS, FE_UPSTREAMS):
+        digests = value[key]
+        if not isinstance(digests, list):
+            raise TypeError(f"{where} precondition {key} must be a list")
+        if not digests:
+            raise _fork_execution_invalid(
+                f"{where} precondition {key} must be non-empty"
+            )
+        for position, digest in enumerate(digests):
+            if not isinstance(digest, str):
+                raise TypeError(
+                    f"{where} precondition {key} {position} must be a str"
+                )
+            if not _is_digest(digest):
+                raise _fork_execution_invalid(
+                    f"{where} precondition {key} {position} must be 64 "
+                    "lowercase hex characters"
+                )
+        if len(set(digests)) != len(digests) or digests != sorted(digests):
+            raise _fork_execution_invalid(
+                f"{where} precondition {key} must be unique and sorted "
+                "ascending"
+            )
+        precondition[key] = list(digests)
+    return precondition
+
+
+def _fork_execution_operations(
+    action: str,
+    boundaries: list[dict],
+    targets: list[str],
+    decision_digest: str,
+) -> list[dict]:
+    """Derive the single operation each ascending target domain gets.
+
+    The idempotency identifier is the SHA-256 of the canonical bytes of
+    the decision digest, the action, the target domain and the boundary
+    objects related to that target.  An ``isolate`` operation requires
+    the target domain to still be active; a ``rollback`` operation binds
+    the base receipts and forking upstreams of the related boundaries as
+    its execution precondition.
+    """
+    operations: list[dict] = []
+    for target in targets:
+        related = [
+            boundary
+            for boundary in boundaries
+            if boundary[DELEGATION_TARGET] == target
+        ]
+        if action == FD_ACTION_ISOLATE:
+            precondition = {
+                FE_KIND: FE_PRECONDITION_ISOLATE,
+                FE_TARGET: target,
+            }
+        else:
+            precondition = {
+                FE_KIND: FE_PRECONDITION_ROLLBACK,
+                FE_RECEIPTS: sorted({
+                    boundary[DELEGATION_RECEIPT_DIGEST] for boundary in related
+                }),
+                FE_UPSTREAMS: sorted({
+                    boundary[DELEGATION_UPSTREAM] for boundary in related
+                }),
+            }
+        operation_id = hashlib.sha256(
+            _checkpoint_compact(
+                {
+                    FE_ACTION: action,
+                    FE_BOUNDARIES: related,
+                    FE_DECISION_DIGEST: decision_digest,
+                    FE_TARGET: target,
+                }
+            )
+        ).hexdigest()
+        operations.append(
+            {
+                ID: operation_id,
+                FE_PRECONDITION: precondition,
+                FE_TARGET: target,
+            }
+        )
+    return operations
+
+
+def _parse_execution_plan(raw: object) -> dict:
+    """Validate plan bytes structurally into the plan payload.
+
+    A non-bytes argument or a field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, digest, ordering or value-format fault raises
+    :class:`InvalidForkExecutionError`.  The operation derivation and
+    the decision/policy bindings are checked separately.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("plan must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _fork_execution_invalid(
+            "plan must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _fork_execution_invalid("plan is not valid UTF-8") from exc
+    try:
+        payload = json.loads(
+            text, object_pairs_hook=_reject_duplicate_fork_execution_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _fork_execution_invalid("plan is not valid JSON") from exc
+
+    if not isinstance(payload, dict):
+        raise TypeError("plan must be a JSON object")
+    if set(payload.keys()) != _FE_PLAN_KEYS:
+        raise _fork_execution_invalid(
+            "plan must contain exactly the keys 'action', 'boundaries', "
+            "'decisionDigest', 'expires', 'moment', 'operations', "
+            "'policyDigest', 'targets' and 'version'"
+        )
+    action = payload[FE_ACTION]
+    if not isinstance(action, str):
+        raise TypeError("plan action must be a str")
+    if action not in _FD_ACTIONS:
+        raise _fork_execution_invalid(
+            "plan action must be one of 'isolate' or 'rollback'"
+        )
+    for key in (FE_DECISION_DIGEST, FE_POLICY_DIGEST):
+        digest = payload[key]
+        if not isinstance(digest, str):
+            raise TypeError(f"plan {key} must be a str")
+        if not _is_digest(digest):
+            raise _fork_execution_invalid(
+                f"plan {key} must be 64 lowercase hex characters"
+            )
+    moments: dict[str, int] = {}
+    for key in (FE_MOMENT, FE_EXPIRES):
+        bound = payload[key]
+        if isinstance(bound, bool) or not isinstance(bound, int):
+            raise TypeError(f"plan {key} must be an int")
+        if bound < 0:
+            raise _fork_execution_invalid(f"plan {key} must be non-negative")
+        moments[key] = bound
+    if moments[FE_EXPIRES] < moments[FE_MOMENT]:
+        raise _fork_execution_invalid(
+            "plan expires must not precede plan moment"
+        )
+
+    raw_boundaries = payload[FE_BOUNDARIES]
+    if not isinstance(raw_boundaries, list):
+        raise TypeError("plan boundaries must be a list")
+    if not raw_boundaries:
+        raise _fork_execution_invalid("plan boundaries must be non-empty")
+    boundaries = [
+        _validated_execution_boundary(value, "plan boundaries")
+        for value in raw_boundaries
+    ]
+    triples = _boundary_triples(boundaries)
+    if len(set(triples)) != len(triples) or list(triples) != sorted(triples):
+        raise _fork_execution_invalid(
+            "plan boundaries must be unique and sorted ascending"
+        )
+
+    targets = payload[FE_TARGETS]
+    if not isinstance(targets, list):
+        raise TypeError("plan targets must be a list")
+    if not targets:
+        raise _fork_execution_invalid("plan targets must be non-empty")
+    for position, target in enumerate(targets):
+        if not isinstance(target, str):
+            raise TypeError(f"plan target {position} must be a str")
+        if target == "":
+            raise _fork_execution_invalid(
+                f"plan target {position} must be non-empty"
+            )
+    if len(set(targets)) != len(targets) or targets != sorted(targets):
+        raise _fork_execution_invalid(
+            "plan targets must be unique and sorted ascending"
+        )
+
+    raw_operations = payload[FE_OPERATIONS]
+    if not isinstance(raw_operations, list):
+        raise TypeError("plan operations must be a list")
+    if not raw_operations:
+        raise _fork_execution_invalid("plan operations must be non-empty")
+    operations: list[dict] = []
+    for position, operation in enumerate(raw_operations):
+        where = f"plan operation {position}"
+        if not isinstance(operation, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(operation.keys()) != _FE_OPERATION_KEYS:
+            raise _fork_execution_invalid(
+                f"{where} must contain exactly the keys 'id', 'precondition' "
+                "and 'target'"
+            )
+        operation_id = operation[ID]
+        if not isinstance(operation_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if not _is_digest(operation_id):
+            raise _fork_execution_invalid(
+                f"{where} id must be 64 lowercase hex characters"
+            )
+        target = operation[FE_TARGET]
+        if not isinstance(target, str):
+            raise TypeError(f"{where} target must be a str")
+        if target == "":
+            raise _fork_execution_invalid(f"{where} target must be non-empty")
+        precondition = _validated_execution_precondition(
+            operation[FE_PRECONDITION], action, target, where
+        )
+        operations.append(
+            {ID: operation_id, FE_PRECONDITION: precondition, FE_TARGET: target}
+        )
+    operation_targets = [operation[FE_TARGET] for operation in operations]
+    if len(set(operation_targets)) != len(operation_targets):
+        raise _fork_execution_invalid(
+            "plan operations must not repeat a target domain"
+        )
+    if operation_targets != sorted(operation_targets):
+        raise _fork_execution_invalid(
+            "plan operations must be sorted by target ascending"
+        )
+    if operation_targets != targets:
+        raise _fork_execution_invalid(
+            "plan operations must cover exactly the plan targets"
+        )
+
+    plan_version = payload[VERSION]
+    if isinstance(plan_version, bool) or not isinstance(plan_version, int):
+        raise TypeError("plan version must be an int")
+    if plan_version != FORK_EXECUTION_VERSION:
+        raise _fork_execution_invalid("plan version must be the integer 1")
+
+    normalized = {
+        FE_ACTION: action,
+        FE_BOUNDARIES: boundaries,
+        FE_DECISION_DIGEST: payload[FE_DECISION_DIGEST],
+        FE_EXPIRES: moments[FE_EXPIRES],
+        FE_MOMENT: moments[FE_MOMENT],
+        FE_OPERATIONS: operations,
+        FE_POLICY_DIGEST: payload[FE_POLICY_DIGEST],
+        FE_TARGETS: list(targets),
+        VERSION: FORK_EXECUTION_VERSION,
+    }
+    if _checkpoint_compact(normalized) != raw:
+        raise _fork_execution_invalid(
+            "plan encoding is not the canonical compact form"
+        )
+    return normalized
+
+
+def _check_plan_consistency(plan_payload: dict) -> None:
+    """Re-derive the plan operations from its own bound material."""
+    expected = _fork_execution_operations(
+        plan_payload[FE_ACTION],
+        plan_payload[FE_BOUNDARIES],
+        plan_payload[FE_TARGETS],
+        plan_payload[FE_DECISION_DIGEST],
+    )
+    if plan_payload[FE_OPERATIONS] != expected:
+        raise _fork_execution_invalid(
+            "plan operations do not match the bound decision digest, action, "
+            "targets and boundaries"
+        )
+
+
+def _verify_decision_for_execution(
+    decision: object,
+    validated_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify the bound decision and require the accepted conclusion."""
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    result = _verify_fork_decision(
+        decision, validated_policy, validated_keyring, moment
+    )
+    if result[STATUS] != FD_STATUS_ACCEPTED:
+        raise _fork_execution_invalid(
+            "decision does not conclude accepted"
+        )
+    return result
+
+
+def _check_plan_digest_bindings(
+    plan_payload: dict, decision: object, validated_policy: dict
+) -> None:
+    """Require the plan to name exactly this decision and policy."""
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    if plan_payload[FE_DECISION_DIGEST] != hashlib.sha256(decision).hexdigest():
+        raise _fork_execution_invalid(
+            "plan decision digest does not match the decision"
+        )
+    expected_policy_digest = hashlib.sha256(
+        _fork_policy_bytes(validated_policy)
+    ).hexdigest()
+    if plan_payload[FE_POLICY_DIGEST] != expected_policy_digest:
+        raise _fork_execution_invalid(
+            "plan policy digest does not match the policy"
+        )
+
+
+def _check_plan_binds_decision(
+    plan_payload: dict,
+    decision_result: dict,
+) -> None:
+    """Require the plan fields to match the verified decision exactly."""
+    if plan_payload[FE_ACTION] != decision_result[FD_ACTION]:
+        raise _fork_execution_invalid("plan action does not match the decision")
+    if plan_payload[FE_BOUNDARIES] != decision_result[FD_BOUNDARIES]:
+        raise _fork_execution_invalid(
+            "plan boundaries do not match the decision"
+        )
+    if plan_payload[FE_TARGETS] != decision_result[FD_TARGETS]:
+        raise _fork_execution_invalid("plan targets do not match the decision")
+
+
+def plan_fork_execution(
+    decision: bytes,
+    policy: dict,
+    keyring: dict,
+    moment: int,
+    expires: int,
+) -> bytes:
+    """Plan the site execution of an accepted fork decision offline.
+
+    ``decision`` is the signed decision :func:`decide_forks` produced;
+    it is re-verified against ``policy``, ``keyring`` and ``moment``
+    through the exact :func:`verify_fork_decision` rules and must
+    conclude ``accepted`` -- any other conclusion raises
+    :class:`ValueError`.  ``moment`` is the generation time and
+    ``expires`` the expiry time of the plan, both non-negative integers
+    with ``expires`` not preceding ``moment``.  No file is read or
+    written and no input is modified.
+
+    The plan is one canonical compact UTF-8 JSON object (recursively
+    sorted keys, non-ASCII preserved, no trailing byte) binding exactly
+    ``action``, ``boundaries`` (every fork boundary of the decision),
+    ``decisionDigest`` (the SHA-256 of the decision bytes), ``expires``,
+    ``moment``, ``operations``, ``policyDigest`` (the SHA-256 of the
+    canonical policy), ``targets`` (the ascending target domains) and
+    ``version`` (the integer 1); the un-adopted proofs of the decision
+    are never copied.  Each target
+    domain gets exactly one operation carrying ``id``, ``precondition``
+    and ``target``: the id is the SHA-256 of the canonical bytes of the
+    decision digest, the action, the target domain and the boundary
+    objects related to that target; an ``isolate`` precondition requires
+    the target domain to still be active (``{"kind":"target-active"}``)
+    while a ``rollback`` precondition binds the base receipts and
+    forking upstreams of the related boundaries
+    (``{"kind":"fork-rollback","receipts":...,"upstreams":...}``) as the
+    execution precondition.
+
+    A parameter, container or field type fault raises :class:`TypeError`
+    (a :class:`bool` never poses as an int); an illegal policy, keyring
+    or moment raises :class:`ValueError`; a decision that fails its own
+    contract raises :class:`InvalidForkDecisionError`; unknown, revoked,
+    not-yet-valid or expired decision credentials raise
+    :class:`AuthenticationError`.
+    """
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    validated_policy = _validated_fork_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+    if isinstance(expires, bool) or not isinstance(expires, int):
+        raise TypeError("expires must be an int")
+    if expires < 0:
+        raise ValueError("expires must be non-negative")
+    if expires < moment:
+        raise ValueError("expires must not precede moment")
+
+    decision_result = _verify_fork_decision(
+        decision, validated_policy, validated_keyring, moment
+    )
+    if decision_result[STATUS] != FD_STATUS_ACCEPTED:
+        raise ValueError("decision does not conclude accepted")
+
+    decision_digest = hashlib.sha256(decision).hexdigest()
+    payload = {
+        FE_ACTION: decision_result[FD_ACTION],
+        FE_BOUNDARIES: decision_result[FD_BOUNDARIES],
+        FE_DECISION_DIGEST: decision_digest,
+        FE_EXPIRES: expires,
+        FE_MOMENT: moment,
+        FE_OPERATIONS: _fork_execution_operations(
+            decision_result[FD_ACTION],
+            decision_result[FD_BOUNDARIES],
+            decision_result[FD_TARGETS],
+            decision_digest,
+        ),
+        FE_POLICY_DIGEST: hashlib.sha256(
+            _fork_policy_bytes(validated_policy)
+        ).hexdigest(),
+        FE_TARGETS: decision_result[FD_TARGETS],
+        VERSION: FORK_EXECUTION_VERSION,
+    }
+    return _checkpoint_compact(payload)
+
+
+def _parse_execution_receipt(raw: bytes) -> tuple[dict, str]:
+    """Validate receipt bytes structurally into ``(payload, signature)``.
+
+    A field of the wrong type raises :class:`TypeError` (a
+    :class:`bool` never poses as an int); every encoding, key-set,
+    digest or value-format fault raises
+    :class:`InvalidForkExecutionError`, which the confirmation layer
+    records as ``invalid-receipt`` instead of raising.
+    """
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _fork_execution_invalid(
+            "receipt must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _fork_execution_invalid("receipt is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_fork_execution_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _fork_execution_invalid("receipt is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("receipt must be a JSON object")
+    if set(data.keys()) != _FE_RECEIPT_TOP_KEYS:
+        raise _fork_execution_invalid(
+            "receipt must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("receipt signature must be a str")
+    if not _is_digest(signature):
+        raise _fork_execution_invalid(
+            "receipt signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("receipt payload must be an object")
+    if set(payload.keys()) != _FE_RECEIPT_PAYLOAD_KEYS:
+        raise _fork_execution_invalid(
+            "receipt payload must contain exactly the keys 'keyVersion', "
+            "'moment', 'operation', 'planDigest', 'post', 'pre', 'result', "
+            "'site' and 'version'"
+        )
+
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("receipt keyVersion must be an int")
+    if key_version <= 0:
+        raise _fork_execution_invalid("receipt keyVersion must be positive")
+    moment = payload[FE_MOMENT]
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("receipt moment must be an int")
+    if moment < 0:
+        raise _fork_execution_invalid("receipt moment must be non-negative")
+    for key in (FE_OPERATION, FE_PLAN_DIGEST, FE_PRE):
+        digest = payload[key]
+        if not isinstance(digest, str):
+            raise TypeError(f"receipt {key} must be a str")
+        if not _is_digest(digest):
+            raise _fork_execution_invalid(
+                f"receipt {key} must be 64 lowercase hex characters"
+            )
+    post = payload[FE_POST]
+    if post is not None:
+        if not isinstance(post, str):
+            raise TypeError("receipt post must be a str or null")
+        if not _is_digest(post):
+            raise _fork_execution_invalid(
+                "receipt post must be 64 lowercase hex characters"
+            )
+    result = payload[FE_RESULT]
+    if not isinstance(result, str):
+        raise TypeError("receipt result must be a str")
+    if result not in _FE_RESULTS:
+        raise _fork_execution_invalid(
+            "receipt result must be one of 'executed', 'rejected' or 'failed'"
+        )
+    if (result == FE_RESULT_EXECUTED) != (post is not None):
+        raise _fork_execution_invalid(
+            "receipt post must be bound exactly when the result is 'executed'"
+        )
+    site = payload[ADJ_SITE]
+    if not isinstance(site, str):
+        raise TypeError("receipt site must be a str")
+    if site == "":
+        raise _fork_execution_invalid("receipt site must be non-empty")
+    receipt_version = payload[VERSION]
+    if isinstance(receipt_version, bool) or not isinstance(receipt_version, int):
+        raise TypeError("receipt version must be an int")
+    if receipt_version != FORK_EXECUTION_VERSION:
+        raise _fork_execution_invalid("receipt version must be the integer 1")
+
+    if _checkpoint_compact(data) != raw:
+        raise _fork_execution_invalid(
+            "receipt encoding is not the canonical compact form"
+        )
+    return payload, signature
+
+
+def _validated_execution_receipt_items(items: object) -> list[dict]:
+    """Validate the receipt batch before any receipt is examined.
+
+    A non-list container, a non-dict element, a non-str id or non-bytes
+    receipt raises :class:`TypeError`; an empty list, an empty or
+    duplicate id or a wrong item key set raises :class:`ValueError`.
+    """
+    if not isinstance(items, list):
+        raise TypeError("receipts must be a list")
+    if not items:
+        raise ValueError("receipts must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _FE_RECEIPT_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'id' and 'receipt'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        receipt = item[FE_RECEIPT]
+        if not isinstance(receipt, bytes):
+            raise TypeError(f"{where} receipt must be bytes")
+        validated.append({ID: item_id, FE_RECEIPT: receipt})
+    return validated
+
+
+def _execution_item_report(
+    item_id: str, digest: str, conclusion: str, reason: str | None
+) -> dict:
+    """One per-receipt confirmation report with the fixed bound key set."""
+    return {
+        FE_CONCLUSION: conclusion,
+        FE_DIGEST: digest,
+        ID: item_id,
+        ADJ_REASON: reason,
+    }
+
+
+def _precondition_digest(precondition: dict) -> str:
+    """The pre-digest a receipt must bind for this precondition."""
+    return hashlib.sha256(_checkpoint_compact(precondition)).hexdigest()
+
+
+def _process_execution_receipts(
+    plan_payload: dict,
+    plan_digest: str,
+    validated_keyring: dict[str, list[dict]],
+    items: list[dict],
+    moment: int,
+) -> tuple[list[dict], list[dict], str]:
+    """Confirm every receipt in input order and tally the operations.
+
+    Each receipt is checked in isolation against the plan, the operation
+    it names, the validity window, the operation precondition, the exact
+    site credentials -- usable at both the receipt moment and the
+    aggregation ``moment`` -- and its signature; any failure rejects
+    just that item with one fixed reason.  Identical receipt digests
+    count once (extras are ``duplicate``); different valid results or
+    post digests for one operation are a ``contradiction``.  Returns the
+    per-item reports in input order, the per-operation conclusions in
+    plan order and the overall status.
+    """
+    operations_by_id = {
+        operation[ID]: operation for operation in plan_payload[FE_OPERATIONS]
+    }
+    reports: list[dict] = []
+    valid: list[tuple[dict, str, str, str, str | None]] = []
+    last_moment_by_site: dict[str, int] = {}
+    for item in items:
+        item_id = item[ID]
+        raw = item[FE_RECEIPT]
+        digest = hashlib.sha256(raw).hexdigest()
+        try:
+            payload, signature = _parse_execution_receipt(raw)
+        except (InvalidForkExecutionError, TypeError):
+            reports.append(
+                _execution_item_report(
+                    item_id,
+                    digest,
+                    FE_CONCLUSION_INVALID_RECEIPT,
+                    FE_REASON_INVALID_RECEIPT,
+                )
+            )
+            continue
+
+        reason: str | None = None
+        operation = operations_by_id.get(payload[FE_OPERATION])
+        if payload[FE_PLAN_DIGEST] != plan_digest:
+            reason = FE_REASON_DECISION_REPLACED
+        elif operation is None:
+            reason = FE_REASON_UNKNOWN_OPERATION
+        receipt_moment = payload[FE_MOMENT]
+        if reason is None and (
+            receipt_moment < plan_payload[FE_MOMENT]
+            or receipt_moment > plan_payload[FE_EXPIRES]
+            or receipt_moment > moment
+            or moment > plan_payload[FE_EXPIRES]
+        ):
+            reason = FE_REASON_OUTSIDE_VALIDITY
+        if reason is None and payload[FE_PRE] != _precondition_digest(
+            operation[FE_PRECONDITION]
+        ):
+            reason = FE_REASON_PRECONDITION_MISMATCH
+        site = payload[ADJ_SITE]
+        if reason is None and site != operation[FE_TARGET]:
+            reason = REASON_UNAUTHORIZED_SITE
+        entry = None
+        if reason is None:
+            key_version = payload[KEY_VERSION]
+            for candidate in validated_keyring.get(site, ()):
+                if candidate[VERSION] == key_version:
+                    entry = candidate
+                    break
+            if entry is None:
+                reason = REASON_CREDENTIAL_UNAVAILABLE
+            elif entry[REVOKED]:
+                reason = REASON_REVOKED
+            elif receipt_moment < entry[NOT_BEFORE] or moment < entry[NOT_BEFORE]:
+                reason = REASON_NOT_YET_VALID
+            elif receipt_moment > entry[NOT_AFTER] or moment > entry[NOT_AFTER]:
+                reason = REASON_EXPIRED
+        if reason is None:
+            expected_signature = hmac.new(
+                bytes.fromhex(entry[SECRET]),
+                _checkpoint_compact(payload),
+                hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(expected_signature, signature):
+                reason = REASON_BAD_SIGNATURE
+        if reason is None:
+            last_moment = last_moment_by_site.get(site)
+            if last_moment is not None and receipt_moment < last_moment:
+                reason = FE_REASON_OUT_OF_ORDER
+        if reason is not None:
+            reports.append(
+                _execution_item_report(
+                    item_id, digest, FE_CONCLUSION_INVALID_RECEIPT, reason
+                )
+            )
+            continue
+
+        last_moment_by_site[site] = receipt_moment
+        report = _execution_item_report(
+            item_id, digest, payload[FE_RESULT], None
+        )
+        reports.append(report)
+        valid.append(
+            (
+                report,
+                operation[ID],
+                digest,
+                payload[FE_RESULT],
+                payload[FE_POST],
+            )
+        )
+
+    by_operation: dict[str, list[tuple[dict, str, str, str, str | None]]] = {}
+    for entry_tuple in valid:
+        by_operation.setdefault(entry_tuple[1], []).append(entry_tuple)
+    for entries in by_operation.values():
+        reference = entries[0]
+        reference_outcome = (reference[3], reference[4])
+        seen_digests = {reference[2]}
+        for extra in entries[1:]:
+            report = extra[0]
+            if extra[2] in seen_digests or (extra[3], extra[4]) == (
+                reference_outcome
+            ):
+                report[FE_CONCLUSION] = FE_CONCLUSION_DUPLICATE
+                report[ADJ_REASON] = REASON_DUPLICATE
+            else:
+                report[FE_CONCLUSION] = FE_CONCLUSION_CONTRADICTION
+                report[ADJ_REASON] = REASON_CONTRADICTION
+            seen_digests.add(extra[2])
+
+    operation_reports: list[dict] = []
+    for operation in plan_payload[FE_OPERATIONS]:
+        entries = by_operation.get(operation[ID], [])
+        conclusions = [entry_tuple[0][FE_CONCLUSION] for entry_tuple in entries]
+        if FE_CONCLUSION_CONTRADICTION in conclusions:
+            operation_conclusion = FE_STATUS_CONFLICTED
+        elif not entries:
+            operation_conclusion = FE_STATUS_PARTIAL
+        else:
+            counted_result = entries[0][3]
+            if counted_result == FE_RESULT_EXECUTED:
+                operation_conclusion = FE_STATUS_CONFIRMED
+            elif counted_result == FE_RESULT_REJECTED:
+                operation_conclusion = FE_STATUS_REJECTED
+            else:
+                operation_conclusion = FE_STATUS_PARTIAL
+        operation_reports.append(
+            {
+                FE_CONCLUSION: operation_conclusion,
+                FE_OPERATION: operation[ID],
+                FE_TARGET: operation[FE_TARGET],
+            }
+        )
+
+    operation_conclusions = [
+        report[FE_CONCLUSION] for report in operation_reports
+    ]
+    if FE_STATUS_CONFLICTED in operation_conclusions:
+        status = FE_STATUS_CONFLICTED
+    elif FE_STATUS_REJECTED in operation_conclusions:
+        status = FE_STATUS_REJECTED
+    elif FE_STATUS_PARTIAL in operation_conclusions:
+        status = FE_STATUS_PARTIAL
+    else:
+        status = FE_STATUS_CONFIRMED
+    return reports, operation_reports, status
+
+
+def confirm_fork_execution(
+    plan: bytes,
+    decision: bytes,
+    policy: dict,
+    receipts: list,
+    keyring: dict,
+    issuer: str,
+    version: int,
+    moment: int,
+) -> bytes:
+    """Aggregate site execution receipts into one signed confirmation.
+
+    ``plan`` is the plan :func:`plan_fork_execution` produced, bound to
+    the original ``decision`` and ``policy``; ``receipts`` is a
+    non-empty list of items each holding exactly a unique, non-empty str
+    ``id`` and ``receipt`` bytes; ``keyring`` follows the
+    :func:`apply_signed_remote` rules; ``issuer``/``version`` name the
+    aggregation signing credentials and ``moment`` is the aggregation
+    time as a non-negative integer.  No file is read or written and no
+    input is modified.
+
+    The plan is validated and must bind the decision (re-verified here,
+    still ``accepted``) and the policy.  Each receipt binds the plan
+    digest, one operation, its site and key version, its moment and the
+    pre-digest of the operation precondition, plus the post-digest when
+    it reports ``executed``; its site must equal the operation target
+    and its key is selected exactly, usable at both the receipt moment
+    and the aggregation moment.  A receipt that fails its encoding or
+    any binding is rejected as just that item with one fixed reason
+    (``invalid-receipt``, ``decision-replaced``, ``unknown-operation``,
+    ``outside-validity``, ``precondition-mismatch``,
+    ``unauthorized-site``, ``credential-unavailable``, ``revoked``,
+    ``not-yet-valid``, ``expired``, ``bad-signature`` or
+    ``out-of-order`` for same-site receipts out of moment order)
+    without affecting the others.  An identical receipt digest counts
+    once per operation -- extras are ``duplicate`` -- while different
+    valid results or post digests for one operation are a
+    ``contradiction``.  Any contradiction makes an operation
+    ``conflicted``; otherwise an explicit ``rejected`` result makes it
+    ``rejected``, a missing or ``failed`` execution makes it
+    ``partial`` and a clean ``executed`` makes it ``confirmed``.  The
+    overall status is ``conflicted``, ``rejected``, ``partial`` or
+    ``confirmed`` by the worst operation in that order.
+
+    The result is one canonical compact UTF-8 JSON object with
+    recursively sorted keys, non-ASCII preserved and no trailing byte,
+    carrying exactly ``payload`` and ``signature``.  The payload binds
+    exactly ``decisionDigest``, ``issuer``, ``keyVersion``, ``moment``,
+    ``operations`` (the per-operation conclusions in plan order),
+    ``planDigest``, ``receipts`` (each receipt digest, conclusion and
+    reason in the original input order), ``status`` and ``version``
+    (the integer 1); ``signature`` is the lowercase hex HMAC-SHA256 of
+    the canonical compact payload bytes under the key bound to the
+    exact issuer and version, with no fallback.
+
+    A parameter, container or field type fault raises :class:`TypeError`
+    (a :class:`bool` never poses as an int); an empty list, an empty or
+    duplicate id or an illegal moment raises :class:`ValueError`; an
+    illegal plan encoding, digest, ordering or binding raises
+    :class:`InvalidForkExecutionError` (a :class:`ValueError` subclass);
+    unknown, revoked, not-yet-valid or expired signing credentials raise
+    :class:`AuthenticationError`.
+    """
+    plan_payload = _parse_execution_plan(plan)
+    _check_plan_consistency(plan_payload)
+    validated_policy = _validated_fork_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    validated_items = _validated_execution_receipt_items(receipts)
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+
+    _check_plan_digest_bindings(plan_payload, decision, validated_policy)
+    decision_result = _verify_decision_for_execution(
+        decision, validated_policy, validated_keyring, moment
+    )
+    _check_plan_binds_decision(plan_payload, decision_result)
+
+    plan_digest = hashlib.sha256(plan).hexdigest()
+    reports, operation_reports, status = _process_execution_receipts(
+        plan_payload, plan_digest, validated_keyring, validated_items, moment
+    )
+
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, moment
+    )
+    payload = {
+        FE_DECISION_DIGEST: hashlib.sha256(decision).hexdigest(),
+        VD_ISSUER: issuer,
+        KEY_VERSION: version,
+        FE_MOMENT: moment,
+        FE_OPERATIONS: operation_reports,
+        FE_PLAN_DIGEST: plan_digest,
+        FE_RECEIPTS: reports,
+        STATUS: status,
+        VERSION: FORK_EXECUTION_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _checkpoint_compact(
+        {TICKET_PAYLOAD: payload, SIGNATURE: signature}
+    )
+
+
+def _validated_confirmation_report(
+    value: object, where: str, seen_ids: set[str]
+) -> dict:
+    """Validate one receipt report inside a confirmation payload."""
+    if not isinstance(value, dict):
+        raise TypeError(f"{where} must be an object")
+    if set(value.keys()) != _FE_ITEM_REPORT_KEYS:
+        raise _fork_execution_invalid(
+            f"{where} must contain exactly the keys 'conclusion', 'digest', "
+            "'id' and 'reason'"
+        )
+    report_id = value[ID]
+    if not isinstance(report_id, str):
+        raise TypeError(f"{where} id must be a str")
+    if report_id == "":
+        raise _fork_execution_invalid(f"{where} id must be non-empty")
+    if report_id in seen_ids:
+        raise _fork_execution_invalid(f"{where} repeats an id")
+    seen_ids.add(report_id)
+    digest = value[FE_DIGEST]
+    if not isinstance(digest, str):
+        raise TypeError(f"{where} digest must be a str")
+    if not _is_digest(digest):
+        raise _fork_execution_invalid(
+            f"{where} digest must be 64 lowercase hex characters"
+        )
+    conclusion = value[FE_CONCLUSION]
+    if not isinstance(conclusion, str):
+        raise TypeError(f"{where} conclusion must be a str")
+    if conclusion not in _FE_ITEM_CONCLUSIONS:
+        raise _fork_execution_invalid(f"{where} conclusion is not known")
+    reason = value[ADJ_REASON]
+    if conclusion in _FE_RESULTS:
+        if reason is not None:
+            raise _fork_execution_invalid(
+                f"{where} reason must be null for a counted receipt"
+            )
+    elif conclusion == FE_CONCLUSION_DUPLICATE:
+        if reason != REASON_DUPLICATE:
+            raise _fork_execution_invalid(
+                f"{where} reason must be 'duplicate'"
+            )
+    elif conclusion == FE_CONCLUSION_CONTRADICTION:
+        if reason != REASON_CONTRADICTION:
+            raise _fork_execution_invalid(
+                f"{where} reason must be 'contradiction'"
+            )
+    else:
+        if not isinstance(reason, str):
+            raise TypeError(f"{where} reason must be a str")
+        if reason not in _FE_INVALID_RECEIPT_REASONS:
+            raise _fork_execution_invalid(f"{where} reason is not known")
+    return {
+        FE_CONCLUSION: conclusion,
+        FE_DIGEST: digest,
+        ID: report_id,
+        ADJ_REASON: reason,
+    }
+
+
+def _validated_confirmation_operation(value: object, where: str) -> dict:
+    """Validate one operation conclusion inside a confirmation payload."""
+    if not isinstance(value, dict):
+        raise TypeError(f"{where} must be an object")
+    if set(value.keys()) != _FE_OPERATION_REPORT_KEYS:
+        raise _fork_execution_invalid(
+            f"{where} must contain exactly the keys 'conclusion', "
+            "'operation' and 'target'"
+        )
+    conclusion = value[FE_CONCLUSION]
+    if not isinstance(conclusion, str):
+        raise TypeError(f"{where} conclusion must be a str")
+    if conclusion not in _FE_STATUSES:
+        raise _fork_execution_invalid(f"{where} conclusion is not known")
+    operation_id = value[FE_OPERATION]
+    if not isinstance(operation_id, str):
+        raise TypeError(f"{where} operation must be a str")
+    if not _is_digest(operation_id):
+        raise _fork_execution_invalid(
+            f"{where} operation must be 64 lowercase hex characters"
+        )
+    target = value[FE_TARGET]
+    if not isinstance(target, str):
+        raise TypeError(f"{where} target must be a str")
+    if target == "":
+        raise _fork_execution_invalid(f"{where} target must be non-empty")
+    return {
+        FE_CONCLUSION: conclusion,
+        FE_OPERATION: operation_id,
+        FE_TARGET: target,
+    }
+
+
+def _parse_fork_confirmation(raw: object) -> tuple[dict, str]:
+    """Validate confirmation bytes structurally into ``(payload, signature)``.
+
+    A non-bytes argument or a field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, digest, ordering or value-format fault raises
+    :class:`InvalidForkExecutionError`.  The plan, receipt and
+    credential bindings are checked by :func:`verify_fork_confirmation`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("confirmation must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _fork_execution_invalid(
+            "confirmation must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _fork_execution_invalid(
+            "confirmation is not valid UTF-8"
+        ) from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_fork_execution_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _fork_execution_invalid("confirmation is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("confirmation must be a JSON object")
+    if set(data.keys()) != _FE_CONFIRMATION_TOP_KEYS:
+        raise _fork_execution_invalid(
+            "confirmation must contain exactly the keys 'payload' and "
+            "'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("confirmation signature must be a str")
+    if not _is_digest(signature):
+        raise _fork_execution_invalid(
+            "confirmation signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("confirmation payload must be an object")
+    if set(payload.keys()) != _FE_CONFIRMATION_PAYLOAD_KEYS:
+        raise _fork_execution_invalid(
+            "payload must contain exactly the keys 'decisionDigest', "
+            "'issuer', 'keyVersion', 'moment', 'operations', 'planDigest', "
+            "'receipts', 'status' and 'version'"
+        )
+
+    for key in (FE_DECISION_DIGEST, FE_PLAN_DIGEST):
+        digest = payload[key]
+        if not isinstance(digest, str):
+            raise TypeError(f"payload {key} must be a str")
+        if not _is_digest(digest):
+            raise _fork_execution_invalid(
+                f"payload {key} must be 64 lowercase hex characters"
+            )
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("payload issuer must be a str")
+    if issuer == "":
+        raise _fork_execution_invalid("payload issuer must be a non-empty str")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _fork_execution_invalid("payload keyVersion must be positive")
+    moment = payload[FE_MOMENT]
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("payload moment must be an int")
+    if moment < 0:
+        raise _fork_execution_invalid("payload moment must be non-negative")
+    status = payload[STATUS]
+    if not isinstance(status, str):
+        raise TypeError("payload status must be a str")
+    if status not in _FE_STATUSES:
+        raise _fork_execution_invalid("payload status is not known")
+
+    raw_reports = payload[FE_RECEIPTS]
+    if not isinstance(raw_reports, list):
+        raise TypeError("payload receipts must be a list")
+    if not raw_reports:
+        raise _fork_execution_invalid("payload receipts must be non-empty")
+    seen_ids: set[str] = set()
+    reports = [
+        _validated_confirmation_report(
+            value, f"payload receipt {position}", seen_ids
+        )
+        for position, value in enumerate(raw_reports)
+    ]
+
+    raw_operations = payload[FE_OPERATIONS]
+    if not isinstance(raw_operations, list):
+        raise TypeError("payload operations must be a list")
+    if not raw_operations:
+        raise _fork_execution_invalid("payload operations must be non-empty")
+    operations = [
+        _validated_confirmation_operation(
+            value, f"payload operation {position}"
+        )
+        for position, value in enumerate(raw_operations)
+    ]
+    operation_ids = [operation[FE_OPERATION] for operation in operations]
+    if len(set(operation_ids)) != len(operation_ids):
+        raise _fork_execution_invalid(
+            "payload operations must not repeat an operation"
+        )
+    operation_targets = [operation[FE_TARGET] for operation in operations]
+    if len(set(operation_targets)) != len(operation_targets):
+        raise _fork_execution_invalid(
+            "payload operations must not repeat a target domain"
+        )
+    if operation_targets != sorted(operation_targets):
+        raise _fork_execution_invalid(
+            "payload operations must be sorted by target ascending"
+        )
+
+    confirmation_version = payload[VERSION]
+    if isinstance(confirmation_version, bool) or not isinstance(
+        confirmation_version, int
+    ):
+        raise TypeError("payload version must be an int")
+    if confirmation_version != FORK_EXECUTION_VERSION:
+        raise _fork_execution_invalid("payload version must be the integer 1")
+
+    normalized = {
+        FE_DECISION_DIGEST: payload[FE_DECISION_DIGEST],
+        VD_ISSUER: issuer,
+        KEY_VERSION: key_version,
+        FE_MOMENT: moment,
+        FE_OPERATIONS: operations,
+        FE_PLAN_DIGEST: payload[FE_PLAN_DIGEST],
+        FE_RECEIPTS: reports,
+        STATUS: status,
+        VERSION: FORK_EXECUTION_VERSION,
+    }
+    canonical = _checkpoint_compact(
+        {TICKET_PAYLOAD: normalized, SIGNATURE: signature}
+    )
+    if canonical != raw:
+        raise _fork_execution_invalid(
+            "confirmation encoding is not the canonical compact form"
+        )
+    return normalized, signature
+
+
+def _fork_confirmation_context(
+    plan: object,
+    decision: object,
+    policy: object,
+    receipts: object,
+    keyring: object,
+    moment: object,
+) -> tuple[dict, str, str, dict[str, list[dict]], list[dict], int]:
+    """Validate the shared verification materials once.
+
+    Returns the parsed plan payload, the plan and decision digests, the
+    validated keyring, the validated receipt items and the moment.  All
+    faults raise exactly as :func:`verify_fork_confirmation` documents.
+    """
+    plan_payload = _parse_execution_plan(plan)
+    _check_plan_consistency(plan_payload)
+    validated_policy = _validated_fork_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    validated_items = _validated_execution_receipt_items(receipts)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+    _check_plan_digest_bindings(plan_payload, decision, validated_policy)
+    decision_result = _verify_decision_for_execution(
+        decision, validated_policy, validated_keyring, moment
+    )
+    _check_plan_binds_decision(plan_payload, decision_result)
+    return (
+        plan_payload,
+        hashlib.sha256(plan).hexdigest(),
+        hashlib.sha256(decision).hexdigest(),
+        validated_keyring,
+        validated_items,
+        moment,
+    )
+
+
+def _verify_confirmation_package(
+    confirmation: bytes,
+    context: tuple[dict, str, str, dict[str, list[dict]], list[dict], int],
+) -> dict:
+    """Re-derive and re-check every binding of one confirmation package.
+
+    This is the shared core of :func:`verify_fork_confirmation` and the
+    batch :func:`verify_fork_confirmations`; the caller owns the
+    shared-material validation.  The returned dict is freshly built
+    solely from authenticated confirmation material.
+    """
+    (
+        plan_payload,
+        plan_digest,
+        decision_digest,
+        validated_keyring,
+        validated_items,
+        moment,
+    ) = context
+    payload, signature = _parse_fork_confirmation(confirmation)
+    if payload[FE_PLAN_DIGEST] != plan_digest:
+        raise _fork_execution_invalid(
+            "confirmation plan digest does not match the plan"
+        )
+    if payload[FE_DECISION_DIGEST] != decision_digest:
+        raise _fork_execution_invalid(
+            "confirmation decision digest does not match the decision"
+        )
+
+    reports, operation_reports, status = _process_execution_receipts(
+        plan_payload,
+        plan_digest,
+        validated_keyring,
+        validated_items,
+        payload[FE_MOMENT],
+    )
+    if payload[FE_RECEIPTS] != reports:
+        raise _fork_execution_invalid(
+            "confirmation receipt reports do not match the re-derived "
+            "outcomes"
+        )
+    if payload[FE_OPERATIONS] != operation_reports:
+        raise _fork_execution_invalid(
+            "confirmation operation conclusions do not match the re-derived "
+            "outcomes"
+        )
+    if payload[STATUS] != status:
+        raise _fork_execution_invalid(
+            "confirmation status does not match the re-derived outcomes"
+        )
+
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION], moment
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "fork execution confirmation signature does not match"
+        )
+
+    return {
+        key: copy.deepcopy(value)
+        for key, value in (
+            ("confirmationDigest", hashlib.sha256(confirmation).hexdigest()),
+            (FE_DECISION_DIGEST, decision_digest),
+            (VD_ISSUER, payload[VD_ISSUER]),
+            (KEY_VERSION, payload[KEY_VERSION]),
+            (FE_MOMENT, payload[FE_MOMENT]),
+            (FE_OPERATIONS, operation_reports),
+            (FE_PLAN_DIGEST, plan_digest),
+            (FE_RECEIPTS, reports),
+            (STATUS, status),
+            (VERSION, FORK_EXECUTION_VERSION),
+        )
+    }
+
+
+def verify_fork_confirmation(
+    confirmation: bytes,
+    plan: bytes,
+    decision: bytes,
+    policy: dict,
+    receipts: list,
+    keyring: dict,
+    moment: int,
+) -> dict:
+    """Verify one signed fork execution confirmation entirely offline.
+
+    Only the confirmation bytes, the ``plan`` it must bind, the
+    original ``decision`` and ``policy``, the ``receipts`` it claims to
+    aggregate, the current ``keyring`` and the verification ``moment``
+    are consulted -- no file is read or written and no argument is
+    modified.  Verification validates the plan and the confirmation
+    canonical encodings and key sets, re-verifies the decision (still
+    ``accepted``), re-checks the plan/decision/policy digest bindings,
+    re-derives every per-receipt outcome, per-operation conclusion and
+    the overall status from the receipt bytes exactly as
+    :func:`confirm_fork_execution` does at the payload's aggregation
+    moment, and checks the HMAC-SHA256 against the key the *current*
+    keyring binds to the payload's exact issuer and version, usable at
+    the verification moment, so a later revocation or expiry rejects
+    the confirmation with no fallback.
+
+    On success a fresh mapping is returned with the fixed keys
+    ``confirmationDigest`` (the SHA-256 of the confirmation bytes),
+    ``decisionDigest``, ``issuer``, ``keyVersion``, ``moment``,
+    ``operations``, ``planDigest``, ``receipts``, ``status`` and
+    ``version`` (the integer 1).  A non-bytes argument or a field of
+    the wrong type raises :class:`TypeError` (a :class:`bool` never
+    poses as an int); an empty list, an empty or duplicate id or an
+    illegal moment raises :class:`ValueError`; an illegal plan or
+    confirmation encoding, digest, ordering or binding raises
+    :class:`InvalidForkExecutionError` (a :class:`ValueError`
+    subclass); unknown, revoked, not-yet-valid or expired credentials
+    or a signature mismatch raise :class:`AuthenticationError`.
+    """
+    if not isinstance(confirmation, bytes):
+        raise TypeError("confirmation must be bytes")
+    context = _fork_confirmation_context(
+        plan, decision, policy, receipts, keyring, moment
+    )
+    return _verify_confirmation_package(confirmation, context)
+
+
+def _validated_confirmation_items(items: object) -> list[dict]:
+    """Validate the confirmation batch before any package is verified.
+
+    The argument must be a non-empty list of dicts each holding exactly
+    ``confirmation`` (bytes) and ``id`` (a non-empty str, unique across
+    the batch).  Container, element and field type faults raise
+    :class:`TypeError`; an empty list, an empty or duplicate id or a
+    wrong key set raises :class:`ValueError`.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _FE_CONFIRMATION_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'confirmation' and "
+                "'id'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        confirmation = item[FE_CONFIRMATION]
+        if not isinstance(confirmation, bytes):
+            raise TypeError(f"{where} confirmation must be bytes")
+        validated.append({ID: item_id, FE_CONFIRMATION: confirmation})
+    return validated
+
+
+def _confirmation_item_report(
+    item_id: str, status: str, error: str | None, result: dict | None
+) -> dict:
+    """One confirmation batch report with the fixed key order."""
+    return {
+        CHECKPOINT_ITEM_ERROR: error,
+        ID: item_id,
+        VERDICT_ITEM_RESULT: result,
+        STATUS: status,
+    }
+
+
+def _verify_confirmation_item(item: dict, context: tuple) -> dict:
+    """Verify one confirmation in isolation and report its outcome.
+
+    Unknown, revoked, not-yet-valid or expired credentials or a wrong
+    signature make the item ``unauthenticated``; every encoding,
+    key-set, digest, ordering or binding fault makes it ``invalid``; a
+    passing confirmation is ``verified``.
+    """
+    item_id = item[ID]
+    try:
+        result = _verify_confirmation_package(item[FE_CONFIRMATION], context)
+    except AuthenticationError as exc:
+        return _confirmation_item_report(
+            item_id, _FE_VERIFY_UNAUTHENTICATED, str(exc), None
+        )
+    except (InvalidForkExecutionError, TypeError) as exc:
+        # A TypeError here can only come from a wrong JSON field type
+        # *inside* the confirmation bytes; the public argument types were
+        # all validated before the batch ran.
+        return _confirmation_item_report(
+            item_id, _FE_VERIFY_INVALID, str(exc), None
+        )
+    return _confirmation_item_report(item_id, _FE_VERIFY_VERIFIED, None, result)
+
+
+def verify_fork_confirmations(
+    items: list,
+    plan: bytes,
+    decision: bytes,
+    policy: dict,
+    receipts: list,
+    keyring: dict,
+    moment: int,
+) -> dict:
+    """Verify a whole batch of fork execution confirmations offline.
+
+    ``items`` is a non-empty list; each item is a dict with exactly the
+    keys ``confirmation`` (the bytes :func:`confirm_fork_execution`
+    produced) and ``id`` (a non-empty str, unique across the batch).
+    The batch and the shared ``plan``, ``decision``, ``policy``,
+    ``receipts``, ``keyring`` and ``moment`` are validated in full
+    before any confirmation is verified: container, element or field
+    type faults raise :class:`TypeError` (a :class:`bool` never poses
+    as an int) and an empty list, an empty or duplicate id, a wrong
+    item key set or an illegal moment raises :class:`ValueError`; an
+    illegal shared plan, decision or binding raises
+    :class:`InvalidForkExecutionError`.  Only these batch-level faults
+    raise.
+
+    Each confirmation is then verified independently, in strict input
+    order, through the exact :func:`verify_fork_confirmation` rules:
+    one confirmation's failure never stops a later one or alters an
+    earlier report.  Currently unknown, revoked, not-yet-valid or
+    expired credentials or a wrong signature make the item
+    ``unauthenticated``; an illegal encoding, key set, digest, ordering
+    or binding makes it ``invalid``; a passing confirmation is
+    ``verified``.
+
+    The top-level result is a fresh dict with the fixed keys ``items``
+    and ``version`` (the integer 1); each item report carries, in this
+    key order, ``error`` (null exactly when verified), ``id``,
+    ``result`` (a fresh independent copy of the single-confirmation
+    result when verified, otherwise null) and ``status``; a failed item
+    keeps a definite, non-empty copy of the original exception text.
+    Repeated calls return equal but mutually independent results.
+    """
+    validated_items = _validated_confirmation_items(items)
+    context = _fork_confirmation_context(
+        plan, decision, policy, receipts, keyring, moment
+    )
+    return {
+        ITEMS: [
+            _verify_confirmation_item(item, context)
+            for item in validated_items
+        ],
+        VERSION: FORK_EXECUTION_VERSION,
     }
