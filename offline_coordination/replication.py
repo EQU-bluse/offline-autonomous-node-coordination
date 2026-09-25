@@ -14505,3 +14505,1809 @@ def verify_convergence_decisions(
         ],
         VERSION: CONVERGENCE_DECISION_VERSION,
     }
+
+
+# --- Supersession chains over multi-site convergence decisions ----------------
+
+SUPERSEDE_VERSION = 1
+
+DS_PREDECESSOR = "predecessor"
+DS_EVIDENCE = "evidence"
+DS_POLICY = "policy"
+DS_OLD_POLICY = "oldPolicy"
+DS_NEW_POLICY = "newPolicy"
+DS_OLD_POLICY_DIGEST = "oldPolicyDigest"
+DS_NEW_POLICY_DIGEST = "newPolicyDigest"
+DS_EFFECTIVE_AT = "effectiveAt"
+DS_ROOT_DIGEST = "rootDigest"
+DS_PREDECESSOR_DIGEST = "predecessorDigest"
+DS_HEAD_DIGEST = "headDigest"
+DS_HEIGHT = "height"
+DS_DECISION_DIGEST = CD_PACKET_DIGEST
+DS_POLICY_VERSION = "policyVersion"
+DS_BATCH_ROOTS = "roots"
+DS_BATCH_SUCCESSORS = "successors"
+DS_BATCH_POLICIES = "policies"
+DS_ANCHOR_DIGEST = "anchorDigest"
+
+DS_BATCH_ITEM_KEYS = frozenset((ID, "chain"))
+DS_CHAIN_KEYS = frozenset((DS_BATCH_ROOTS, DS_BATCH_SUCCESSORS))
+
+_DS_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_DS_PAYLOAD_KEYS = frozenset((
+    DS_PREDECESSOR,
+    DS_EVIDENCE,
+    VD_ISSUER,
+    KEY_VERSION,
+    DS_NEW_POLICY,
+    DS_OLD_POLICY,
+    DS_OLD_POLICY_DIGEST,
+    DS_NEW_POLICY_DIGEST,
+    DS_POLICY_VERSION,
+    DS_EFFECTIVE_AT,
+    VERSION,
+))
+_DS_EVIDENCE_ITEM_KEYS = frozenset((FC_CERTIFICATE, ID, FC_ROUNDS))
+_DS_POLICY_KEYS = frozenset((CD_SITES, CD_THRESHOLD, DS_POLICY_VERSION))
+_DS_VERIFY_VERIFIED = "verified"
+_DS_VERIFY_INVALID = "invalid"
+_DS_VERIFY_UNAUTHENTICATED = "unauthenticated"
+_DS_CHAIN_CONFLICTED = "conflicted"
+_DS_CHAIN_ERROR = "forked-successor"
+
+_DS_ANCHOR_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_DS_ANCHOR_PAYLOAD_KEYS = frozenset((
+    VD_ISSUER,
+    KEY_VERSION,
+    DS_ROOT_DIGEST,
+    DS_HEAD_DIGEST,
+    DS_HEIGHT,
+    CD_POLICY_DIGEST,
+    DS_POLICY_VERSION,
+    CP_MOMENT,
+    VERSION,
+))
+
+
+class InvalidChainError(ValueError):
+    """A supersession successor packet breaks its chain binding contract."""
+
+
+class InvalidAnchorError(ValueError):
+    """A sealed decision head anchor breaks its binding contract."""
+
+
+def _chain_invalid(message: str) -> InvalidChainError:
+    return InvalidChainError(f"invalid decision chain: {message}")
+
+
+def _anchor_invalid(message: str) -> InvalidAnchorError:
+    return InvalidAnchorError(f"invalid decision head anchor: {message}")
+
+
+def _reject_duplicate_supersede_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate successor keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _chain_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _reject_duplicate_anchor_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate anchor keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _anchor_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _validated_decision_policy(policy: object) -> dict:
+    """Validate the versioned convergence site policy into fresh form.
+
+    Like :func:`_validated_convergence_site_policy` -- a non-empty
+    mapping of each authorized non-empty signing site to its non-empty
+    set of allowed positive key versions and a positive threshold no
+    greater than the site count -- but additionally carrying exactly a
+    positive integer ``policyVersion``.  Type faults raise
+    :class:`TypeError`; every key-set or value fault raises
+    :class:`ValueError`.
+    """
+    if not isinstance(policy, dict):
+        raise TypeError("policy must be a dict")
+    if set(policy.keys()) != _DS_POLICY_KEYS:
+        raise ValueError(
+            "policy must contain exactly the keys 'sites', 'threshold' and "
+            "'policyVersion'"
+        )
+    policy_version = policy[DS_POLICY_VERSION]
+    if isinstance(policy_version, bool) or not isinstance(policy_version, int):
+        raise TypeError("policy policyVersion must be an int")
+    if policy_version <= 0:
+        raise ValueError("policy policyVersion must be a positive integer")
+    # The sites/threshold pair shares the exact convergence policy rules.
+    base = _validated_convergence_site_policy({
+        CD_SITES: policy[CD_SITES],
+        CD_THRESHOLD: policy[CD_THRESHOLD],
+    })
+    base[DS_POLICY_VERSION] = policy_version
+    return base
+
+
+def _decision_policy_bytes(policy: dict) -> bytes:
+    """Canonical compact bytes of the normalized versioned site policy."""
+    return _checkpoint_compact({
+        CD_SITES: {
+            site: sorted(policy[CD_SITES][site])
+            for site in sorted(policy[CD_SITES])
+        },
+        CD_THRESHOLD: policy[CD_THRESHOLD],
+        DS_POLICY_VERSION: policy[DS_POLICY_VERSION],
+    })
+
+
+def _decision_policy_digest(policy: dict) -> str:
+    """SHA-256 of the canonical versioned site policy."""
+    return hashlib.sha256(_decision_policy_bytes(policy)).hexdigest()
+
+
+# -- Evidence shape validation shared by sealing and chain inputs --------------
+
+def _validated_supersede_evidence_items(items: object, where: str) -> list[dict]:
+    """Shape-validate one hop's evidence list.
+
+    Each item holds exactly ``certificate`` (bytes), ``id`` (a
+    non-empty str, unique within the stage) and ``rounds`` (a list
+    whose entries are shape-validated exactly as convergence rounds).
+    Container/element/field type faults raise :class:`TypeError`; an
+    empty list, an empty or duplicate id, a wrong item/round key set or
+    an empty round or confirmation raises :class:`ValueError`.
+    Cross-stage prefix and duplication faults are examined per chain.
+    """
+    if not isinstance(items, list):
+        raise TypeError(f"{where} evidence must be a list")
+    if not items:
+        raise ValueError(f"{where} evidence must be non-empty")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        item_where = f"{where} evidence item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{item_where} must be a dict")
+        if set(item.keys()) != _DS_EVIDENCE_ITEM_KEYS:
+            raise ValueError(
+                f"{item_where} must contain exactly the keys 'certificate', "
+                "'id' and 'rounds'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{item_where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{item_where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"{item_where} repeats an id")
+        seen_ids.add(item_id)
+        certificate = item[FC_CERTIFICATE]
+        if not isinstance(certificate, bytes):
+            raise TypeError(f"{item_where} certificate must be bytes")
+        validated_rounds = _validated_convergence_round_shapes(
+            item[FC_ROUNDS]
+        )
+        validated.append({
+            FC_CERTIFICATE: certificate,
+            ID: item_id,
+            FC_ROUNDS: validated_rounds,
+        })
+    return validated
+
+
+# -- Recomputing one convergence verdict from raw evidence --------------------
+
+def _recompute_convergence_verdict(
+    validated_items: list[dict],
+    decision: bytes,
+    validated_fork_policy: dict,
+    site_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Re-adjudicate raw evidence into the full verdict aggregates.
+
+    Returns the certificate digests in the original input order, the
+    per-certificate rows sorted by site then id, the derived overall
+    status and (when accepted) the common result, its digest and the
+    shared plan digest.
+    """
+    certificate_digests = [
+        hashlib.sha256(item[FC_CERTIFICATE]).hexdigest()
+        for item in validated_items
+    ]
+    rows = [
+        _adjudicate_convergence_one(
+            item, decision, validated_fork_policy, site_policy,
+            validated_keyring, moment,
+        )
+        for item in validated_items
+    ]
+    contradicted, votes = _tally_convergence_rows(rows)
+    contents = {
+        _convergence_content_key(convergence): convergence
+        for convergence in votes.values()
+    }
+    if contradicted or len(contents) > 1:
+        status = CD_STATUS_CONFLICTED
+    elif len(contents) == 1 and len(votes) >= site_policy[CD_THRESHOLD]:
+        status = CD_STATUS_ACCEPTED
+    else:
+        status = CD_STATUS_INSUFFICIENT
+    if status == CD_STATUS_ACCEPTED:
+        common = copy.deepcopy(next(iter(contents.values())))
+        common_digest = hashlib.sha256(
+            _checkpoint_compact(common)
+        ).hexdigest()
+        plan_digest = common[CD_PLAN_DIGEST]
+    else:
+        common = None
+        common_digest = None
+        plan_digest = None
+    rows.sort(
+        key=lambda row: (
+            row[ADJ_SITE] is not None,
+            row[ADJ_SITE] or "",
+            row[ID],
+        )
+    )
+    return {
+        CD_CERTIFICATES: certificate_digests,
+        ITEMS: rows,
+        STATUS: status,
+        CD_COMMON: common,
+        CD_COMMON_DIGEST: common_digest,
+        CD_PLAN_DIGEST: plan_digest,
+    }
+
+
+def _plain_site_policy(site_policy: dict) -> dict:
+    """The unversioned ``{sites, threshold}`` form a root decision binds."""
+    return {
+        CD_SITES: site_policy[CD_SITES],
+        CD_THRESHOLD: site_policy[CD_THRESHOLD],
+    }
+
+
+_HEX_EVEN = re.compile(r"[0-9a-f]*$")
+
+
+def _hex_bytes(value: str) -> bytes:
+    """Decode a canonical even-length lowercase hex string to bytes."""
+    if not value or len(value) % 2 or _HEX_EVEN.fullmatch(value) is None:
+        raise ValueError("must be non-empty even-length lowercase hex")
+    return bytes.fromhex(value)
+
+
+def _evidence_bound_form(validated_items: list[dict]) -> list[dict]:
+    """The raw JSON-bound form of evidence items (bytes as lowercase hex)."""
+    return [
+        {
+            FC_CERTIFICATE: item[FC_CERTIFICATE].hex(),
+            ID: item[ID],
+            FC_ROUNDS: [
+                {
+                    FC_CONFIRMATION: round_entry[FC_CONFIRMATION].hex(),
+                    FE_PREVIOUS: round_entry[FE_PREVIOUS],
+                    FC_SEQ: round_entry[FC_SEQ],
+                }
+                for round_entry in item[FC_ROUNDS]
+            ],
+        }
+        for item in validated_items
+    ]
+
+
+def _evidence_identity(validated_items: list[dict]) -> list[tuple]:
+    """Content identity tuples for evidence prefix comparisons."""
+    return [
+        (
+            item[ID],
+            hashlib.sha256(item[FC_CERTIFICATE]).hexdigest(),
+            tuple(
+                (
+                    round_entry[FC_SEQ],
+                    round_entry[FE_PREVIOUS],
+                    hashlib.sha256(
+                        round_entry[FC_CONFIRMATION]
+                    ).hexdigest(),
+                )
+                for round_entry in item[FC_ROUNDS]
+            ),
+        )
+        for item in validated_items
+    ]
+
+
+def _parse_bound_evidence(raw_items: object, where: str) -> list[dict]:
+    """Parse the raw evidence increment bound inside a successor packet.
+
+    Bytes ride as non-empty even-length lowercase hex strings.  A field
+    of the wrong type raises :class:`TypeError`; every key-set, value,
+    empty, duplicate-id or hex-encoding fault raises
+    :class:`InvalidChainError`.
+    """
+    if not isinstance(raw_items, list):
+        raise TypeError(f"{where} evidence must be a list")
+    if not raw_items:
+        raise _chain_invalid(f"{where} evidence must be non-empty")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(raw_items):
+        item_where = f"{where} evidence item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{item_where} must be an object")
+        if set(item.keys()) != _DS_EVIDENCE_ITEM_KEYS:
+            raise _chain_invalid(
+                f"{item_where} must contain exactly the keys 'certificate', "
+                "'id' and 'rounds'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{item_where} id must be a str")
+        if item_id == "":
+            raise _chain_invalid(f"{item_where} id must be non-empty")
+        if item_id in seen_ids:
+            raise _chain_invalid(f"{item_where} repeats an id")
+        seen_ids.add(item_id)
+        certificate_hex = item[FC_CERTIFICATE]
+        if not isinstance(certificate_hex, str):
+            raise TypeError(f"{item_where} certificate must be a str")
+        try:
+            certificate = _hex_bytes(certificate_hex)
+        except ValueError as exc:
+            raise _chain_invalid(
+                f"{item_where} certificate must be non-empty even-length "
+                "lowercase hex"
+            ) from exc
+        raw_rounds = item[FC_ROUNDS]
+        if not isinstance(raw_rounds, list):
+            raise TypeError(f"{item_where} rounds must be a list")
+        if not raw_rounds:
+            raise _chain_invalid(f"{item_where} rounds must be non-empty")
+        rounds: list[dict] = []
+        for round_position, round_entry in enumerate(raw_rounds):
+            round_where = f"{item_where} round {round_position}"
+            if not isinstance(round_entry, dict):
+                raise TypeError(f"{round_where} must be an object")
+            if set(round_entry.keys()) != _FC_ROUND_KEYS:
+                raise _chain_invalid(
+                    f"{round_where} must contain exactly the keys "
+                    "'confirmation', 'previous' and 'seq'"
+                )
+            seq = round_entry[FC_SEQ]
+            if isinstance(seq, bool) or not isinstance(seq, int):
+                raise TypeError(f"{round_where} seq must be an int")
+            previous = round_entry[FE_PREVIOUS]
+            if previous is not None:
+                if not isinstance(previous, str):
+                    raise TypeError(
+                        f"{round_where} previous must be a str or null"
+                    )
+                if not _is_digest(previous):
+                    raise _chain_invalid(
+                        f"{round_where} previous must be 64 lowercase hex "
+                        "characters"
+                    )
+            confirmation_hex = round_entry[FC_CONFIRMATION]
+            if not isinstance(confirmation_hex, str):
+                raise TypeError(f"{round_where} confirmation must be a str")
+            try:
+                confirmation = _hex_bytes(confirmation_hex)
+            except ValueError as exc:
+                raise _chain_invalid(
+                    f"{round_where} confirmation must be non-empty even-length "
+                    "lowercase hex"
+                ) from exc
+            rounds.append({
+                FC_CONFIRMATION: confirmation,
+                FE_PREVIOUS: previous,
+                FC_SEQ: seq,
+            })
+        validated.append({
+            FC_CERTIFICATE: certificate,
+            ID: item_id,
+            FC_ROUNDS: rounds,
+        })
+    return validated
+
+
+# -- Successor packet shape ----------------------------------------------------
+
+_DS_SUCCESSOR_PAYLOAD_KEYS = frozenset((
+    DS_ROOT_DIGEST,
+    DS_PREDECESSOR_DIGEST,
+    DS_HEIGHT,
+    CD_CERTIFICATES,
+    CD_COMMON,
+    CD_COMMON_DIGEST,
+    CD_PLAN_DIGEST,
+    ITEMS,
+    STATUS,
+    DS_EVIDENCE,
+    DS_OLD_POLICY_DIGEST,
+    DS_NEW_POLICY_DIGEST,
+    DS_POLICY_VERSION,
+    DS_EFFECTIVE_AT,
+    VD_ISSUER,
+    KEY_VERSION,
+    VERSION,
+))
+
+
+def _root_decision_view(raw: bytes) -> dict:
+    """Structurally parse a root convergence decision predecessor.
+
+    Only the canonical/shape contract of
+    :func:`_parse_convergence_decision` is applied (the HMAC and the
+    fork-decision/policy bindings are not); the aggregates a successor
+    builds on are returned as a fresh view.
+    """
+    payload, _signature = _parse_convergence_decision(raw)
+    return {
+        "kind": "root",
+        DS_ROOT_DIGEST: hashlib.sha256(raw).hexdigest(),
+        DS_HEIGHT: 0,
+        STATUS: payload[STATUS],
+        CD_COMMON: copy.deepcopy(payload[CD_COMMON]),
+        CD_PLAN_DIGEST: payload[CD_PLAN_DIGEST],
+        CD_CERTIFICATES: list(payload[CD_CERTIFICATES]),
+        ITEMS: copy.deepcopy(payload[ITEMS]),
+        "policy_digest": payload[CD_POLICY_DIGEST],
+        DS_POLICY_VERSION: CONVERGENCE_DECISION_VERSION,
+        DS_EFFECTIVE_AT: None,
+        "root_plan_digest": _root_plan_digest(payload),
+    }
+
+
+def _root_plan_digest(root_payload: dict) -> str:
+    """The one plan digest a whole chain must keep (accepted root)."""
+    if root_payload[CD_PLAN_DIGEST] is not None:
+        return root_payload[CD_PLAN_DIGEST]
+    # An insufficient/conflicted root binds no aggregate plan digest;
+    # every authenticated row nevertheless converges on one plan.
+    plan_digests = {
+        row[CD_CONVERGENCE][CD_PLAN_DIGEST]
+        for row in root_payload[ITEMS]
+        if row[CD_CONVERGENCE] is not None
+    }
+    if len(plan_digests) != 1:
+        raise _convergence_decision_invalid(
+            "root decision must converge on one plan"
+        )
+    return next(iter(plan_digests))
+
+
+def _view_plan_digest(plan_digest: str | None, rows: list[dict]) -> str:
+    """The one root plan a predecessor builds on, even when insufficient."""
+    if plan_digest is not None:
+        return plan_digest
+    plan_digests = {
+        row[CD_CONVERGENCE][CD_PLAN_DIGEST]
+        for row in rows
+        if row[CD_CONVERGENCE] is not None
+    }
+    if len(plan_digests) != 1:
+        raise _chain_invalid("successor must converge on one root plan")
+    return next(iter(plan_digests))
+
+
+def _successor_view(raw: bytes) -> dict:
+    """Structurally parse a successor predecessor into a fresh view."""
+    payload, _signature, evidence = _parse_supersede_packet(raw)
+    return {
+        "kind": "successor",
+        DS_ROOT_DIGEST: payload[DS_ROOT_DIGEST],
+        DS_HEIGHT: payload[DS_HEIGHT],
+        STATUS: payload[STATUS],
+        CD_COMMON: copy.deepcopy(payload[CD_COMMON]),
+        CD_PLAN_DIGEST: payload[CD_PLAN_DIGEST],
+        CD_CERTIFICATES: list(payload[CD_CERTIFICATES]),
+        ITEMS: copy.deepcopy(payload[ITEMS]),
+        "policy_digest": payload[DS_NEW_POLICY_DIGEST],
+        DS_POLICY_VERSION: payload[DS_POLICY_VERSION],
+        DS_EFFECTIVE_AT: payload[DS_EFFECTIVE_AT],
+        "evidence": evidence,
+        "root_plan_digest": _view_plan_digest(
+            payload[CD_PLAN_DIGEST], payload[ITEMS]
+        ),
+    }
+
+
+def _packet_payload_keys(raw: bytes) -> frozenset | None:
+    """Return a packet's payload key set without any structural validation.
+
+    Returns ``None`` for anything that is not a canonical
+    ``{payload, signature}`` JSON envelope so the caller may try both
+    packet kinds.
+    """
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or TICKET_PAYLOAD not in data:
+        return None
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        return None
+    return frozenset(payload.keys())
+
+
+def _predecessor_view(raw: object) -> dict:
+    """Parse the predecessor bytes (root decision or successor packet).
+
+    The packet kind is chosen from the payload key set so that a
+    malformed root decision raises
+    :class:`InvalidConvergenceDecisionError` while a malformed successor
+    raises :class:`InvalidChainError`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("predecessor must be bytes")
+    keys = _packet_payload_keys(raw)
+    if keys is not None and DS_ROOT_DIGEST in keys:
+        return _successor_view(raw)
+    return _root_decision_view(raw)
+
+
+def _assert_transition(previous: dict, verdict: dict) -> None:
+    """Enforce the per-hop verdict state-machine and fixed plan/root."""
+    prev_status = previous[STATUS]
+    new_status = verdict[STATUS]
+    if prev_status == CD_STATUS_CONFLICTED and new_status != CD_STATUS_CONFLICTED:
+        raise _chain_invalid(
+            "a conflicted decision can never be outvoted or fall back"
+        )
+    if prev_status == CD_STATUS_ACCEPTED:
+        if new_status == CD_STATUS_INSUFFICIENT:
+            raise _chain_invalid(
+                "an accepted decision must not fall back to insufficient"
+            )
+        if new_status == CD_STATUS_ACCEPTED:
+            if verdict[CD_COMMON] != previous[CD_COMMON]:
+                raise _chain_invalid(
+                    "an accepted decision may only keep the same common result"
+                )
+    # An accepted/conflicted verdict always pins one plan, equal to the
+    # chain's root plan; insufficient verdicts pin no aggregate plan.
+    if verdict[CD_PLAN_DIGEST] is not None:
+        if verdict[CD_PLAN_DIGEST] != previous["root_plan_digest"]:
+            raise _chain_invalid(
+                "a policy rotation must never change the plan or settled "
+                "operations"
+            )
+    for row in verdict[ITEMS]:
+        convergence = row[CD_CONVERGENCE]
+        if convergence is not None:
+            if convergence[CD_PLAN_DIGEST] != previous["root_plan_digest"]:
+                raise _chain_invalid(
+                    "every authenticated result must keep the root plan"
+                )
+
+
+def _assert_sealer_authorized(
+    old_policy: dict, new_policy: dict, issuer: str, key_version: int
+) -> None:
+    """The successor sealer must be authorized under both policies.
+
+    Historical evidence from a site a rotation removes still stands in
+    the prefix; the one identity acting at this hop is the successor
+    signer, and its exact key version must be allowed by the policy
+    before and after the rotation.
+    """
+    if key_version not in old_policy[CD_SITES].get(issuer, frozenset()):
+        raise _chain_invalid(
+            f"sealer {issuer!r} version {key_version} is not authorized by "
+            "the previous policy"
+        )
+    if key_version not in new_policy[CD_SITES].get(issuer, frozenset()):
+        raise _chain_invalid(
+            f"sealer {issuer!r} version {key_version} is not authorized by "
+            "the rotated policy"
+        )
+
+
+def _root_prefix_matches(
+    root_view: dict, evidence: list[dict], require_extension: bool
+) -> None:
+    """A first successor's evidence must extend the root's certificates."""
+    root_digests = root_view[CD_CERTIFICATES]
+    if len(evidence) < len(root_digests):
+        raise _chain_invalid(
+            "the evidence sequence must have the predecessor as a prefix"
+        )
+    root_id_for = {
+        row[CD_CERTIFICATE_DIGEST]: row[ID]
+        for row in root_view[ITEMS]
+    }
+    for position, digest in enumerate(root_digests):
+        item = evidence[position]
+        if hashlib.sha256(item[FC_CERTIFICATE]).hexdigest() != digest:
+            raise _chain_invalid(
+                "the evidence sequence must have the root certificates as a "
+                "prefix"
+            )
+        if root_id_for.get(digest) != item[ID]:
+            raise _chain_invalid(
+                "prefix evidence must keep the root's per-certificate ids"
+            )
+    if require_extension and len(evidence) == len(root_digests):
+        raise _chain_invalid(
+            "an unchanged policy must add at least one evidence item"
+        )
+
+
+def _successor_prefix_matches(
+    previous: dict, evidence: list[dict], require_extension: bool
+) -> None:
+    """A later successor's evidence must keep the predecessor as a prefix.
+
+    When the policy is unchanged a hop must additionally add at least
+    one item; a policy rotation may re-seal the same evidence sequence
+    as a pure prefix.
+    """
+    prior = _evidence_identity(previous["evidence"])
+    current = _evidence_identity(evidence)
+    if len(current) < len(prior):
+        raise _chain_invalid(
+            "the evidence sequence must have the predecessor evidence as a "
+            "prefix"
+        )
+    if current[:len(prior)] != prior:
+        raise _chain_invalid(
+            "the evidence sequence must have the predecessor evidence as a "
+            "prefix; history must not be deleted, changed or reordered"
+        )
+    if require_extension and len(current) == len(prior):
+        raise _chain_invalid(
+            "an unchanged policy must add at least one evidence item"
+        )
+
+
+def _assert_evidence_prefix(
+    previous: dict, evidence: list[dict], require_extension: bool
+) -> None:
+    """Dispatch the prefix/extension rule by predecessor kind."""
+    if previous["kind"] == "root":
+        _root_prefix_matches(previous, evidence, require_extension)
+    else:
+        _successor_prefix_matches(previous, evidence, require_extension)
+
+
+def supersede_decision(
+    predecessor: bytes,
+    evidence: list,
+    decision: bytes,
+    policy: dict,
+    old_policy: dict,
+    new_policy: dict,
+    keyring: dict,
+    moment: int,
+    effective_at: int,
+    issuer: str,
+    version: int,
+) -> bytes:
+    """Issue one signed supersession successor over a convergence decision.
+
+    ``predecessor`` is either an existing convergence decision packet
+    (the chain root) or the previous successor packet.  ``evidence`` is
+    the stage's non-empty certificate/rounds list in the exact shape of
+    :func:`adjudicate_convergence` items; its sequence must have the
+    predecessor's evidence as a strict prefix (a first successor keeps
+    the root's certificates and ids in order; a later successor keeps
+    every prior evidence item) and must add at least one item.
+    ``decision`` is the original fork decision bytes and ``policy`` the
+    shared fork policy; ``old_policy`` and ``new_policy`` are the
+    versioned site policies (each exactly ``sites``, ``threshold`` and a
+    positive ``policyVersion``) in force before and at this hop.  A
+    changed policy increments ``policyVersion`` by exactly one and
+    changes nothing else about the root, plan or settled operations; an
+    unchanged policy keeps the same version.  ``effective_at`` is the
+    hop's non-negative effective moment and must not move backwards.
+
+    The new verdict is recomputed from scratch from the full evidence
+    sequence.  Additional evidence may move ``insufficient`` to
+    ``accepted`` or ``conflicted``; an ``accepted`` verdict only keeps
+    the identical common result or advances to ``conflicted`` (it never
+    falls back to ``insufficient`` or changes conclusion), and a
+    ``conflicted`` verdict is never masked by a later majority.  Every
+    authenticated evidence identity and key version must be authorized
+    by both policies and the credentials must be usable at
+    ``effective_at`` and at the verification ``moment``.
+
+    Returns canonical compact UTF-8 JSON with exactly ``payload`` and
+    ``signature``.  The payload binds the root digest, predecessor
+    digest, chain height, the full recomputed verdict aggregates
+    (certificate digests in original order, items sorted by site then
+    id, status, common result/digest and plan digest), the bound raw
+    evidence increment (bytes as lowercase hex), the old and new policy
+    digests, the policy version, the effective moment, the issuer and
+    key version and ``version`` (the integer 1); the signature is the
+    HMAC-SHA256 of the canonical payload under the exact issuer/version
+    key.  Container/field type faults raise :class:`TypeError`; an empty
+    value, duplicate id, illegal version or backwards moment raises
+    :class:`ValueError`; a malformed root raises
+    :class:`InvalidConvergenceDecisionError`; a malformed successor or
+    broken chain rule raises :class:`InvalidChainError`; signing or
+    evidence credential faults raise :class:`AuthenticationError`.  No
+    file is read or written and no input is modified.
+    """
+    validated_evidence = _validated_supersede_evidence_items(
+        evidence, "evidence"
+    )
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    if not isinstance(predecessor, bytes):
+        raise TypeError("predecessor must be bytes")
+    validated_fork_policy = _validated_fork_policy(policy)
+    validated_old = _validated_decision_policy(old_policy)
+    validated_new = _validated_decision_policy(new_policy)
+    validated_keyring = _validated_keyring(keyring)
+    sign_moment = _fe_moment(moment, "moment")
+    effective = _fe_moment(effective_at, "effectiveAt")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+
+    previous = _predecessor_view(predecessor)
+
+    old_digest = _decision_policy_digest(validated_old)
+    new_digest = _decision_policy_digest(validated_new)
+    old_version = validated_old[DS_POLICY_VERSION]
+    if previous["kind"] == "root":
+        # The root binds an unversioned {sites,threshold} policy; the
+        # first versioned policy over it starts at version 1 and must
+        # keep the same sites and threshold.
+        if not _policy_sites_threshold_matches_root(validated_old, previous):
+            raise _chain_invalid(
+                "oldPolicy sites and threshold must match the root decision "
+                "policy"
+            )
+        prior_version = CONVERGENCE_DECISION_VERSION
+    else:
+        if old_digest != previous["policy_digest"]:
+            raise _chain_invalid(
+                "oldPolicy must equal the policy bound by the predecessor"
+            )
+        prior_version = previous[DS_POLICY_VERSION]
+    if old_version != prior_version:
+        raise _chain_invalid(
+            "oldPolicy policyVersion must match the predecessor policy version"
+        )
+    new_version = validated_new[DS_POLICY_VERSION]
+    sites_threshold_unchanged = (
+        validated_old[CD_SITES] == validated_new[CD_SITES]
+        and validated_old[CD_THRESHOLD] == validated_new[CD_THRESHOLD]
+    )
+    if sites_threshold_unchanged:
+        if new_version != old_version:
+            raise _chain_invalid(
+                "an unchanged policy must keep its policy version"
+            )
+    else:
+        if new_version != old_version + 1:
+            raise _chain_invalid(
+                "a changed policy must increment policyVersion by exactly one"
+            )
+
+    if previous[DS_EFFECTIVE_AT] is not None and effective < previous[
+        DS_EFFECTIVE_AT
+    ]:
+        raise ValueError("effectiveAt must not move backwards")
+
+    # When the policy is unchanged the history must strictly grow; a
+    # rotation may re-seal the identical evidence sequence.
+    _assert_evidence_prefix(
+        previous, validated_evidence, sites_threshold_unchanged
+    )
+
+    verdict = _recompute_convergence_verdict(
+        validated_evidence, decision, validated_fork_policy,
+        _plain_site_policy(validated_new), validated_keyring, effective,
+    )
+    _assert_transition(previous, verdict)
+    _assert_sealer_authorized(validated_old, validated_new, issuer, version)
+
+    # Evidence credentials must be usable both when the hop takes
+    # effect and when it is issued/verified, and the verdict settled at
+    # the effective moment must be the one observed now.
+    verdict_now = _recompute_convergence_verdict(
+        validated_evidence, decision, validated_fork_policy,
+        _plain_site_policy(validated_new), validated_keyring, sign_moment,
+    )
+    if (
+        verdict_now[STATUS] != verdict[STATUS]
+        or verdict_now[ITEMS] != verdict[ITEMS]
+        or verdict_now[CD_COMMON] != verdict[CD_COMMON]
+    ):
+        raise AuthenticationError(
+            "evidence credentials are not all usable at the issuance moment"
+        )
+
+    # The signing credential must be usable both when the hop is
+    # effective and when it is issued/verified.
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, effective
+    )
+    _usable_checkpoint_key(
+        validated_keyring, issuer, version, sign_moment
+    )
+
+    root_digest = previous[DS_ROOT_DIGEST]
+    height = previous[DS_HEIGHT] + 1
+    payload = {
+        DS_ROOT_DIGEST: root_digest,
+        DS_PREDECESSOR_DIGEST: hashlib.sha256(predecessor).hexdigest(),
+        DS_HEIGHT: height,
+        CD_CERTIFICATES: verdict[CD_CERTIFICATES],
+        CD_COMMON: verdict[CD_COMMON],
+        CD_COMMON_DIGEST: verdict[CD_COMMON_DIGEST],
+        CD_PLAN_DIGEST: verdict[CD_PLAN_DIGEST],
+        ITEMS: [copy.deepcopy(row) for row in verdict[ITEMS]],
+        STATUS: verdict[STATUS],
+        DS_EVIDENCE: _evidence_bound_form(validated_evidence),
+        DS_OLD_POLICY_DIGEST: old_digest,
+        DS_NEW_POLICY_DIGEST: new_digest,
+        DS_POLICY_VERSION: new_version,
+        DS_EFFECTIVE_AT: effective,
+        VD_ISSUER: issuer,
+        KEY_VERSION: version,
+        VERSION: SUPERSEDE_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _checkpoint_compact(
+        {TICKET_PAYLOAD: payload, SIGNATURE: signature}
+    )
+
+
+def _policy_sites_threshold_matches_root(
+    old_policy: dict, root_view: dict
+) -> bool:
+    """Whether a versioned policy's sites/threshold equal the root policy."""
+    root_digest = root_view["policy_digest"]
+    unversioned = hashlib.sha256(
+        _convergence_site_policy_bytes(_plain_site_policy(old_policy))
+    ).hexdigest()
+    return hmac.compare_digest(root_digest, unversioned)
+
+
+def _parse_supersede_packet(raw: object) -> tuple[dict, str]:
+    """Validate successor packet bytes into ``(payload, signature)``.
+
+    A non-bytes argument or a field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, digest, ordering, shape, evidence or
+    binding fault raises :class:`InvalidChainError`.  The predecessor,
+    policy, moment and signature bindings are checked by the chain
+    verifier.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("successor must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _chain_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _chain_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_supersede_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _chain_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("successor must be a JSON object")
+    if set(data.keys()) != _DS_TOP_KEYS:
+        raise _chain_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("successor signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
+        raise _chain_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("successor payload must be an object")
+    if set(payload.keys()) != _DS_SUCCESSOR_PAYLOAD_KEYS:
+        raise _chain_invalid(
+            "payload must contain exactly the keys 'rootDigest', "
+            "'predecessorDigest', 'height', 'certificates', 'common', "
+            "'commonDigest', 'planDigest', 'items', 'status', 'evidence', "
+            "'oldPolicyDigest', 'newPolicyDigest', 'policyVersion', "
+            "'effectiveAt', 'issuer', 'keyVersion' and 'version'"
+        )
+
+    root_digest = payload[DS_ROOT_DIGEST]
+    if not isinstance(root_digest, str):
+        raise TypeError("payload rootDigest must be a str")
+    if not _is_digest(root_digest):
+        raise _chain_invalid(
+            "payload rootDigest must be 64 lowercase hex characters"
+        )
+    predecessor_digest = payload[DS_PREDECESSOR_DIGEST]
+    if not isinstance(predecessor_digest, str):
+        raise TypeError("payload predecessorDigest must be a str")
+    if not _is_digest(predecessor_digest):
+        raise _chain_invalid(
+            "payload predecessorDigest must be 64 lowercase hex characters"
+        )
+    height = payload[DS_HEIGHT]
+    if isinstance(height, bool) or not isinstance(height, int):
+        raise TypeError("payload height must be an int")
+    if height < 1:
+        raise _chain_invalid("payload height must be a positive integer")
+
+    certificates = payload[CD_CERTIFICATES]
+    if not isinstance(certificates, list):
+        raise TypeError("payload certificates must be a list")
+    if not certificates:
+        raise _chain_invalid("payload certificates must be non-empty")
+    for position, digest in enumerate(certificates):
+        if not isinstance(digest, str):
+            raise TypeError(
+                f"payload certificate {position} digest must be a str"
+            )
+        if not _is_digest(digest):
+            raise _chain_invalid(
+                f"payload certificate {position} digest must be 64 lowercase "
+                "hex characters"
+            )
+
+    status = payload[STATUS]
+    if not isinstance(status, str):
+        raise TypeError("payload status must be a str")
+    if status not in _CD_STATUSES:
+        raise _chain_invalid("payload status is not known")
+
+    common = payload[CD_COMMON]
+    common_digest = payload[CD_COMMON_DIGEST]
+    if common is None:
+        if common_digest is not None:
+            if not isinstance(common_digest, str):
+                raise TypeError("payload commonDigest must be a str or null")
+            raise _chain_invalid("a null common result binds no common digest")
+    else:
+        common = _validated_bound_convergence(common, "payload common")
+        if not isinstance(common_digest, str):
+            raise TypeError("payload commonDigest must be a str")
+        if not _is_digest(common_digest):
+            raise _chain_invalid(
+                "payload commonDigest must be 64 lowercase hex characters"
+            )
+        if common_digest != hashlib.sha256(
+            _checkpoint_compact(common)
+        ).hexdigest():
+            raise _chain_invalid(
+                "payload commonDigest does not match the common result"
+            )
+
+    plan_digest = payload[CD_PLAN_DIGEST]
+    if plan_digest is not None:
+        if not isinstance(plan_digest, str):
+            raise TypeError("payload planDigest must be a str or null")
+        if not _is_digest(plan_digest):
+            raise _chain_invalid(
+                "payload planDigest must be 64 lowercase hex characters"
+            )
+    if status == CD_STATUS_ACCEPTED:
+        if common is None:
+            raise _chain_invalid(
+                "an accepted verdict must keep the common convergence result"
+            )
+    elif common is not None:
+        raise _chain_invalid(
+            "only an accepted verdict may keep a common convergence result"
+        )
+    if common is not None and common[CD_PLAN_DIGEST] != plan_digest:
+        raise _chain_invalid(
+            "the common result must share the bound plan digest"
+        )
+
+    parsed_rows = _validated_convergence_decision_rows(payload[ITEMS])
+
+    for key in (DS_OLD_POLICY_DIGEST, DS_NEW_POLICY_DIGEST):
+        value = payload[key]
+        if not isinstance(value, str):
+            raise TypeError(f"payload {key} must be a str")
+        if not _is_digest(value):
+            raise _chain_invalid(
+                f"payload {key} must be 64 lowercase hex characters"
+            )
+    policy_version = payload[DS_POLICY_VERSION]
+    if isinstance(policy_version, bool) or not isinstance(policy_version, int):
+        raise TypeError("payload policyVersion must be an int")
+    if policy_version <= 0:
+        raise _chain_invalid("payload policyVersion must be positive")
+    effective = payload[DS_EFFECTIVE_AT]
+    if isinstance(effective, bool) or not isinstance(effective, int):
+        raise TypeError("payload effectiveAt must be an int")
+    if effective < 0:
+        raise _chain_invalid("payload effectiveAt must be non-negative")
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("payload issuer must be a str")
+    if issuer == "":
+        raise _chain_invalid("payload issuer must be a non-empty str")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _chain_invalid("payload keyVersion must be positive")
+    version = payload[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("payload version must be an int")
+    if version != SUPERSEDE_VERSION:
+        raise _chain_invalid("payload version must be the integer 1")
+
+    evidence = _parse_bound_evidence(payload[DS_EVIDENCE], "payload")
+
+    if _checkpoint_compact(data) != raw:
+        raise _chain_invalid("encoding is not the canonical compact form")
+
+    # The signed payload keeps its canonical bound form (evidence rides
+    # as hex); the decoded raw evidence is returned separately so the
+    # canonical bytes stay byte-identical for the HMAC check.
+    return payload, signature, evidence
+
+
+# -- Offline chain verification -----------------------------------------------
+
+def _validated_policy_sequence(policies: object) -> list[dict]:
+    """Validate a chain's versioned policy sequence (one more than hops)."""
+    if not isinstance(policies, list):
+        raise TypeError("policies must be a list")
+    if not policies:
+        raise ValueError("policies must be a non-empty list")
+    return [_validated_decision_policy(policy) for policy in policies]
+
+
+def _chain_root_policy(versioned_policy: dict) -> dict:
+    """The unversioned site policy a root decision was signed under."""
+    return _plain_site_policy(versioned_policy)
+
+
+def _verify_chain_hop(
+    successor: bytes,
+    previous_view: dict,
+    previous_packet: bytes,
+    root_packet_digest: str,
+    root_plan_digest: str,
+    decision: bytes,
+    validated_fork_policy: dict,
+    old_policy: dict,
+    new_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one successor packet against its predecessor and policies."""
+    payload, signature, evidence = _parse_supersede_packet(successor)
+
+    if payload[DS_ROOT_DIGEST] != root_packet_digest:
+        raise _chain_invalid("root digest does not match the chain root")
+    if payload[DS_PREDECESSOR_DIGEST] != hashlib.sha256(
+        previous_packet
+    ).hexdigest():
+        raise _chain_invalid(
+            "predecessor digest does not match the previous packet"
+        )
+    expected_height = previous_view[DS_HEIGHT] + 1
+    if payload[DS_HEIGHT] != expected_height:
+        raise _chain_invalid("height must increase by exactly one")
+
+    old_digest = _decision_policy_digest(old_policy)
+    new_digest = _decision_policy_digest(new_policy)
+    if previous_view["kind"] == "root":
+        if not _policy_sites_threshold_matches_root(old_policy, previous_view):
+            raise _chain_invalid(
+                "oldPolicy sites and threshold must match the root policy"
+            )
+        prior_version = CONVERGENCE_DECISION_VERSION
+    else:
+        if old_digest != previous_view["policy_digest"]:
+            raise _chain_invalid(
+                "oldPolicy must equal the policy bound by the predecessor"
+            )
+        prior_version = previous_view[DS_POLICY_VERSION]
+    old_version = old_policy[DS_POLICY_VERSION]
+    if old_version != prior_version:
+        raise _chain_invalid(
+            "oldPolicy policyVersion must match the predecessor version"
+        )
+    if payload[DS_OLD_POLICY_DIGEST] != old_digest:
+        raise _chain_invalid("bound oldPolicyDigest does not match")
+    if payload[DS_NEW_POLICY_DIGEST] != new_digest:
+        raise _chain_invalid("bound newPolicyDigest does not match")
+    unchanged = (
+        old_policy[CD_SITES] == new_policy[CD_SITES]
+        and old_policy[CD_THRESHOLD] == new_policy[CD_THRESHOLD]
+    )
+    new_version = new_policy[DS_POLICY_VERSION]
+    if unchanged:
+        if new_version != old_version:
+            raise _chain_invalid(
+                "an unchanged policy must keep its policy version"
+            )
+    elif new_version != old_version + 1:
+        raise _chain_invalid(
+            "a changed policy must increment policyVersion by exactly one"
+        )
+    if payload[DS_POLICY_VERSION] != new_version:
+        raise _chain_invalid("bound policyVersion does not match the policy")
+
+    effective = payload[DS_EFFECTIVE_AT]
+    if previous_view[DS_EFFECTIVE_AT] is not None and effective < previous_view[
+        DS_EFFECTIVE_AT
+    ]:
+        raise _chain_invalid("effectiveAt must not move backwards")
+
+    _assert_evidence_prefix(previous_view, evidence, unchanged)
+
+    verdict = _recompute_convergence_verdict(
+        evidence, decision, validated_fork_policy,
+        _plain_site_policy(new_policy), validated_keyring, effective,
+    )
+    # Credentials must still be usable at the verification moment, and
+    # the verdict must be the same one that was settled at effective time.
+    verdict_now = _recompute_convergence_verdict(
+        evidence, decision, validated_fork_policy,
+        _plain_site_policy(new_policy), validated_keyring, moment,
+    )
+    view = {**previous_view, "root_plan_digest": root_plan_digest}
+    _assert_transition(view, verdict)
+    _assert_sealer_authorized(
+        old_policy, new_policy, payload[VD_ISSUER], payload[KEY_VERSION]
+    )
+
+    if payload[CD_CERTIFICATES] != verdict[CD_CERTIFICATES]:
+        raise _chain_invalid(
+            "bound certificate digests do not match the recomputed evidence"
+        )
+    if payload[ITEMS] != verdict[ITEMS]:
+        raise _chain_invalid(
+            "bound items do not match the recomputed verdict"
+        )
+    if payload[STATUS] != verdict[STATUS]:
+        raise _chain_invalid("bound status does not match the recomputed verdict")
+    if payload[CD_COMMON] != verdict[CD_COMMON]:
+        raise _chain_invalid("bound common result does not match")
+    if payload[CD_COMMON_DIGEST] != verdict[CD_COMMON_DIGEST]:
+        raise _chain_invalid("bound common digest does not match")
+    if payload[CD_PLAN_DIGEST] != verdict[CD_PLAN_DIGEST]:
+        raise _chain_invalid("bound plan digest does not match")
+    if verdict_now[STATUS] != verdict[STATUS] or verdict_now[ITEMS] != verdict[
+        ITEMS
+    ] or verdict_now[CD_COMMON] != verdict[CD_COMMON]:
+        raise AuthenticationError(
+            "evidence credentials are not all usable at the verification "
+            "moment"
+        )
+
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION], effective
+    )
+    _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION], moment
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "decision successor signature does not match"
+        )
+
+    return {
+        "packet": successor,
+        "view": _successor_view_from_payload(payload, evidence, root_plan_digest),
+    }
+
+
+def _successor_view_from_payload(
+    payload: dict, evidence: list[dict], root_plan_digest: str
+) -> dict:
+    """Build a predecessor view from an already-verified successor."""
+    return {
+        "kind": "successor",
+        DS_ROOT_DIGEST: payload[DS_ROOT_DIGEST],
+        DS_HEIGHT: payload[DS_HEIGHT],
+        STATUS: payload[STATUS],
+        CD_COMMON: copy.deepcopy(payload[CD_COMMON]),
+        CD_PLAN_DIGEST: payload[CD_PLAN_DIGEST],
+        CD_CERTIFICATES: list(payload[CD_CERTIFICATES]),
+        ITEMS: copy.deepcopy(payload[ITEMS]),
+        "policy_digest": payload[DS_NEW_POLICY_DIGEST],
+        DS_POLICY_VERSION: payload[DS_POLICY_VERSION],
+        DS_EFFECTIVE_AT: payload[DS_EFFECTIVE_AT],
+        "evidence": evidence,
+        "root_plan_digest": root_plan_digest,
+    }
+
+
+def verify_decision_chain(
+    root: bytes,
+    successors: list,
+    decision: bytes,
+    policy: dict,
+    policies: list,
+    keyring: dict,
+    moment: int,
+) -> dict:
+    """Verify one supersession chain hop by hop, entirely offline.
+
+    ``root`` is the chain's convergence decision packet and
+    ``successors`` the ordered successor packets (possibly empty for a
+    height-zero chain).  ``decision`` is the original fork decision and
+    ``policy`` the shared fork policy; ``policies`` is one versioned
+    site policy per stage (the root policy plus one per successor), so
+    its length is ``len(successors) + 1``.  The root is verified under
+    the first policy's sites and threshold at the verification
+    ``moment``; every successor re-recomputes its verdict from the bound
+    full evidence under its new policy, checks the predecessor, root,
+    height, policy-version and effective-moment bindings and the
+    verdict state machine, and verifies the HMAC with a credential
+    usable both at the hop's effective moment and at ``moment``.
+
+    Returns a fresh mapping with exactly ``rootDigest``, ``headDigest``,
+    ``height`` (0 for a bare root), ``policyVersion`` (the head policy's
+    version, 1 for a bare root) and ``status``.  A non-bytes argument
+    or wrong field type raises :class:`TypeError`; an empty value,
+    duplicate id, illegal version or backwards moment raises
+    :class:`ValueError`; a bad root raises
+    :class:`InvalidConvergenceDecisionError`; a bad successor raises
+    :class:`InvalidChainError`; a signature or credential fault raises
+    :class:`AuthenticationError`.  No file is read or written and no
+    input is modified.
+    """
+    if not isinstance(root, bytes):
+        raise TypeError("root must be bytes")
+    if not isinstance(successors, list):
+        raise TypeError("successors must be a list")
+    for index, successor in enumerate(successors):
+        if not isinstance(successor, bytes):
+            raise TypeError(f"successor {index} must be bytes")
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    validated_fork_policy = _validated_fork_policy(policy)
+    validated_policies = _validated_policy_sequence(policies)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    if len(validated_policies) != len(successors) + 1:
+        raise ValueError(
+            "policies must provide one entry per chain stage (one more than "
+            "the number of successors)"
+        )
+    if validated_policies[0][DS_POLICY_VERSION] != 1:
+        raise ValueError(
+            "the root stage policy must carry policyVersion 1"
+        )
+
+    root_result = _verify_convergence_decision(
+        root, decision, _chain_root_policy(validated_policies[0]),
+        validated_keyring, verify_moment,
+    )
+    root_payload, _root_sig = _parse_convergence_decision(root)
+    root_digest = hashlib.sha256(root).hexdigest()
+    root_plan_digest = _root_plan_digest(root_payload)
+    view = _root_decision_view(root)
+    head_packet = root
+    head_status = root_result[STATUS]
+    head_policy_version = validated_policies[0][DS_POLICY_VERSION]
+
+    previous_packet = root
+    for index, successor in enumerate(successors):
+        hop = _verify_chain_hop(
+            successor, view, previous_packet, root_digest, root_plan_digest,
+            decision, validated_fork_policy, validated_policies[index],
+            validated_policies[index + 1], validated_keyring, verify_moment,
+        )
+        view = hop["view"]
+        previous_packet = successor
+        head_packet = successor
+        head_status = view[STATUS]
+        head_policy_version = view[DS_POLICY_VERSION]
+
+    return {
+        DS_ROOT_DIGEST: root_digest,
+        DS_HEAD_DIGEST: hashlib.sha256(head_packet).hexdigest(),
+        DS_HEIGHT: view[DS_HEIGHT],
+        DS_POLICY_VERSION: head_policy_version,
+        STATUS: head_status,
+    }
+
+
+# -- Offline batch verification of decision chains ----------------------------
+
+def _validated_decision_chain_batch(items: object) -> list[dict]:
+    """Validate the chain batch before any chain is verified.
+
+    Each item holds exactly ``id`` (a non-empty str, unique across the
+    batch), ``roots`` (bytes), ``successors`` (a list of bytes) and
+    ``policies`` (a non-empty list).  Container/element/field type
+    faults raise :class:`TypeError`; an empty list, empty or duplicate
+    id or a wrong key set raises :class:`ValueError`.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != {
+            ID, DS_BATCH_ROOTS, DS_BATCH_SUCCESSORS, DS_BATCH_POLICIES
+        }:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'id', 'roots', "
+                "'successors' and 'policies'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        root = item[DS_BATCH_ROOTS]
+        if not isinstance(root, bytes):
+            raise TypeError(f"{where} root must be bytes")
+        successors = item[DS_BATCH_SUCCESSORS]
+        if not isinstance(successors, list):
+            raise TypeError(f"{where} successors must be a list")
+        for hop_index, successor in enumerate(successors):
+            if not isinstance(successor, bytes):
+                raise TypeError(f"{where} successor {hop_index} must be bytes")
+        policies = item[DS_BATCH_POLICIES]
+        if not isinstance(policies, list):
+            raise TypeError(f"{where} policies must be a list")
+        if not policies:
+            raise ValueError(f"{where} policies must be non-empty")
+        validated.append({
+            ID: item_id,
+            DS_BATCH_ROOTS: root,
+            DS_BATCH_SUCCESSORS: list(successors),
+            DS_BATCH_POLICIES: list(policies),
+        })
+    return validated
+
+
+def _chain_edge_nodes(item: dict) -> list[str]:
+    """The digest chain a batch item walks: root then each successor."""
+    nodes = [hashlib.sha256(item[DS_BATCH_ROOTS]).hexdigest()]
+    for successor in item[DS_BATCH_SUCCESSORS]:
+        nodes.append(hashlib.sha256(successor).hexdigest())
+    return nodes
+
+
+def _decision_chain_item_report(
+    item_id: str, status: str, error: str | None, result: dict | None
+) -> dict:
+    """One decision-chain batch report with the fixed key order."""
+    return {
+        CHECKPOINT_ITEM_ERROR: error,
+        ID: item_id,
+        VERDICT_ITEM_RESULT: result,
+        STATUS: status,
+    }
+
+
+def verify_decision_chains(
+    items: list, decision: bytes, policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify a batch of supersession chains and spot successor forks.
+
+    Each item holds exactly a unique ``id``, its ``roots`` packet, its
+    ordered ``successors`` packets and its per-stage ``policies``
+    sequence.  The whole batch, fork ``decision``/``policy``, keyring
+    and moment are validated before any chain runs; only these
+    batch-level faults raise (container/element/field type faults
+    :class:`TypeError`; an empty list, empty or duplicate id or wrong
+    key set :class:`ValueError`).
+
+    Each chain is then verified independently, in strict input order,
+    through the exact :func:`verify_decision_chain` rules: one chain's
+    failure never stops a later chain or changes an earlier report.
+    Encoding, key-set, digest, ordering, reference, binding or
+    state-machine faults report ``invalid``; signature or credential
+    faults report ``unauthenticated``; a passing chain reports
+    ``verified``.
+
+    After verification, the same predecessor digest pointing at two
+    distinct successor packets is a fork (a mere prefix extension --
+    the same chain growing longer -- is not).  Every verified chain
+    crossing a forking edge is reclassified ``conflicted`` with its
+    verified result kept; invalid/unauthenticated chains are never
+    reclassified.
+
+    Returns a fresh dict with fixed keys ``items`` and ``version``
+    (the integer 1); each item report carries, in this key order,
+    ``error`` (null exactly when verified), ``id``, ``result`` (a fresh
+    copy of the chain summary when verified, otherwise null) and
+    ``status``.  No file is read or written and no input is modified.
+    """
+    validated_items = _validated_decision_chain_batch(items)
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    validated_fork_policy = _validated_fork_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+
+    reports: list[dict] = []
+    results: list[dict | None] = []
+    for item in validated_items:
+        item_id = item[ID]
+        try:
+            result = verify_decision_chain(
+                item[DS_BATCH_ROOTS], item[DS_BATCH_SUCCESSORS], decision,
+                policy, item[DS_BATCH_POLICIES], keyring, verify_moment,
+            )
+        except AuthenticationError as exc:
+            reports.append(_decision_chain_item_report(
+                item_id, _DS_VERIFY_UNAUTHENTICATED, str(exc), None
+            ))
+            results.append(None)
+        except (InvalidConvergenceDecisionError, InvalidChainError,
+                TypeError, ValueError) as exc:
+            # A TypeError here is a wrong field type inside a packet;
+            # the public argument types were all validated up front.
+            reports.append(_decision_chain_item_report(
+                item_id, _DS_VERIFY_INVALID, str(exc), None
+            ))
+            results.append(None)
+        else:
+            reports.append(_decision_chain_item_report(
+                item_id, _DS_VERIFY_VERIFIED, None, result
+            ))
+            results.append(result)
+
+    # Fork detection: one predecessor digest pointing at two distinct
+    # successor digests, ignoring chains that did not verify.
+    children: dict[str, set[str]] = {}
+    for item, result in zip(validated_items, results):
+        if result is None:
+            continue
+        nodes = _chain_edge_nodes(item)
+        for upstream, downstream in zip(nodes, nodes[1:]):
+            children.setdefault(upstream, set()).add(downstream)
+    fork_edges = {
+        upstream for upstream, digests in children.items()
+        if len(digests) > 1
+    }
+    if fork_edges:
+        for item, report, result in zip(validated_items, reports, results):
+            if result is None:
+                continue
+            nodes = _chain_edge_nodes(item)
+            if any(upstream in fork_edges for upstream in nodes[:-1]):
+                report[STATUS] = _DS_CHAIN_CONFLICTED
+                report[CHECKPOINT_ITEM_ERROR] = _DS_CHAIN_ERROR
+
+    return {
+        ITEMS: reports,
+        VERSION: SUPERSEDE_VERSION,
+    }
+
+
+# -- Stable head anchors for verified, accepted, unforked chains ---------------
+
+def seal_decision_head(
+    items: list,
+    target: str,
+    decision: bytes,
+    policy: dict,
+    keyring: dict,
+    moment: int,
+    issuer: str,
+    version: int,
+) -> bytes:
+    """Seal a stable anchor over one target head within the batch.
+
+    The batch is first run through the exact
+    :func:`verify_decision_chains` rules.  An anchor is only sealed for
+    the ``target`` chain when it is ``verified`` -- never merely
+    conflicted by a fork in this batch, invalid or unauthenticated --
+    and its head is ``accepted``; otherwise sealing raises
+    :class:`ValueError`.  Other chains in the batch are still checked
+    for forks (a fork reclassifies the target when it shares an edge)
+    but their own failures do not stop the target's anchor.  The
+    anchor binds that chain's root digest, head digest and height
+    together with the head policy digest, the head policy version and
+    the sealing moment.  The signature is the HMAC-SHA256 of the
+    canonical anchor payload under the exact ``issuer``/``version``
+    key, usable at ``moment``.
+
+    Returns canonical compact UTF-8 JSON with exactly ``payload`` and
+    ``signature``.  Container/field type faults raise :class:`TypeError`;
+    an empty value, an unknown target id, an illegal version or a target
+    that is not clean, unforked and accepted raises :class:`ValueError`;
+    a signing credential fault raises :class:`AuthenticationError`.  No
+    file is read or written and no input is modified.
+    """
+    validated_items = _validated_decision_chain_batch(items)
+    if not isinstance(target, str):
+        raise TypeError("target must be a str")
+    if target == "":
+        raise ValueError("target must be non-empty")
+    target_index = None
+    for position, item in enumerate(validated_items):
+        if item[ID] == target:
+            target_index = position
+            break
+    if target_index is None:
+        raise ValueError(f"unknown target id {target!r}")
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    _validated_fork_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    seal_moment = _fe_moment(moment, "moment")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+
+    report = verify_decision_chains(
+        items, decision, policy, keyring, seal_moment
+    )
+    # The target alone must be verified (never conflicted by a fork in
+    # this batch, invalid or unauthenticated) and accepted; an unrelated
+    # failing chain never stops its anchor.
+    entry_report = report[ITEMS][target_index]
+    if entry_report[STATUS] != _DS_VERIFY_VERIFIED:
+        raise ValueError(
+            "an anchor seals only a verified target with no fork"
+        )
+    result = entry_report[VERDICT_ITEM_RESULT]
+    if result[STATUS] != CD_STATUS_ACCEPTED:
+        raise ValueError("an anchor seals only an accepted head")
+    target_item = validated_items[target_index]
+    head_packet = (
+        target_item[DS_BATCH_SUCCESSORS][-1]
+        if target_item[DS_BATCH_SUCCESSORS] else target_item[DS_BATCH_ROOTS]
+    )
+    head_policy = _validated_decision_policy(
+        target_item[DS_BATCH_POLICIES][-1]
+    )
+    if result[DS_HEAD_DIGEST] != hashlib.sha256(head_packet).hexdigest():
+        raise ValueError("the sealed head digest does not match its packet")
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, seal_moment
+    )
+    payload = {
+        DS_ROOT_DIGEST: result[DS_ROOT_DIGEST],
+        DS_HEAD_DIGEST: result[DS_HEAD_DIGEST],
+        DS_HEIGHT: result[DS_HEIGHT],
+        CD_POLICY_DIGEST: _decision_policy_digest(head_policy),
+        DS_POLICY_VERSION: result[DS_POLICY_VERSION],
+        CP_MOMENT: seal_moment,
+        VD_ISSUER: issuer,
+        KEY_VERSION: version,
+        VERSION: SUPERSEDE_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _checkpoint_compact(
+        {TICKET_PAYLOAD: payload, SIGNATURE: signature}
+    )
+
+
+def _parse_decision_anchor(raw: object) -> tuple[dict, str]:
+    """Validate anchor bytes structurally into ``(payload, signature)``."""
+    if not isinstance(raw, bytes):
+        raise TypeError("anchor must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _anchor_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _anchor_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_anchor_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _anchor_invalid("is not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise TypeError("anchor must be a JSON object")
+    if set(data.keys()) != _DS_ANCHOR_TOP_KEYS:
+        raise _anchor_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("anchor signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
+        raise _anchor_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("anchor payload must be an object")
+    if set(payload.keys()) != _DS_ANCHOR_PAYLOAD_KEYS:
+        raise _anchor_invalid(
+            "payload must contain exactly the keys 'rootDigest', "
+            "'headDigest', 'height', 'policyDigest', 'policyVersion', "
+            "'moment', 'issuer', 'keyVersion' and 'version'"
+        )
+    for key in (DS_ROOT_DIGEST, DS_HEAD_DIGEST, CD_POLICY_DIGEST):
+        value = payload[key]
+        if not isinstance(value, str):
+            raise TypeError(f"payload {key} must be a str")
+        if not _is_digest(value):
+            raise _anchor_invalid(
+                f"payload {key} must be 64 lowercase hex characters"
+            )
+    height = payload[DS_HEIGHT]
+    if isinstance(height, bool) or not isinstance(height, int):
+        raise TypeError("payload height must be an int")
+    if height < 0:
+        raise _anchor_invalid("payload height must be non-negative")
+    policy_version = payload[DS_POLICY_VERSION]
+    if isinstance(policy_version, bool) or not isinstance(policy_version, int):
+        raise TypeError("payload policyVersion must be an int")
+    if policy_version <= 0:
+        raise _anchor_invalid("payload policyVersion must be positive")
+    moment = payload[CP_MOMENT]
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("payload moment must be an int")
+    if moment < 0:
+        raise _anchor_invalid("payload moment must be non-negative")
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("payload issuer must be a str")
+    if issuer == "":
+        raise _anchor_invalid("payload issuer must be a non-empty str")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _anchor_invalid("payload keyVersion must be positive")
+    anchor_version = payload[VERSION]
+    if isinstance(anchor_version, bool) or not isinstance(
+        anchor_version, int
+    ):
+        raise TypeError("payload version must be an int")
+    if anchor_version != SUPERSEDE_VERSION:
+        raise _anchor_invalid("payload version must be the integer 1")
+    if _checkpoint_compact(data) != raw:
+        raise _anchor_invalid("encoding is not the canonical compact form")
+    return payload, signature
+
+
+def verify_decision_head(
+    anchor: bytes,
+    items: list,
+    target: str,
+    decision: bytes,
+    policy: dict,
+    keyring: dict,
+    moment: int,
+) -> dict:
+    """Re-verify a sealed anchor against its original batch and keys.
+
+    The anchor is checked structurally and its HMAC verified against
+    the current keyring key bound to its exact issuer and version,
+    usable at the verification ``moment``.  The original batch (with
+    ``target`` naming the anchored chain) is then re-run through
+    :func:`verify_decision_chains`; every chain must again verify with
+    no fork and an accepted head, and the target chain's root digest,
+    head digest, height and policy version must equal the anchor
+    bindings while the bound policy digest must equal the digest of the
+    target's head policy.
+
+    Returns a fresh mapping with fixed keys ``rootDigest``,
+    ``headDigest``, ``height``, ``policyDigest``, ``policyVersion`` and
+    ``anchorDigest`` (the SHA-256 of the anchor bytes).  A non-bytes or
+    wrong-type argument raises :class:`TypeError`; an empty value,
+    duplicate or unknown target id or an illegal version raises
+    :class:`ValueError`; a bad anchor raises :class:`InvalidAnchorError`;
+    a batch that no longer verifies raises the underlying
+    :class:`InvalidConvergenceDecisionError` or :class:`InvalidChainError`;
+    a signature or credential fault raises :class:`AuthenticationError`.
+    No file is read or written and no input is modified.
+    """
+    if not isinstance(anchor, bytes):
+        raise TypeError("anchor must be bytes")
+    payload, signature = _parse_decision_anchor(anchor)
+    validated_items = _validated_decision_chain_batch(items)
+    if not isinstance(target, str):
+        raise TypeError("target must be a str")
+    if target == "":
+        raise ValueError("target must be non-empty")
+    target_index = None
+    for position, item in enumerate(validated_items):
+        if item[ID] == target:
+            target_index = position
+            break
+    if target_index is None:
+        raise ValueError(f"unknown target id {target!r}")
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    _validated_fork_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION],
+        verify_moment,
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _checkpoint_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError("decision head anchor signature does not match")
+
+    report = verify_decision_chains(
+        items, decision, policy, keyring, verify_moment
+    )
+    entry_report = report[ITEMS][target_index]
+    if entry_report[STATUS] != _DS_VERIFY_VERIFIED:
+        raise _anchor_invalid(
+            "the anchored target no longer verifies without a fork"
+        )
+    result = entry_report[VERDICT_ITEM_RESULT]
+    if result[STATUS] != CD_STATUS_ACCEPTED:
+        raise _anchor_invalid("the anchored head is no longer accepted")
+    target_item = validated_items[target_index]
+    head_policy = _validated_decision_policy(
+        target_item[DS_BATCH_POLICIES][-1]
+    )
+    head_policy_digest = _decision_policy_digest(head_policy)
+    if result[DS_ROOT_DIGEST] != payload[DS_ROOT_DIGEST]:
+        raise _anchor_invalid("root digest does not match the anchor")
+    if result[DS_HEAD_DIGEST] != payload[DS_HEAD_DIGEST]:
+        raise _anchor_invalid("head digest does not match the anchor")
+    if result[DS_HEIGHT] != payload[DS_HEIGHT]:
+        raise _anchor_invalid("height does not match the anchor")
+    if result[DS_POLICY_VERSION] != payload[DS_POLICY_VERSION]:
+        raise _anchor_invalid("policy version does not match the anchor")
+    if head_policy_digest != payload[CD_POLICY_DIGEST]:
+        raise _anchor_invalid("policy digest does not match the anchor")
+    return {
+        DS_ROOT_DIGEST: payload[DS_ROOT_DIGEST],
+        DS_HEAD_DIGEST: payload[DS_HEAD_DIGEST],
+        DS_HEIGHT: payload[DS_HEIGHT],
+        CD_POLICY_DIGEST: head_policy_digest,
+        DS_POLICY_VERSION: payload[DS_POLICY_VERSION],
+        DS_ANCHOR_DIGEST: hashlib.sha256(anchor).hexdigest(),
+    }
