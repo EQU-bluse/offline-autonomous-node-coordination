@@ -10,8 +10,9 @@ site/version HMAC signing with no fallback, the per-packet
 ``invalid-proof``/``unauthorized``/``unauthenticated`` taxonomy,
 same-site duplicate and contradiction handling, cross-site report and
 digest agreement that no majority can outvote, the accepted/
-insufficient/conflicted outcomes with the common report present only
-when accepted, stable site/id ordering with original-order attestation
+insufficient/conflicted outcomes with the unique common report kept
+even below threshold (and present only with a valid vote), stable
+site/id ordering with original-order attestation
 digests, offline re-tally and signature verification, equal-but-
 independent return values, error hierarchy, input immutability and the
 purely offline guarantee.
@@ -337,8 +338,19 @@ class AdjudicatePruneAttestationsTest(PruneAttestationFixtures,
         self.assertEqual(compact(parse(raw)), raw)
         self.assertFalse(raw.endswith(b"\n"))
 
-    def test_insufficient_below_threshold_carries_no_report(self):
+    def test_insufficient_below_threshold_keeps_the_unique_report(self):
         raw = self.decide([("a", self.att_a)])
+        payload = parse(raw)["payload"]
+        self.assertEqual(payload["status"], "insufficient")
+        # One unique, conflict-free vote short of the threshold still
+        # carries the one common complete batch report.
+        expected_report = verify_prune_receipts(
+            self.prune_items, RING, self.moment
+        )
+        self.assertEqual(payload["report"], expected_report)
+
+    def test_insufficient_with_no_valid_vote_carries_a_null_report(self):
+        raw = self.decide([("bad", b"nope")])
         payload = parse(raw)["payload"]
         self.assertEqual(payload["status"], "insufficient")
         self.assertIsNone(payload["report"])
@@ -752,8 +764,9 @@ class VerifyPruneAdjudicationTest(PruneAttestationFixtures,
         with self.assertRaises(InvalidPruneAdjudicationError):
             self.verify(raw=self.resign(data))
 
-        # Claim a report for an insufficient adjudication.
-        insufficient = self.decide([self.packet("a", self.att_a)])
+        # Claim a report for an insufficient adjudication with no valid
+        # vote, whose common report must stay null.
+        insufficient = self.decide([self.packet("bad", b"nope")])
         data = parse(insufficient)
         data["payload"]["report"] = verify_prune_receipts(
             self.prune_items, RING, self.moment
@@ -763,6 +776,15 @@ class VerifyPruneAdjudicationTest(PruneAttestationFixtures,
 
         # Drop the common report while claiming accepted.
         data = parse(self.decision)
+        data["payload"]["report"] = None
+        with self.assertRaises(InvalidPruneAdjudicationError):
+            self.verify(raw=self.resign(data))
+
+        # A unique conflict-free content short of the threshold must
+        # still carry its common report; dropping it is a bad binding.
+        below = self.decide([self.packet("a", self.att_a)])
+        self.assertEqual(parse(below)["payload"]["status"], "insufficient")
+        data = parse(below)
         data["payload"]["report"] = None
         with self.assertRaises(InvalidPruneAdjudicationError):
             self.verify(raw=self.resign(data))
