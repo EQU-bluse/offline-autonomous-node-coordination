@@ -23165,3 +23165,1155 @@ def verify_prune_aggregate_head(
         PAC_POLICY_VERSION: payload[PAC_POLICY_VERSION],
         PAC_ANCHOR_DIGEST: hashlib.sha256(anchor).hexdigest(),
     }
+
+# --- Batch verification and fork proofs over prune aggregate chains ----------
+
+PRUNE_AGGREGATE_CHAINS_VERSION = 1
+PRUNE_AGGREGATE_FORK_PROOF_VERSION = 1
+
+PACF_ROOT = "root"
+PACF_SUCCESSORS = "successors"
+PACF_POLICIES = "policies"
+PACF_IDS = "ids"
+PACF_MATERIALS_DIGEST = "materialsDigest"
+PACF_FORKED_CHAIN = "forked-aggregate-chain"
+
+PACF_STATUS_VERIFIED = "verified"
+PACF_STATUS_CONFLICTED = "conflicted"
+PACF_STATUS_INVALID_ROOT = "invalid-root"
+PACF_STATUS_INVALID_CHAIN = "invalid-chain"
+PACF_STATUS_UNAUTHENTICATED = "unauthenticated"
+_PACF_STATUSES = frozenset((
+    PACF_STATUS_VERIFIED,
+    PACF_STATUS_CONFLICTED,
+    PACF_STATUS_INVALID_ROOT,
+    PACF_STATUS_INVALID_CHAIN,
+    PACF_STATUS_UNAUTHENTICATED,
+))
+
+_PACF_ITEM_KEYS = frozenset((
+    ID,
+    PACF_ROOT,
+    PACF_SUCCESSORS,
+    PACF_POLICIES,
+))
+_PACF_FORK_KEYS = frozenset((
+    PAC_ROOT_DIGEST,
+    PAC_PREDECESSOR_DIGEST,
+    PACF_SUCCESSORS,
+    PACF_IDS,
+))
+_PACF_MATERIAL_KEYS = frozenset((
+    ID,
+    PACF_ROOT,
+    PACF_SUCCESSORS,
+    PACF_POLICIES,
+))
+_PACF_RESULT_KEYS = frozenset((
+    PAC_ROOT_DIGEST,
+    PAC_HEAD_DIGEST,
+    PAC_HEIGHT,
+    PAC_POLICY_VERSION,
+    STATUS,
+    PAC_COMMON_DIGEST,
+))
+_PACF_REPORT_KEYS = frozenset((CHAINS_FORKS, ITEMS, VERSION))
+_PACF_ITEM_REPORT_KEYS = frozenset((
+    CHECKPOINT_ITEM_ERROR,
+    ID,
+    VERDICT_ITEM_RESULT,
+    STATUS,
+))
+_PACF_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_PACF_PAYLOAD_KEYS = frozenset((
+    PACF_MATERIALS_DIGEST,
+    FORK_PROOF_CHAINS,
+    VD_ISSUER,
+    KEY_VERSION,
+    CP_MOMENT,
+    PBA_PRUNE_POLICY_DIGEST,
+    FORK_PROOF_REPORT,
+    VERSION,
+))
+
+
+class InvalidAggregateForkProofError(ValueError):
+    """A signed prune aggregate fork proof fails its canonical contract."""
+
+
+def _pac_fork_proof_invalid(message: str) -> InvalidAggregateForkProofError:
+    return InvalidAggregateForkProofError(
+        f"invalid prune aggregate fork proof: {message}"
+    )
+
+
+def _pac_fork_invalid_edge(where: str) -> InvalidAggregateForkProofError:
+    return _pac_fork_proof_invalid(
+        f"{where} is not a fork in the bound chain materials"
+    )
+
+
+def _reject_duplicate_pacf_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate proof keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _pac_fork_proof_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _validated_pacf_items(chains: object) -> list[dict]:
+    """Validate the chain batch before any chain is verified.
+
+    The argument must be a non-empty list of dicts each holding exactly
+    ``id`` (a non-empty str, unique across the batch), ``root`` (the
+    root aggregate bytes), ``successors`` (a list of successor packet
+    bytes, empty for a height-zero chain) and ``policies`` (a list with
+    exactly one versioned site policy per chain stage, so one more than
+    the successor count).  Container, element and field type faults
+    raise :class:`TypeError`; an empty list, an empty or duplicate id,
+    a wrong key set or a policy count that does not match the stage
+    count raises :class:`ValueError`.  Only a fully validated batch
+    comes back, as fresh item dicts with copied lists, so verification
+    below never mutates the caller's objects.
+    """
+    if not isinstance(chains, list):
+        raise TypeError("chains must be a list")
+    if not chains:
+        raise ValueError("chains must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(chains):
+        where = f"chain {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _PACF_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'id', 'policies', "
+                "'root' and 'successors'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        root = item[PACF_ROOT]
+        if not isinstance(root, bytes):
+            raise TypeError(f"{where} root must be bytes")
+        successors = item[PACF_SUCCESSORS]
+        if not isinstance(successors, list):
+            raise TypeError(f"{where} successors must be a list")
+        for hop_index, successor in enumerate(successors):
+            if not isinstance(successor, bytes):
+                raise TypeError(f"{where} successor {hop_index} must be bytes")
+        policies = item[PACF_POLICIES]
+        if not isinstance(policies, list):
+            raise TypeError(f"{where} policies must be a list")
+        if len(policies) != len(successors) + 1:
+            raise ValueError(
+                f"{where} policies must provide one entry per chain stage "
+                "(one more than the number of successors)"
+            )
+        validated.append(
+            {
+                ID: item_id,
+                PACF_ROOT: root,
+                PACF_SUCCESSORS: list(successors),
+                PACF_POLICIES: list(policies),
+            }
+        )
+    return validated
+
+
+def _pacf_item_report(
+    item_id: str, status: str, error: str | None, result: dict | None
+) -> dict:
+    """One chain batch report with the fixed key order."""
+    return {
+        CHECKPOINT_ITEM_ERROR: error,
+        ID: item_id,
+        VERDICT_ITEM_RESULT: result,
+        STATUS: status,
+    }
+
+
+def _pacf_chain_result(root_digest: str, head: dict) -> dict:
+    """The per-chain result with the fixed key order."""
+    return {
+        PAC_ROOT_DIGEST: root_digest,
+        PAC_HEAD_DIGEST: head[PAC_HEAD_DIGEST],
+        PAC_HEIGHT: head[PAC_HEIGHT],
+        PAC_POLICY_VERSION: head[PAC_POLICY_VERSION],
+        STATUS: head[STATUS],
+        PAC_COMMON_DIGEST: head[PAC_COMMON_DIGEST],
+    }
+
+
+def _verify_pacf_one(
+    item: dict,
+    validated_prune_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    verify_moment: int,
+) -> dict:
+    """Verify one batch chain in isolation and report its outcome.
+
+    The root aggregate is verified first, then the ordered successors
+    hop by hop -- exactly the :func:`verify_prune_aggregate_chain`
+    rules.  A root fault is ``invalid-root``, a successor or chain
+    binding fault is ``invalid-chain`` and a credential or signature
+    fault is ``unauthenticated``; a passing chain is ``verified`` with
+    its fresh chain summary.
+    """
+    item_id = item[ID]
+    root = item[PACF_ROOT]
+    successors = item[PACF_SUCCESSORS]
+    policies = item[PACF_POLICIES]
+    try:
+        root_policy = _validated_pac_site_policy(policies[0])
+        if root_policy[DS_POLICY_VERSION] != 1:
+            raise ValueError(
+                "the root stage policy must carry policyVersion 1"
+            )
+        root_payload = _verify_prune_batch_aggregate_core(
+            root, validated_prune_policy,
+            _pac_plain_site_policy(root_policy),
+            validated_keyring, verify_moment,
+        )
+    except AuthenticationError as exc:
+        return _pacf_item_report(
+            item_id, PACF_STATUS_UNAUTHENTICATED, str(exc), None
+        )
+    except (InvalidPruneBatchAggregateError, TypeError, ValueError) as exc:
+        # A TypeError here can only come from a wrong JSON field type
+        # *inside* the root bytes or a wrong root policy field type; the
+        # public argument types were all validated before the batch ran.
+        return _pacf_item_report(
+            item_id, PACF_STATUS_INVALID_ROOT, str(exc), None
+        )
+
+    root_digest = hashlib.sha256(root).hexdigest()
+    head = {
+        PAC_HEAD_DIGEST: root_digest,
+        PAC_HEIGHT: 0,
+        PAC_POLICY_VERSION: None,
+        STATUS: root_payload[STATUS],
+        PAC_COMMON_DIGEST: None,
+    }
+    declaration = root_payload[PBA_DECLARATION]
+    if declaration is not None:
+        head[PAC_COMMON_DIGEST] = hashlib.sha256(
+            _prune_compact(declaration)
+        ).hexdigest()
+    try:
+        view = _pac_root_view(root)
+        previous_packet = root
+        previous_policy = root_policy
+        for index, successor in enumerate(successors):
+            new_policy = _validated_pac_site_policy(policies[index + 1])
+            hop = _verify_pac_hop(
+                successor, view, hashlib.sha256(previous_packet).hexdigest(),
+                previous_policy, new_policy,
+                validated_prune_policy, validated_keyring, verify_moment,
+            )
+            view = hop["view"]
+            previous_packet = successor
+            previous_policy = new_policy
+            head[PAC_HEAD_DIGEST] = hashlib.sha256(successor).hexdigest()
+            head[PAC_HEIGHT] = view[PAC_HEIGHT]
+            head[PAC_POLICY_VERSION] = view[DS_POLICY_VERSION]
+            head[STATUS] = view[STATUS]
+            head[PAC_COMMON_DIGEST] = None
+            if view[PBA_DECLARATION] is not None:
+                head[PAC_COMMON_DIGEST] = hashlib.sha256(
+                    _prune_compact(view[PBA_DECLARATION])
+                ).hexdigest()
+        if not successors:
+            head[PAC_POLICY_VERSION] = root_policy[DS_POLICY_VERSION]
+    except AuthenticationError as exc:
+        return _pacf_item_report(
+            item_id, PACF_STATUS_UNAUTHENTICATED, str(exc), None
+        )
+    except (InvalidAggregateChainError, TypeError, ValueError) as exc:
+        return _pacf_item_report(
+            item_id, PACF_STATUS_INVALID_CHAIN, str(exc), None
+        )
+    return _pacf_item_report(
+        item_id, PACF_STATUS_VERIFIED, None,
+        _pacf_chain_result(root_digest, head),
+    )
+
+
+def _pacf_fork_edges(
+    validated_items: list[dict], results: list[dict | None]
+) -> dict[tuple[str, str], set[str]]:
+    """Map each forking ``(rootDigest, predecessorDigest)`` edge.
+
+    Only chains that verified successfully participate, grouped by the
+    root aggregate digest; successor trajectories under different roots
+    are never compared.  Chains are walked with the actual packet
+    bytes: the edge leaving one node carries the next packet's SHA-256
+    and starts at the root digest itself.  A given predecessor digest
+    pointing at two or more distinct successor digests within one root
+    group is a fork; a mere prefix extension -- the same chain growing
+    longer -- adds no successor and is not a fork.
+    """
+    groups: dict[str, dict[str, set[str]]] = {}
+    for item, result in zip(validated_items, results):
+        if result is None:
+            continue
+        root_digest = result[PAC_ROOT_DIGEST]
+        edges = groups.setdefault(root_digest, {})
+        node = root_digest
+        for successor in item[PACF_SUCCESSORS]:
+            successor_digest = hashlib.sha256(successor).hexdigest()
+            edges.setdefault(node, set()).add(successor_digest)
+            node = successor_digest
+    fork_edges: dict[tuple[str, str], set[str]] = {}
+    for root_digest, root_edges in groups.items():
+        for predecessor, successors in root_edges.items():
+            if len(successors) > 1:
+                fork_edges[(root_digest, predecessor)] = successors
+    return fork_edges
+
+
+def verify_prune_aggregate_chains(
+    chains: list, prune_policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify a batch of prune aggregate chains and spot chain forks.
+
+    ``chains`` is a non-empty list; each item is a dict with exactly
+    the keys ``id`` (a non-empty str, unique across the batch),
+    ``root`` (the chain's root aggregate bytes), ``successors`` (the
+    ordered successor packet bytes, empty for a height-zero chain) and
+    ``policies`` (one versioned site policy per chain stage, so exactly
+    ``len(successors) + 1`` entries).  ``prune_policy``, ``keyring``
+    and ``moment`` keep their :func:`verify_prune_aggregate_chain`
+    meaning and are shared by the whole batch.  No file is read or
+    written and no argument is modified.
+
+    The whole batch structure and the shared materials are validated
+    before any chain is verified: container, element or field type
+    faults raise :class:`TypeError` (a :class:`bool` never poses as an
+    int) and an empty list, an empty or duplicate id, a wrong item key
+    set, a policy count that does not match the stage count or an
+    illegal moment raises :class:`ValueError` (the shared prune policy
+    and keyring keep their single-chain classification).  Only these
+    batch-level faults raise.
+
+    Each chain is then verified independently, in strict input order,
+    through the exact :func:`verify_prune_aggregate_chain` rules: one
+    chain's failure never stops a later chain or alters an earlier
+    report.  A root aggregate fault is ``invalid-root``, a successor
+    encoding, key-set, version, value or chain-binding fault is
+    ``invalid-chain`` and an unknown, revoked, not-yet-valid or expired
+    credential or a signature mismatch is ``unauthenticated``; a failed
+    chain keeps a definite, non-empty copy of the exception text and a
+    null ``result``.
+
+    Successful chains are grouped by ``rootDigest`` -- successor
+    trajectories under different roots are never compared -- and the
+    same predecessor digest pointing at two or more distinct successor
+    digests is a fork (a plain prefix extension is not).  Every chain
+    passing through a forking edge is reclassified ``conflicted``: its
+    verified result is kept and its ``error`` is fixed to
+    ``"forked-aggregate-chain"``.
+
+    The top-level result is a fresh dict with the fixed key order
+    ``forks``, ``items`` and ``version`` (the integer 1).  ``forks`` is
+    sorted stably by ``rootDigest`` then ``predecessorDigest``; each
+    fork carries exactly ``rootDigest``, ``predecessorDigest``,
+    ``successors`` (the ascending successor digests) and ``ids`` (the
+    ascending ids of the chains passing through the edge).  Each item
+    report strictly preserves input order and carries, in this key
+    order, ``error``, ``id``, ``result`` (a fresh chain summary with
+    the fixed keys ``rootDigest``, ``headDigest``, ``height``,
+    ``policyVersion``, ``status`` and ``commonDigest`` when the chain
+    verified, otherwise null) and ``status``.
+    """
+    validated_items = _validated_pacf_items(chains)
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+
+    reports: list[dict] = []
+    results: list[dict | None] = []
+    for item in validated_items:
+        report = _verify_pacf_one(
+            item, validated_prune_policy, validated_keyring, verify_moment
+        )
+        reports.append(report)
+        results.append(report[VERDICT_ITEM_RESULT])
+
+    fork_edges = _pacf_fork_edges(validated_items, results)
+    edge_ids: dict[tuple[str, str], set[str]] = {
+        edge: set() for edge in fork_edges
+    }
+    if fork_edges:
+        # Record the chains crossing each forking edge and reclassify
+        # those chains in one walk over the actual packet bytes.
+        for item, report, result in zip(validated_items, reports, results):
+            if result is None:
+                continue
+            root_digest = result[PAC_ROOT_DIGEST]
+            node = root_digest
+            crosses_fork = False
+            for successor in item[PACF_SUCCESSORS]:
+                edge = (root_digest, node)
+                if edge in fork_edges:
+                    edge_ids[edge].add(item[ID])
+                    crosses_fork = True
+                node = hashlib.sha256(successor).hexdigest()
+            if crosses_fork:
+                report[STATUS] = PACF_STATUS_CONFLICTED
+                report[CHECKPOINT_ITEM_ERROR] = PACF_FORKED_CHAIN
+
+    forks = [
+        {
+            PAC_ROOT_DIGEST: root_digest,
+            PAC_PREDECESSOR_DIGEST: predecessor,
+            PACF_SUCCESSORS: sorted(fork_edges[(root_digest, predecessor)]),
+            PACF_IDS: sorted(edge_ids[(root_digest, predecessor)]),
+        }
+        for root_digest, predecessor in sorted(fork_edges)
+    ]
+    return {
+        CHAINS_FORKS: forks,
+        ITEMS: reports,
+        VERSION: PRUNE_AGGREGATE_CHAINS_VERSION,
+    }
+
+
+# -- Signed fork evidence for prune aggregate chains ---------------------------
+
+def _pacf_policy_material(policy: object) -> dict:
+    """Normalize one policy history entry for its bound byte digest.
+
+    Valid versioned site policies canonicalize exactly as the chain
+    binds them (ascending sites, ascending version arrays); any other
+    JSON value is normalized with sets becoming ascending lists so the
+    material digest is always derivable without re-running the chain.
+    """
+    if isinstance(policy, dict):
+        return {
+            key: _pacf_policy_material(policy[key])
+            for key in sorted(policy)
+        }
+    if isinstance(policy, (set, frozenset)):
+        return sorted(policy)
+    if isinstance(policy, list):
+        return [_pacf_policy_material(value) for value in policy]
+    return policy
+
+
+def _pacf_chain_materials(validated_items: list[dict]) -> list[dict]:
+    """Summarize each input chain's material in strict input order.
+
+    Every entry -- one per batch item, with no reordering and none
+    omitted, including chains that failed verification -- carries
+    exactly ``id``, ``root`` (the lowercase hex SHA-256 of the root
+    aggregate bytes), ``successors`` (the lowercase hex SHA-256 of
+    each successor packet's complete bytes, in chain order) and
+    ``policies`` (the lowercase hex SHA-256 of each policy history
+    entry's canonical bytes, in history order).
+    """
+    materials: list[dict] = []
+    for item in validated_items:
+        materials.append(
+            {
+                ID: item[ID],
+                PACF_ROOT: hashlib.sha256(item[PACF_ROOT]).hexdigest(),
+                PACF_SUCCESSORS: [
+                    hashlib.sha256(successor).hexdigest()
+                    for successor in item[PACF_SUCCESSORS]
+                ],
+                PACF_POLICIES: [
+                    hashlib.sha256(
+                        _prune_compact(_pacf_policy_material(policy))
+                    ).hexdigest()
+                    for policy in item[PACF_POLICIES]
+                ],
+            }
+        )
+    return materials
+
+
+def sign_prune_aggregate_fork_proof(
+    chains: list,
+    prune_policy: dict,
+    keyring: dict,
+    moment: int,
+    issuer: str,
+    version: int,
+) -> bytes:
+    """Sign the fork summary of a prune aggregate chain batch.
+
+    ``chains`` is the same non-empty list of ``{"id", "root",
+    "successors", "policies"}`` dicts
+    :func:`verify_prune_aggregate_chains` takes; ``prune_policy`` is
+    the same invariant ``{"batch", "sites", "threshold"}`` object,
+    ``keyring`` follows the :func:`apply_signed_remote` rules,
+    ``moment`` is the signing time and ``issuer``/``version`` name the
+    signing credentials.  The batch first runs through the exact
+    :func:`verify_prune_aggregate_chains` rules and the proof is
+    issued only when the resulting summary reports at least one fork.
+    No file is read or written and no argument is modified.
+
+    The proof is one canonical compact UTF-8 JSON object -- every
+    object key recursively sorted, non-ASCII preserved, no trailing
+    newline or any other trailing byte -- carrying exactly ``payload``
+    and ``signature``.  The payload binds exactly ``issuer``,
+    ``keyVersion``, ``moment``, ``prunePolicyDigest`` (the lowercase
+    hex SHA-256 of the canonical compact prune policy encoding), the
+    complete ``report``, the original-order ``chains`` material
+    summary, ``materialsDigest`` (the lowercase hex SHA-256 of the
+    canonical compact ``chains`` encoding) and ``version`` (the
+    integer 1).  ``chains`` summarizes every input chain, strictly in
+    input order with no reordering and none omitted: each entry
+    carries exactly ``id``, ``root`` (the SHA-256 of the root
+    aggregate bytes), ``successors`` (the SHA-256 of each successor
+    packet's complete bytes in chain order) and ``policies`` (the
+    SHA-256 of each policy history entry's canonical bytes in history
+    order).  ``signature`` is the lowercase hex HMAC-SHA256 of the
+    canonical compact payload bytes under the key the keyring binds to
+    the exact issuer and version, with no fallback.
+
+    A parameter or public field type fault raises :class:`TypeError`
+    (a :class:`bool` never poses as an int); an empty issuer, a
+    non-positive version, a negative moment, an illegal shared
+    material or a report without a fork raises :class:`ValueError`;
+    and unknown, revoked, not-yet-valid or expired credentials raise
+    :class:`AuthenticationError`.
+    """
+    validated_items = _validated_pacf_items(chains)
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_keyring = _validated_keyring(keyring)
+    sign_moment = _fe_moment(moment, "moment")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+
+    report = verify_prune_aggregate_chains(
+        validated_items, prune_policy, keyring, moment
+    )
+    if not report[CHAINS_FORKS]:
+        raise ValueError(
+            "a prune aggregate fork proof requires at least one fork in "
+            "the chain report"
+        )
+    materials = _pacf_chain_materials(validated_items)
+    entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, sign_moment
+    )
+    payload = {
+        VD_ISSUER: issuer,
+        KEY_VERSION: version,
+        CP_MOMENT: sign_moment,
+        PBA_PRUNE_POLICY_DIGEST: hashlib.sha256(
+            _verdict_policy_bytes(validated_prune_policy)
+        ).hexdigest(),
+        FORK_PROOF_REPORT: copy.deepcopy(report),
+        FORK_PROOF_CHAINS: materials,
+        PACF_MATERIALS_DIGEST: hashlib.sha256(
+            _prune_compact(materials)
+        ).hexdigest(),
+        VERSION: PRUNE_AGGREGATE_FORK_PROOF_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+def _validated_pacf_materials(chains: object) -> list[dict]:
+    """Validate the bound chain material summary into fresh ordered dicts.
+
+    Each entry must carry exactly ``id`` (a non-empty str), ``root``
+    (64 lowercase hex characters), ``successors`` (a list of 64-char
+    lowercase hex digests, empty for a height-zero chain) and
+    ``policies`` (a non-empty list of 64-char lowercase hex digests
+    with exactly one more entry than the successors).  A field of the
+    wrong type raises :class:`TypeError`; every key-set, value-format
+    or ordering fault raises
+    :class:`InvalidAggregateForkProofError`.
+    """
+    if not isinstance(chains, list):
+        raise TypeError("payload chains must be a list")
+    if not chains:
+        raise _pac_fork_proof_invalid("payload chains must be non-empty")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, chain in enumerate(chains):
+        where = f"chain {position}"
+        if not isinstance(chain, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(chain.keys()) != _PACF_MATERIAL_KEYS:
+            raise _pac_fork_proof_invalid(
+                f"{where} must contain exactly the keys 'id', 'policies', "
+                "'root' and 'successors'"
+            )
+        chain_id = chain[ID]
+        if not isinstance(chain_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if chain_id == "":
+            raise _pac_fork_proof_invalid(f"{where} id must be a non-empty str")
+        if chain_id in seen_ids:
+            raise _pac_fork_proof_invalid(f"{where} repeats an id")
+        seen_ids.add(chain_id)
+        root = chain[PACF_ROOT]
+        if not isinstance(root, str):
+            raise TypeError(f"{where} root must be a str")
+        if not _prune_is_digest(root):
+            raise _pac_fork_proof_invalid(
+                f"{where} root must be 64 lowercase hex characters"
+            )
+        successors = chain[PACF_SUCCESSORS]
+        if not isinstance(successors, list):
+            raise TypeError(f"{where} successors must be a list")
+        for hop_index, successor in enumerate(successors):
+            if not isinstance(successor, str):
+                raise TypeError(f"{where} successor {hop_index} must be a str")
+            if not _prune_is_digest(successor):
+                raise _pac_fork_proof_invalid(
+                    f"{where} successor {hop_index} must be 64 lowercase hex "
+                    "characters"
+                )
+        policies = chain[PACF_POLICIES]
+        if not isinstance(policies, list):
+            raise TypeError(f"{where} policies must be a list")
+        if not policies:
+            raise _pac_fork_proof_invalid(
+                f"{where} policies must be a non-empty list"
+            )
+        for policy_index, policy in enumerate(policies):
+            if not isinstance(policy, str):
+                raise TypeError(f"{where} policy {policy_index} must be a str")
+            if not _prune_is_digest(policy):
+                raise _pac_fork_proof_invalid(
+                    f"{where} policy {policy_index} must be 64 lowercase hex "
+                    "characters"
+                )
+        if len(policies) != len(successors) + 1:
+            raise _pac_fork_proof_invalid(
+                f"{where} policies must provide one entry per chain stage "
+                "(one more than the number of successors)"
+            )
+        validated.append(
+            {
+                ID: chain_id,
+                PACF_ROOT: root,
+                PACF_SUCCESSORS: list(successors),
+                PACF_POLICIES: list(policies),
+            }
+        )
+    return validated
+
+
+def _validated_pacf_result(result: object, material: dict, where: str) -> None:
+    """Validate one bound chain summary against its chain material.
+
+    The summary must follow the exact
+    :func:`verify_prune_aggregate_chains` result shape and stay
+    consistent with the bound material: the root digest must equal the
+    material's root, the height must equal the successor count and the
+    head digest must equal the last successor digest (the root digest
+    for a height-zero chain).  A field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    key-set, value-format or binding fault raises
+    :class:`InvalidAggregateForkProofError`.
+    """
+    if not isinstance(result, dict):
+        raise TypeError(f"{where} result must be an object")
+    if set(result.keys()) != _PACF_RESULT_KEYS:
+        raise _pac_fork_proof_invalid(
+            f"{where} result must contain exactly the keys 'commonDigest', "
+            "'headDigest', 'height', 'policyVersion', 'rootDigest' and "
+            "'status'"
+        )
+    root_digest = result[PAC_ROOT_DIGEST]
+    if not isinstance(root_digest, str):
+        raise TypeError(f"{where} result rootDigest must be a str")
+    if not _prune_is_digest(root_digest):
+        raise _pac_fork_proof_invalid(
+            f"{where} result rootDigest must be 64 lowercase hex characters"
+        )
+    head_digest = result[PAC_HEAD_DIGEST]
+    if not isinstance(head_digest, str):
+        raise TypeError(f"{where} result headDigest must be a str")
+    if not _prune_is_digest(head_digest):
+        raise _pac_fork_proof_invalid(
+            f"{where} result headDigest must be 64 lowercase hex characters"
+        )
+    height = result[PAC_HEIGHT]
+    if isinstance(height, bool) or not isinstance(height, int):
+        raise TypeError(f"{where} result height must be an int")
+    if height < 0:
+        raise _pac_fork_proof_invalid(
+            f"{where} result height must be non-negative"
+        )
+    policy_version = result[PAC_POLICY_VERSION]
+    if isinstance(policy_version, bool) or not isinstance(
+        policy_version, int
+    ):
+        raise TypeError(f"{where} result policyVersion must be an int")
+    if policy_version <= 0:
+        raise _pac_fork_proof_invalid(
+            f"{where} result policyVersion must be positive"
+        )
+    status = result[STATUS]
+    if not isinstance(status, str):
+        raise TypeError(f"{where} result status must be a str")
+    if status not in _PA_STATUSES:
+        raise _pac_fork_proof_invalid(
+            f"{where} result status is not a known status"
+        )
+    common_digest = result[PAC_COMMON_DIGEST]
+    if common_digest is not None:
+        if not isinstance(common_digest, str):
+            raise TypeError(f"{where} result commonDigest must be a str")
+        if not _prune_is_digest(common_digest):
+            raise _pac_fork_proof_invalid(
+                f"{where} result commonDigest must be 64 lowercase hex "
+                "characters"
+            )
+    if status == PA_STATUS_ACCEPTED and common_digest is None:
+        raise _pac_fork_proof_invalid(
+            f"{where} an accepted result must bind a commonDigest"
+        )
+    if status == PA_STATUS_CONFLICTED and common_digest is not None:
+        raise _pac_fork_proof_invalid(
+            f"{where} a conflicted result must bind a null commonDigest"
+        )
+    if root_digest != material[PACF_ROOT]:
+        raise _pac_fork_proof_invalid(
+            f"{where} result rootDigest does not match the chain material"
+        )
+    if height != len(material[PACF_SUCCESSORS]):
+        raise _pac_fork_proof_invalid(
+            f"{where} result height does not match the chain material"
+        )
+    expected_head = (
+        material[PACF_SUCCESSORS][-1]
+        if material[PACF_SUCCESSORS]
+        else material[PACF_ROOT]
+    )
+    if head_digest != expected_head:
+        raise _pac_fork_proof_invalid(
+            f"{where} result headDigest does not match the chain material"
+        )
+
+
+def _validated_pacf_report(report: object, chains: list[dict]) -> dict:
+    """Validate the complete chain-batch report bound into a fork proof.
+
+    The report must follow the exact
+    :func:`verify_prune_aggregate_chains` shape -- ``forks``, ``items``
+    and ``version`` (the integer 1) -- with at least one fork.  Every
+    binding to the chain material summary is checked: the item count
+    and per-position ids, the per-result root/height/head consistency
+    with the bound material, and each fork's exact crossing chains and
+    successor digests recomputed from the bound materials.  A field of
+    the wrong type raises :class:`TypeError` (a :class:`bool` never
+    poses as an int); every key-set, value, ordering, reference or
+    binding fault raises :class:`InvalidAggregateForkProofError`.
+    """
+    if not isinstance(report, dict):
+        raise TypeError("payload report must be an object")
+    if set(report.keys()) != _PACF_REPORT_KEYS:
+        raise _pac_fork_proof_invalid(
+            "bound report must contain exactly the keys 'forks', 'items' "
+            "and 'version'"
+        )
+    version = report[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("bound report version must be an int")
+    if version != PRUNE_AGGREGATE_CHAINS_VERSION:
+        raise _pac_fork_proof_invalid(
+            "bound report version must be the integer 1"
+        )
+
+    items = report[ITEMS]
+    if not isinstance(items, list):
+        raise TypeError("bound report items must be a list")
+    if not items:
+        raise _pac_fork_proof_invalid("bound report items must be non-empty")
+    if len(items) != len(chains):
+        raise _pac_fork_proof_invalid(
+            "bound report item count does not match the chain materials"
+        )
+
+    for position, item_report in enumerate(items):
+        where = f"bound report item {position}"
+        if not isinstance(item_report, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(item_report.keys()) != _PACF_ITEM_REPORT_KEYS:
+            raise _pac_fork_proof_invalid(
+                f"{where} must contain exactly the keys 'error', 'id', "
+                "'result' and 'status'"
+            )
+        item_id = item_report[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise _pac_fork_proof_invalid(f"{where} id must be a non-empty str")
+        if item_id != chains[position][ID]:
+            raise _pac_fork_proof_invalid(
+                f"{where} id does not match the chain material at its "
+                "position"
+            )
+        status = item_report[STATUS]
+        if not isinstance(status, str):
+            raise TypeError(f"{where} status must be a str")
+        if status not in _PACF_STATUSES:
+            raise _pac_fork_proof_invalid(
+                f"{where} status is not a known status"
+            )
+        error = item_report[CHECKPOINT_ITEM_ERROR]
+        result = item_report[VERDICT_ITEM_RESULT]
+        if status == PACF_STATUS_VERIFIED:
+            if error is not None:
+                raise _pac_fork_proof_invalid(
+                    f"{where} error must be null when verified"
+                )
+            _validated_pacf_result(result, chains[position], where)
+        elif status == PACF_STATUS_CONFLICTED:
+            if not isinstance(error, str):
+                raise TypeError(
+                    f"{where} error must be a str when conflicted"
+                )
+            if error != PACF_FORKED_CHAIN:
+                raise _pac_fork_proof_invalid(
+                    f"{where} error must be 'forked-aggregate-chain' when "
+                    "conflicted"
+                )
+            _validated_pacf_result(result, chains[position], where)
+        else:
+            if not isinstance(error, str):
+                raise TypeError(f"{where} error must be a str for a failure")
+            if error == "":
+                raise _pac_fork_proof_invalid(
+                    f"{where} error must be a non-empty str for a failure"
+                )
+            if result is not None:
+                raise _pac_fork_proof_invalid(
+                    f"{where} result must be null for a failure"
+                )
+
+    forks = report[CHAINS_FORKS]
+    if not isinstance(forks, list):
+        raise TypeError("bound report forks must be a list")
+    if not forks:
+        raise ValueError("a fork proof must report at least one fork")
+
+    # Recompute every edge from the bound materials, then demand the
+    # bound fork entries match exactly -- the same grouping and fork
+    # rule verify_prune_aggregate_chains uses.
+    groups: dict[str, dict[str, set[str]]] = {}
+    for chain, item_report in zip(chains, items):
+        if not isinstance(item_report[VERDICT_ITEM_RESULT], dict):
+            continue
+        root_digest = chain[PACF_ROOT]
+        edges = groups.setdefault(root_digest, {})
+        node = root_digest
+        for successor_digest in chain[PACF_SUCCESSORS]:
+            edges.setdefault(node, set()).add(successor_digest)
+            node = successor_digest
+    expected_edges: dict[tuple[str, str], set[str]] = {}
+    for root_digest, root_edges in groups.items():
+        for predecessor, successors in root_edges.items():
+            if len(successors) > 1:
+                expected_edges[(root_digest, predecessor)] = successors
+    crossing: dict[tuple[str, str], set[str]] = {
+        edge: set() for edge in expected_edges
+    }
+    for chain, item_report in zip(chains, items):
+        if not isinstance(item_report[VERDICT_ITEM_RESULT], dict):
+            continue
+        root_digest = chain[PACF_ROOT]
+        node = root_digest
+        for successor_digest in chain[PACF_SUCCESSORS]:
+            edge = (root_digest, node)
+            if edge in expected_edges:
+                crossing[edge].add(chain[ID])
+            node = successor_digest
+
+    seen_edges: set[tuple[str, str]] = set()
+    previous_edge: tuple[str, str] | None = None
+    for position, fork in enumerate(forks):
+        where = f"bound report fork {position}"
+        if not isinstance(fork, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(fork.keys()) != _PACF_FORK_KEYS:
+            raise _pac_fork_proof_invalid(
+                f"{where} must contain exactly the keys 'ids', "
+                "'predecessorDigest', 'rootDigest' and 'successors'"
+            )
+        root_digest = fork[PAC_ROOT_DIGEST]
+        predecessor = fork[PAC_PREDECESSOR_DIGEST]
+        if not isinstance(root_digest, str):
+            raise TypeError(f"{where} rootDigest must be a str")
+        if not isinstance(predecessor, str):
+            raise TypeError(f"{where} predecessorDigest must be a str")
+        if not _prune_is_digest(root_digest):
+            raise _pac_fork_proof_invalid(
+                f"{where} rootDigest must be 64 lowercase hex characters"
+            )
+        if not _prune_is_digest(predecessor):
+            raise _pac_fork_proof_invalid(
+                f"{where} predecessorDigest must be 64 lowercase hex "
+                "characters"
+            )
+        edge = (root_digest, predecessor)
+        if edge in seen_edges:
+            raise _pac_fork_proof_invalid(f"{where} repeats a fork edge")
+        seen_edges.add(edge)
+        if previous_edge is not None and edge < previous_edge:
+            raise _pac_fork_proof_invalid(
+                f"{where} forks must be sorted by rootDigest then "
+                "predecessorDigest"
+            )
+        previous_edge = edge
+        if edge not in expected_edges:
+            raise _pac_fork_invalid_edge(where)
+        successors = fork[PACF_SUCCESSORS]
+        if not isinstance(successors, list):
+            raise TypeError(f"{where} successors must be a list")
+        if any(not isinstance(successor, str) for successor in successors):
+            raise TypeError(f"{where} successors must be strs")
+        if any(not _prune_is_digest(successor) for successor in successors):
+            raise _pac_fork_proof_invalid(
+                f"{where} successors must be 64 lowercase hex characters"
+            )
+        if successors != sorted(successors) or len(set(successors)) != len(
+            successors
+        ):
+            raise _pac_fork_proof_invalid(
+                f"{where} successors must be unique and sorted ascending"
+            )
+        if set(successors) != expected_edges[edge]:
+            raise _pac_fork_proof_invalid(
+                f"{where} successors do not match the forking edge"
+            )
+        ids = fork[PACF_IDS]
+        if not isinstance(ids, list):
+            raise TypeError(f"{where} ids must be a list")
+        if any(not isinstance(fork_id, str) for fork_id in ids):
+            raise TypeError(f"{where} ids must be strs")
+        if any(fork_id == "" for fork_id in ids):
+            raise _pac_fork_proof_invalid(f"{where} ids must be non-empty")
+        if ids != sorted(ids) or len(set(ids)) != len(ids):
+            raise _pac_fork_proof_invalid(
+                f"{where} ids must be unique and sorted ascending"
+            )
+        if set(ids) != crossing[edge]:
+            raise _pac_fork_proof_invalid(
+                f"{where} ids do not match the chains crossing the edge"
+            )
+
+    if seen_edges != set(expected_edges):
+        raise _pac_fork_proof_invalid(
+            "the bound forks do not match the forking edges in the materials"
+        )
+    conflicted = {
+        item_report[ID]
+        for item_report in items
+        if item_report[STATUS] == PACF_STATUS_CONFLICTED
+    }
+    all_fork_ids: set[str] = set()
+    for edge_crossing in crossing.values():
+        all_fork_ids |= edge_crossing
+    if conflicted != all_fork_ids:
+        raise _pac_fork_proof_invalid(
+            "the fork id sets must equal the conflicted report items"
+        )
+    return report
+
+
+def _parse_pac_fork_proof(raw: object) -> tuple[dict, str, list[dict]]:
+    """Validate fork proof bytes into ``(payload, signature, chains)``.
+
+    A non-bytes argument or a public field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, digest, ordering, reference or
+    report-binding fault raises
+    :class:`InvalidAggregateForkProofError`.  The policy, moment,
+    credential and signature bindings are checked by
+    :func:`verify_prune_aggregate_fork_proof`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("proof must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _pac_fork_proof_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _pac_fork_proof_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_pacf_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _pac_fork_proof_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("proof must be a JSON object")
+    if set(data.keys()) != _PACF_TOP_KEYS:
+        raise _pac_fork_proof_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("proof signature must be a str")
+    if _PRUNE_HEX64.fullmatch(signature) is None:
+        raise _pac_fork_proof_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("proof payload must be an object")
+    if set(payload.keys()) != _PACF_PAYLOAD_KEYS:
+        raise _pac_fork_proof_invalid(
+            "payload must contain exactly the keys 'chains', 'issuer', "
+            "'keyVersion', 'materialsDigest', 'moment', "
+            "'prunePolicyDigest', 'report' and 'version'"
+        )
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("payload issuer must be a str")
+    if issuer == "":
+        raise ValueError("payload issuer must be a non-empty str")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("payload keyVersion must be an int")
+    if key_version <= 0:
+        raise ValueError("payload keyVersion must be positive")
+    proof_moment = payload[CP_MOMENT]
+    if isinstance(proof_moment, bool) or not isinstance(proof_moment, int):
+        raise TypeError("payload moment must be an int")
+    if proof_moment < 0:
+        raise _pac_fork_proof_invalid("payload moment must be non-negative")
+    policy_digest = payload[PBA_PRUNE_POLICY_DIGEST]
+    if not isinstance(policy_digest, str):
+        raise TypeError("payload prunePolicyDigest must be a str")
+    if not _prune_is_digest(policy_digest):
+        raise _pac_fork_proof_invalid(
+            "payload prunePolicyDigest must be 64 lowercase hex characters"
+        )
+    materials_digest = payload[PACF_MATERIALS_DIGEST]
+    if not isinstance(materials_digest, str):
+        raise TypeError("payload materialsDigest must be a str")
+    if not _prune_is_digest(materials_digest):
+        raise _pac_fork_proof_invalid(
+            "payload materialsDigest must be 64 lowercase hex characters"
+        )
+    proof_version = payload[VERSION]
+    if isinstance(proof_version, bool) or not isinstance(proof_version, int):
+        raise TypeError("payload version must be an int")
+    if proof_version != PRUNE_AGGREGATE_FORK_PROOF_VERSION:
+        raise _pac_fork_proof_invalid("payload version must be the integer 1")
+    if not isinstance(payload[FORK_PROOF_REPORT], dict):
+        raise TypeError("payload report must be an object")
+    chains = _validated_pacf_materials(payload[FORK_PROOF_CHAINS])
+    if hashlib.sha256(_prune_compact(chains)).hexdigest() != materials_digest:
+        raise _pac_fork_proof_invalid(
+            "materialsDigest does not match the bound chain materials"
+        )
+    _validated_pacf_report(payload[FORK_PROOF_REPORT], chains)
+
+    if _prune_compact(data) != raw:
+        raise _pac_fork_proof_invalid(
+            "encoding is not the canonical compact form"
+        )
+    return payload, signature, chains
+
+
+def verify_prune_aggregate_fork_proof(
+    proof: bytes, prune_policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Re-verify a signed prune aggregate fork proof entirely offline.
+
+    Only the proof bytes, the expected invariant ``prune_policy``, the
+    current ``keyring`` and the verification ``moment`` are consulted
+    -- no file is read or written and no argument is modified.
+    Verification validates the proof encoding, key sets, version,
+    digests, ordering, chain/report references and the complete bound
+    chain-batch report, recomputes the materials digest, the forking
+    edges, the crossing id sets and every ordering purely from the
+    bound chain materials, recomputes the prune policy digest over the
+    canonical compact policy encoding, requires the signing moment not
+    to be later than the verification moment, and verifies the
+    HMAC-SHA256 signature against the key the *current* keyring binds
+    to the payload's exact issuer and version, usable at the
+    verification moment, so a later revocation or expiry rejects the
+    proof with no fallback.
+
+    On success a fresh independent mapping is returned with the fixed
+    keys ``chains``, ``issuer``, ``keyVersion``, ``materialsDigest``,
+    ``moment``, ``prunePolicyDigest``, ``proofDigest`` (the lowercase
+    hex SHA-256 of the proof bytes), ``report`` and ``version`` (the
+    integer 1).  A non-bytes proof or a public field of the wrong type
+    raises :class:`TypeError` (a :class:`bool` never poses as an int);
+    an illegal policy, keyring or moment, an empty issuer, a
+    non-positive key version or a report without a fork raises
+    :class:`ValueError`; an illegal encoding, key set, version, digest,
+    ordering, reference or report binding raises
+    :class:`InvalidAggregateForkProofError` (a :class:`ValueError`
+    subclass); and unknown, revoked, not-yet-valid or expired
+    credentials or a signature mismatch raise
+    :class:`AuthenticationError`.
+    """
+    if not isinstance(proof, bytes):
+        raise TypeError("proof must be bytes")
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    payload, signature, chains = _parse_pac_fork_proof(proof)
+    recomputed_policy = hashlib.sha256(
+        _verdict_policy_bytes(validated_prune_policy)
+    ).hexdigest()
+    if payload[PBA_PRUNE_POLICY_DIGEST] != recomputed_policy:
+        raise _pac_fork_proof_invalid(
+            "prunePolicyDigest does not match the prune policy"
+        )
+    if payload[CP_MOMENT] > verify_moment:
+        raise _pac_fork_proof_invalid(
+            "moment must not be later than the verification moment"
+        )
+
+    key_entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION],
+        verify_moment,
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(key_entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "prune aggregate fork proof signature does not match"
+        )
+
+    return {
+        FORK_PROOF_CHAINS: copy.deepcopy(chains),
+        VD_ISSUER: payload[VD_ISSUER],
+        KEY_VERSION: payload[KEY_VERSION],
+        PACF_MATERIALS_DIGEST: payload[PACF_MATERIALS_DIGEST],
+        CP_MOMENT: payload[CP_MOMENT],
+        PBA_PRUNE_POLICY_DIGEST: recomputed_policy,
+        FORK_PROOF_DIGEST: hashlib.sha256(proof).hexdigest(),
+        FORK_PROOF_REPORT: copy.deepcopy(payload[FORK_PROOF_REPORT]),
+        VERSION: PRUNE_AGGREGATE_FORK_PROOF_VERSION,
+    }
