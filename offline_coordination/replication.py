@@ -20882,6 +20882,7 @@ def _prune_batch_aggregate_row(
 
 def _aggregate_prune_batch_one(
     item: dict,
+    packet_digest: str,
     prune_policy_digest: str,
     prune_threshold: int,
     site_policy: dict,
@@ -20890,20 +20891,13 @@ def _aggregate_prune_batch_one(
 ) -> dict:
     """Authenticate and authorize one prune adjudication batch in isolation.
 
-    Returns a fresh row carrying the fixed reason ``invalid``,
-    ``unauthenticated`` or ``unauthorized`` for a rejecting packet and
-    no trusted declaration, or a ``valid`` row whose declaration is the
-    packet's complete original-order item list (each entry's id, input
-    digest and full per-item verdict report), never just its final
-    status.  One packet's failure never affects the other packets.  An
-    ``invalid`` row (bad structure, a future moment, another prune
-    policy or a broken embedded binding) carries no identity; the
-    credential and authorization rejects keep the packet's parsed
-    issuer/key version, matching the adjudication taxonomy.
+    ``packet_digest`` is the lowercase hex SHA-256 of the item's packet
+    bytes, supplied by the caller so a verdict can be recomputed from
+    stored packet material without hashing it twice.  See
+    :func:`aggregate_prune_batches` for the full row contract.
     """
     item_id = item[ID]
     raw = item[PBA_PACKET]
-    packet_digest = hashlib.sha256(raw).hexdigest()
 
     def invalid_row() -> dict:
         return _prune_batch_aggregate_row(
@@ -21166,7 +21160,8 @@ def aggregate_prune_batches(
     ).hexdigest()
     rows = [
         _aggregate_prune_batch_one(
-            item, prune_policy_digest,
+            item, hashlib.sha256(item[PBA_PACKET]).hexdigest(),
+            prune_policy_digest,
             validated_prune_policy[ADJ_THRESHOLD],
             validated_site_policy, validated_keyring, aggregate_moment,
         )
@@ -21538,50 +21533,14 @@ def _reconcile_prune_batch_aggregate(payload: dict, threshold: int) -> None:
             )
 
 
-def verify_prune_batch_aggregate(
-    aggregate, prune_policy, site_policy, keyring, moment
-):
-    """Verify a signed cross-site prune batch aggregate entirely offline.
-
-    Only the aggregate bytes, the expected original ``prune_policy``,
-    the expected ``site_policy``, the current ``keyring`` and the
-    verification ``moment`` are consulted -- no file is read or written
-    and no argument is modified.  Verification validates the canonical
-    encoding and every key set, recomputes both policy digests, and
-    re-tallies the bound per-packet rows purely from the signed payload:
-    the original-order input digest bindings, the issuer/id row
-    ordering, same-site duplicate and contradiction markings,
-    cross-site declaration agreement (the complete original-order
-    declarations, not just their final statuses), the threshold outcome
-    and the claimed common declaration, together with a full structural
-    re-tally of every verified adjudication embedded in each bound
-    declaration against the original prune policy.  It then checks the
-    HMAC-SHA256 against the key the *current* keyring binds to the
-    payload's exact issuer and version, usable at the verification
-    moment, so a later revocation or expiry rejects the aggregate with
-    no fallback.
-
-    On success a fresh dict equal to the authenticated payload
-    (``inputs``, ``issuer``, ``items``, ``keyVersion``,
-    ``prunePolicyDigest``, ``sitePolicyDigest``, ``declaration``,
-    ``status`` and ``version``) is returned -- repeated calls return
-    equal but mutually independent objects sharing no mutable
-    structure.  A non-bytes aggregate or a public field of the wrong
-    type raises :class:`TypeError` (a :class:`bool` never poses as an
-    int); an illegal policy, keyring or moment raises
-    :class:`ValueError`; an illegal encoding, key set, digest, ordering,
-    tally or declaration binding raises
-    :class:`InvalidPruneBatchAggregateError` (a :class:`ValueError`
-    subclass); unknown, revoked, not-yet-valid or expired credentials
-    or a signature mismatch raise :class:`AuthenticationError`.
-    """
-    if not isinstance(aggregate, bytes):
-        raise TypeError("aggregate packet must be bytes")
-    validated_prune_policy = _validated_adjudication_policy(prune_policy)
-    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
-    validated_keyring = _validated_keyring(keyring)
-    verify_moment = _fe_moment(moment, "moment")
-
+def _verify_prune_batch_aggregate_core(
+    aggregate: bytes,
+    validated_prune_policy: dict,
+    validated_site_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    verify_moment: int,
+) -> dict:
+    """Verify one aggregate from already-validated shared materials."""
     payload, signature = _parse_prune_batch_aggregate(aggregate)
     expected_prune_digest = hashlib.sha256(
         _verdict_policy_bytes(validated_prune_policy)
@@ -21643,3 +21602,1566 @@ def verify_prune_batch_aggregate(
             "prune batch aggregate signature does not match"
         )
     return copy.deepcopy(payload)
+
+
+def verify_prune_batch_aggregate(
+    aggregate, prune_policy, site_policy, keyring, moment
+):
+    """Verify a signed cross-site prune batch aggregate entirely offline.
+
+    Only the aggregate bytes, the expected original ``prune_policy``,
+    the expected ``site_policy``, the current ``keyring`` and the
+    verification ``moment`` are consulted -- no file is read or written
+    and no argument is modified.  Verification validates the canonical
+    encoding and every key set, recomputes both policy digests, and
+    re-tallies the bound per-packet rows purely from the signed payload:
+    the original-order input digest bindings, the issuer/id row
+    ordering, same-site duplicate and contradiction markings,
+    cross-site declaration agreement (the complete original-order
+    declarations, not just their final statuses), the threshold outcome
+    and the claimed common declaration, together with a full structural
+    re-tally of every verified adjudication embedded in each bound
+    declaration against the original prune policy.  It then checks the
+    HMAC-SHA256 against the key the *current* keyring binds to the
+    payload's exact issuer and version, usable at the verification
+    moment, so a later revocation or expiry rejects the aggregate with
+    no fallback.
+
+    On success a fresh dict equal to the authenticated payload
+    (``inputs``, ``issuer``, ``items``, ``keyVersion``,
+    ``prunePolicyDigest``, ``sitePolicyDigest``, ``declaration``,
+    ``status`` and ``version``) is returned -- repeated calls return
+    equal but mutually independent objects sharing no mutable
+    structure.  A non-bytes aggregate or a public field of the wrong
+    type raises :class:`TypeError` (a :class:`bool` never poses as an
+    int); an illegal policy, keyring or moment raises
+    :class:`ValueError`; an illegal encoding, key set, digest, ordering,
+    tally or declaration binding raises
+    :class:`InvalidPruneBatchAggregateError` (a :class:`ValueError`
+    subclass); unknown, revoked, not-yet-valid or expired credentials
+    or a signature mismatch raise :class:`AuthenticationError`.
+    """
+    if not isinstance(aggregate, bytes):
+        raise TypeError("aggregate packet must be bytes")
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    return _verify_prune_batch_aggregate_core(
+        aggregate, validated_prune_policy, validated_site_policy,
+        validated_keyring, verify_moment,
+    )
+
+
+# -- Supersession chains over cross-site prune batch aggregates ----------------
+
+PRUNE_AGGREGATE_CHAIN_VERSION = CHAIN_PRUNE_VERSION
+
+PAC_PACKET = PBA_PACKET
+PAC_HANDOVERS = "handovers"
+PAC_ROOT_DIGEST = DS_ROOT_DIGEST
+PAC_PREDECESSOR_DIGEST = DS_PREDECESSOR_DIGEST
+PAC_HEAD_DIGEST = DS_HEAD_DIGEST
+PAC_HEIGHT = DS_HEIGHT
+PAC_OLD_POLICY_DIGEST = DS_OLD_POLICY_DIGEST
+PAC_NEW_POLICY_DIGEST = DS_NEW_POLICY_DIGEST
+PAC_POLICY_VERSION = DS_POLICY_VERSION
+PAC_EFFECTIVE_AT = DS_EFFECTIVE_AT
+PAC_COMMON_DIGEST = CD_COMMON_DIGEST
+PAC_POLICY_DIGEST = CD_POLICY_DIGEST
+PAC_ANCHOR_DIGEST = DS_ANCHOR_DIGEST
+
+_PAC_SITE_POLICY_KEYS = frozenset((ADJ_SITES, ADJ_THRESHOLD, DS_POLICY_VERSION))
+_PAC_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_PAC_SUCCESSOR_PAYLOAD_KEYS = frozenset((
+    PAC_ROOT_DIGEST,
+    PAC_PREDECESSOR_DIGEST,
+    PAC_HEIGHT,
+    PBA_INPUTS,
+    PA_ITEMS,
+    PBA_DECLARATION,
+    STATUS,
+    PBA_PRUNE_POLICY_DIGEST,
+    PAC_OLD_POLICY_DIGEST,
+    PAC_NEW_POLICY_DIGEST,
+    PAC_POLICY_VERSION,
+    PAC_EFFECTIVE_AT,
+    PAC_HANDOVERS,
+    VD_ISSUER,
+    KEY_VERSION,
+    VERSION,
+))
+_PAC_INCREMENT_ITEM_KEYS = frozenset((ID, PAC_PACKET))
+_PAC_ANCHOR_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_PAC_ANCHOR_PAYLOAD_KEYS = frozenset((
+    PAC_ROOT_DIGEST,
+    PAC_HEAD_DIGEST,
+    PAC_HEIGHT,
+    PAC_POLICY_DIGEST,
+    PAC_POLICY_VERSION,
+    CP_MOMENT,
+    VD_ISSUER,
+    KEY_VERSION,
+    VERSION,
+))
+
+
+class InvalidAggregateChainError(ValueError):
+    """A prune aggregate successor packet breaks its chain contract."""
+
+
+class InvalidAggregateAnchorError(ValueError):
+    """A sealed prune aggregate head anchor breaks its binding contract."""
+
+
+def _pac_chain_invalid(message: str) -> InvalidAggregateChainError:
+    return InvalidAggregateChainError(
+        f"invalid prune aggregate chain: {message}"
+    )
+
+
+def _pac_anchor_invalid(message: str) -> InvalidAggregateAnchorError:
+    return InvalidAggregateAnchorError(
+        f"invalid prune aggregate anchor: {message}"
+    )
+
+
+def _reject_duplicate_pac_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate successor keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _pac_chain_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _reject_duplicate_pac_anchor_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate anchor keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _pac_anchor_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _validated_pac_site_policy(policy: object) -> dict:
+    """Validate a versioned prune-aggregate site policy into fresh form.
+
+    The policy keeps the exact sites/threshold contract of
+    :func:`_validated_prune_batch_site_policy` -- a non-empty mapping of
+    each authorized non-empty site to its non-empty set of allowed
+    positive key versions and a positive threshold no greater than the
+    site count -- and additionally carries exactly a positive integer
+    ``policyVersion``.  Type faults raise :class:`TypeError` (a
+    :class:`bool` never poses as an int); key-set or value faults raise
+    :class:`ValueError`.
+    """
+    if not isinstance(policy, dict):
+        raise TypeError("site policy must be a dict")
+    if set(policy.keys()) != _PAC_SITE_POLICY_KEYS:
+        raise ValueError(
+            "site policy must contain exactly the keys 'sites', "
+            "'threshold' and 'policyVersion'"
+        )
+    policy_version = policy[DS_POLICY_VERSION]
+    if isinstance(policy_version, bool) or not isinstance(policy_version, int):
+        raise TypeError("site policy policyVersion must be an int")
+    if policy_version <= 0:
+        raise ValueError("site policy policyVersion must be a positive integer")
+    base = _validated_prune_batch_site_policy({
+        ADJ_SITES: policy[ADJ_SITES],
+        ADJ_THRESHOLD: policy[ADJ_THRESHOLD],
+    })
+    base[DS_POLICY_VERSION] = policy_version
+    return base
+
+
+def _pac_site_policy_bytes(policy: dict) -> bytes:
+    """Canonical compact bytes of the normalized versioned site policy.
+
+    Sites are listed ascending with ascending version arrays and every
+    key is recursively sorted; ``policyVersion`` is bound alongside.
+    """
+    return _prune_compact({
+        ADJ_SITES: {
+            site: sorted(policy[ADJ_SITES][site])
+            for site in sorted(policy[ADJ_SITES])
+        },
+        ADJ_THRESHOLD: policy[ADJ_THRESHOLD],
+        DS_POLICY_VERSION: policy[DS_POLICY_VERSION],
+    })
+
+
+def _pac_policy_digest(policy: dict) -> str:
+    """SHA-256 of the canonical versioned site policy."""
+    return hashlib.sha256(_pac_site_policy_bytes(policy)).hexdigest()
+
+
+def _pac_plain_site_policy(policy: dict) -> dict:
+    """The unversioned ``{sites, threshold}`` form a root aggregate binds."""
+    return {ADJ_SITES: policy[ADJ_SITES], ADJ_THRESHOLD: policy[ADJ_THRESHOLD]}
+
+
+def _pac_policy_matches_root(policy: dict, root_view: dict) -> bool:
+    """Whether a versioned policy's sites/threshold equal the root policy."""
+    unversioned = hashlib.sha256(
+        _prune_batch_site_policy_bytes(_pac_plain_site_policy(policy))
+    ).hexdigest()
+    return hmac.compare_digest(root_view["policy_digest"], unversioned)
+
+
+# -- Stage views over a root aggregate or a successor packet ------------------
+
+def _pac_root_view(raw: bytes) -> dict:
+    """Structurally parse a root prune batch aggregate predecessor."""
+    payload, _signature = _parse_prune_batch_aggregate(raw)
+    return {
+        "kind": "root",
+        PAC_ROOT_DIGEST: hashlib.sha256(raw).hexdigest(),
+        PAC_HEIGHT: 0,
+        STATUS: payload[STATUS],
+        PBA_DECLARATION: payload[PBA_DECLARATION],
+        PBA_INPUTS: list(payload[PBA_INPUTS]),
+        PA_ITEMS: copy.deepcopy(payload[PA_ITEMS]),
+        "policy_digest": payload[PBA_SITE_POLICY_DIGEST],
+        "prune_policy_digest": payload[PBA_PRUNE_POLICY_DIGEST],
+        DS_POLICY_VERSION: PRUNE_BATCH_AGGREGATE_VERSION,
+        PAC_EFFECTIVE_AT: None,
+    }
+
+
+def _pac_successor_view(raw: bytes) -> dict:
+    """Structurally parse a successor predecessor into a fresh view."""
+    payload, _signature, _increment = _parse_pac_successor(raw)
+    return {
+        "kind": "successor",
+        PAC_ROOT_DIGEST: payload[PAC_ROOT_DIGEST],
+        PAC_HEIGHT: payload[PAC_HEIGHT],
+        STATUS: payload[STATUS],
+        PBA_DECLARATION: copy.deepcopy(payload[PBA_DECLARATION]),
+        PBA_INPUTS: list(payload[PBA_INPUTS]),
+        PA_ITEMS: copy.deepcopy(payload[PA_ITEMS]),
+        "policy_digest": payload[PAC_NEW_POLICY_DIGEST],
+        "prune_policy_digest": payload[PBA_PRUNE_POLICY_DIGEST],
+        DS_POLICY_VERSION: payload[PAC_POLICY_VERSION],
+        PAC_EFFECTIVE_AT: payload[PAC_EFFECTIVE_AT],
+    }
+
+
+def _pac_predecessor_view(raw: object) -> dict:
+    """Parse predecessor bytes (root aggregate or successor packet).
+
+    The packet kind is chosen from the payload key set so a malformed
+    root raises :class:`InvalidPruneBatchAggregateError` while a
+    malformed successor raises :class:`InvalidAggregateChainError`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("predecessor must be bytes")
+    keys = _packet_payload_keys(raw)
+    if keys is not None and PAC_ROOT_DIGEST in keys:
+        return _pac_successor_view(raw)
+    return _pac_root_view(raw)
+
+
+# -- Recomputing one aggregate verdict from the stage handovers ---------------
+
+def _pac_sort_rows(rows: list[dict]) -> list[dict]:
+    """The bound row order: identity-less rows first, then site then id."""
+    return sorted(
+        rows,
+        key=lambda row: (
+            row[VD_ISSUER] is not None,
+            row[VD_ISSUER] or "",
+            row[ID],
+        ),
+    )
+
+
+def _tally_prune_chain_rows(
+    rows: list[dict], prefix_count: int, threshold: int
+) -> tuple[str, list | None]:
+    """Re-tally the stage's rows without rewriting the prefix.
+
+    ``rows`` walks the stage in union order -- the predecessor's
+    existing statements first (``prefix_count`` of them, already
+    site/id-sorted), then the new handover statements -- and the
+    existing statements must keep the predecessor's verdict: the
+    historical ``valid`` row of one site/content group always wins, so
+    a newly appended repeat (even one with a smaller id) can only be a
+    ``duplicate``.  A group first formed by this hop follows the root
+    aggregation rule: its smallest-id row is ``valid`` and repeats are
+    ``duplicate``.  A second distinct declaration from one site
+    contradicts every declaration of that site.  Distinct sites must
+    share the one declaration; any disagreement is ``conflicted`` and
+    no majority can outvote it.  One unique conflict-free declaration
+    backed by at least the threshold of distinct sites is ``accepted``;
+    short of the threshold it stays ``insufficient`` but keeps that
+    declaration; with no valid vote the declaration is null.
+    """
+    # site -> content bytes -> list of (from-prefix flag, row)
+    by_site: dict[str, dict[bytes, list[tuple[bool, dict]]]] = {}
+    for position, row in enumerate(rows):
+        if row[ADJ_CONCLUSION] in (
+            PA_CONCLUSION_VALID,
+            PA_CONCLUSION_DUPLICATE,
+            PA_CONCLUSION_CONTRADICTION,
+        ):
+            content = _prune_compact(row[PBA_DECLARATION])
+            by_site.setdefault(row[VD_ISSUER], {}).setdefault(
+                content, []
+            ).append((position < prefix_count, row))
+
+    contradicted = False
+    votes: dict[str, bytes] = {}
+    representatives: dict[str, dict] = {}
+    for site, groups in by_site.items():
+        if len(groups) > 1:
+            contradicted = True
+            ordered_groups = sorted(
+                groups.values(),
+                key=lambda members: min(member[1][ID] for member in members),
+            )
+            for members in ordered_groups:
+                members.sort(key=lambda member: member[1][ID])
+                members[0][1][ADJ_CONCLUSION] = PA_CONCLUSION_CONTRADICTION
+                members[0][1][ADJ_REASON] = REASON_CONTRADICTION
+                for _from_prefix, extra in members[1:]:
+                    extra[ADJ_CONCLUSION] = PA_CONCLUSION_DUPLICATE
+                    extra[ADJ_REASON] = REASON_DUPLICATE
+        else:
+            content, members = next(iter(groups.items()))
+            prefix_members = [
+                member for member in members if member[0]
+            ]
+            candidates = prefix_members or members
+            winner = min(candidates, key=lambda member: member[1][ID])
+            winner[1][ADJ_CONCLUSION] = PA_CONCLUSION_VALID
+            winner[1][ADJ_REASON] = None
+            for from_prefix, member in members:
+                if member is winner[1]:
+                    continue
+                member[ADJ_CONCLUSION] = PA_CONCLUSION_DUPLICATE
+                member[ADJ_REASON] = REASON_DUPLICATE
+            votes[site] = content
+            representatives[site] = winner[1]
+
+    contents = set(votes.values())
+    if contradicted or len(contents) > 1:
+        return PA_STATUS_CONFLICTED, None
+    if len(contents) == 1:
+        common_declaration = copy.deepcopy(
+            min(representatives.values(), key=lambda row: row[ID])[
+                PBA_DECLARATION
+            ]
+        )
+        if len(votes) >= threshold:
+            return PA_STATUS_ACCEPTED, common_declaration
+        return PA_STATUS_INSUFFICIENT, common_declaration
+    return PA_STATUS_INSUFFICIENT, None
+
+
+def _pac_recompute(
+    prefix_inputs: list[str],
+    prefix_rows: list[dict],
+    increment: list[dict],
+    prune_policy_digest: str,
+    prune_threshold: int,
+    site_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Recompute the complete stage conclusion from prefix plus increment.
+
+    The prefix statements are the already-verified statements of the
+    predecessor; each new handover is run through the existing
+    aggregation rules and the complete statement set is then re-tallied.
+    """
+    increment_rows: list[dict] = []
+    increment_digests: list[str] = []
+    for item in increment:
+        digest = hashlib.sha256(item[PBA_PACKET]).hexdigest()
+        increment_digests.append(digest)
+        increment_rows.append(
+            _aggregate_prune_batch_one(
+                item, digest, prune_policy_digest, prune_threshold,
+                site_policy, validated_keyring, moment,
+            )
+        )
+
+    full_inputs = list(prefix_inputs) + increment_digests
+    working_rows = copy.deepcopy(prefix_rows)
+    working_rows.extend(copy.deepcopy(increment_rows))
+    status, declaration = _tally_prune_chain_rows(
+        working_rows, len(prefix_rows), site_policy[ADJ_THRESHOLD]
+    )
+    return {
+        PBA_INPUTS: full_inputs,
+        PA_ITEMS: _pac_sort_rows(working_rows),
+        STATUS: status,
+        PBA_DECLARATION: declaration,
+    }
+
+
+def _pac_assert_transition(previous: dict, verdict: dict) -> None:
+    """Enforce the per-hop verdict state machine.
+
+    ``insufficient`` may gain supplemental evidence and become
+    ``accepted`` or ``conflicted``; an ``accepted`` head only keeps the
+    identical common declaration or advances to ``conflicted`` (it
+    never falls back to insufficient or swaps declarations); a
+    ``conflicted`` verdict can never be masked by a later majority.
+    """
+    prev_status = previous[STATUS]
+    new_status = verdict[STATUS]
+    if prev_status == PA_STATUS_CONFLICTED:
+        if new_status != PA_STATUS_CONFLICTED:
+            raise _pac_chain_invalid(
+                "a conflicted aggregate can never be outvoted or fall back"
+            )
+    elif prev_status == PA_STATUS_ACCEPTED:
+        if new_status == PA_STATUS_INSUFFICIENT:
+            raise _pac_chain_invalid(
+                "an accepted aggregate must not fall back to insufficient"
+            )
+        if new_status == PA_STATUS_ACCEPTED:
+            if verdict[PBA_DECLARATION] != previous[PBA_DECLARATION]:
+                raise _pac_chain_invalid(
+                    "an accepted aggregate may only keep the same common "
+                    "declaration"
+                )
+
+
+def _pac_assert_sealer_authorized(
+    old_policy: dict, new_policy: dict, issuer: str, key_version: int
+) -> None:
+    """The successor sealer must be authorized under both site policies."""
+    if key_version not in old_policy[ADJ_SITES].get(issuer, frozenset()):
+        raise _pac_chain_invalid(
+            f"sealer {issuer!r} version {key_version} is not authorized by "
+            "the previous site policy"
+        )
+    if key_version not in new_policy[ADJ_SITES].get(issuer, frozenset()):
+        raise _pac_chain_invalid(
+            f"sealer {issuer!r} version {key_version} is not authorized by "
+            "the rotated site policy"
+        )
+
+
+def _pac_validated_increment(increment: object) -> list[dict]:
+    """Validate a sealing-stage handover increment, which may be empty.
+
+    A non-empty increment follows the exact
+    :func:`aggregate_prune_batches` item rules; an empty increment is
+    only meaningful for a policy rotation (the append rule enforces a
+    non-empty increment when the policy is unchanged).
+    """
+    if not isinstance(increment, list):
+        raise TypeError("increment must be a list")
+    if not increment:
+        return []
+    return _validated_prune_batch_items(increment)
+
+
+def _pac_assert_extends(
+    previous: dict, full_inputs: list[str], increment: list[dict],
+    unchanged: bool,
+) -> None:
+    """Enforce the append-only handover prefix and disjoint identities.
+
+    The predecessor's handover digests must remain the ordered prefix
+    of the stage -- nothing is deleted, changed or reordered -- and a
+    non-empty increment adds only new packet digests and new item ids.
+    An unchanged policy must add at least one handover; a rotation may
+    re-seal the identical sequence with an empty increment.
+    """
+    prefix_inputs = previous[PBA_INPUTS]
+    if unchanged and not increment:
+        raise _pac_chain_invalid("an unchanged policy requires new handovers")
+    if len(full_inputs) < len(prefix_inputs):
+        raise _pac_chain_invalid(
+            "the handover sequence must extend the predecessor"
+        )
+    if full_inputs[:len(prefix_inputs)] != prefix_inputs:
+        raise _pac_chain_invalid(
+            "the handover sequence must keep the predecessor as an ordered "
+            "prefix; history must not be deleted, changed or reordered"
+        )
+    prefix_digests = set(prefix_inputs)
+    prefix_ids = {row[ID] for row in previous[PA_ITEMS]}
+    seen_digests: set[str] = set()
+    seen_ids: set[str] = set()
+    for item in increment:
+        digest = hashlib.sha256(item[PBA_PACKET]).hexdigest()
+        if digest in prefix_digests or digest in seen_digests:
+            raise _pac_chain_invalid(
+                "a handover packet already in the prefix must not be appended "
+                "again"
+            )
+        seen_digests.add(digest)
+        item_id = item[ID]
+        if item_id in prefix_ids or item_id in seen_ids:
+            raise _pac_chain_invalid(
+                f"handover item id {item_id!r} is already part of the chain"
+            )
+        seen_ids.add(item_id)
+
+
+# -- Successor packet shape ----------------------------------------------------
+
+def _pac_bound_increment(raw_items: object, where: str) -> list[dict]:
+    """Parse the raw handover increment bound inside a successor packet.
+
+    Each entry carries exactly ``id`` and ``packet``; packet bytes ride
+    as non-empty even-length lowercase hex.  A field of the wrong type
+    raises :class:`TypeError`; every key-set, value or hex fault raises
+    :class:`InvalidAggregateChainError`.
+    """
+    if not isinstance(raw_items, list):
+        raise TypeError(f"{where} handovers must be a list")
+    validated: list[dict] = []
+    for position, item in enumerate(raw_items):
+        item_where = f"{where} handover {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{item_where} must be an object")
+        if set(item.keys()) != _PAC_INCREMENT_ITEM_KEYS:
+            raise _pac_chain_invalid(
+                f"{item_where} must contain exactly the keys 'id' and 'packet'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{item_where} id must be a str")
+        if item_id == "":
+            raise _pac_chain_invalid(f"{item_where} id must be non-empty")
+        packet_hex = item[PAC_PACKET]
+        if not isinstance(packet_hex, str):
+            raise TypeError(f"{item_where} packet must be a str")
+        try:
+            packet = _hex_bytes(packet_hex)
+        except ValueError as exc:
+            raise _pac_chain_invalid(
+                f"{item_where} packet must be non-empty even-length lowercase "
+                "hex"
+            ) from exc
+        validated.append({ID: item_id, PAC_PACKET: packet})
+    return validated
+
+
+def _pac_validated_rows(raw_rows: object, where: str) -> list[dict]:
+    """Validate the bound aggregate rows of a successor payload.
+
+    The row contract is the one :func:`aggregate_prune_batches` binds,
+    but every structural fault raises
+    :class:`InvalidAggregateChainError` and a wrong JSON type raises
+    :class:`TypeError`.
+    """
+    if not isinstance(raw_rows, list):
+        raise TypeError(f"{where} items must be a list")
+    if not raw_rows:
+        raise _pac_chain_invalid(f"{where} items must be a non-empty list")
+    parsed_rows: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, row in enumerate(raw_rows):
+        row_where = f"{where} item {position}"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be an object")
+        if set(row.keys()) != _PBA_ROW_KEYS:
+            raise _pac_chain_invalid(
+                f"{row_where} must contain exactly the keys 'conclusion', "
+                "'digest', 'id', 'issuer', 'keyVersion', 'reason' and "
+                "'declaration'"
+            )
+        row_id = row[ID]
+        if not isinstance(row_id, str):
+            raise TypeError(f"{row_where} id must be a str")
+        if row_id == "":
+            raise _pac_chain_invalid(f"{row_where} id must be non-empty")
+        if row_id in seen_ids:
+            raise _pac_chain_invalid(f"{row_where} repeats an id")
+        seen_ids.add(row_id)
+        digest = row[CP_DIGEST]
+        if not _prune_is_digest(digest):
+            raise _pac_chain_invalid(
+                f"{row_where} digest must be 64 lowercase hex characters"
+            )
+        site = row[VD_ISSUER]
+        if site is not None and not isinstance(site, str):
+            raise TypeError(f"{row_where} issuer must be a str or null")
+        if site == "":
+            raise _pac_chain_invalid(f"{row_where} issuer must be non-empty")
+        key_version = row[KEY_VERSION]
+        if isinstance(key_version, bool) or not isinstance(key_version, int):
+            if key_version is not None:
+                raise TypeError(
+                    f"{row_where} keyVersion must be an int or null"
+                )
+        elif key_version <= 0:
+            raise _pac_chain_invalid(
+                f"{row_where} keyVersion must be positive"
+            )
+        if (site is None) != (key_version is None):
+            raise _pac_chain_invalid(
+                f"{row_where} issuer and keyVersion must be null together"
+            )
+        conclusion = row[ADJ_CONCLUSION]
+        if not isinstance(conclusion, str):
+            raise TypeError(f"{row_where} conclusion must be a str")
+        reason = row[ADJ_REASON]
+        if conclusion == PA_CONCLUSION_VALID:
+            if reason is not None:
+                raise _pac_chain_invalid(
+                    f"{row_where} reason must be null for a valid row"
+                )
+        elif conclusion == PA_CONCLUSION_INVALID:
+            if reason not in _PBA_INVALID_REASONS:
+                raise _pac_chain_invalid(
+                    f"{row_where} reason must be one of 'invalid', "
+                    "'unauthenticated' or 'unauthorized'"
+                )
+        elif conclusion in (
+            PA_CONCLUSION_DUPLICATE, PA_CONCLUSION_CONTRADICTION
+        ):
+            expected = (
+                REASON_DUPLICATE
+                if conclusion == PA_CONCLUSION_DUPLICATE
+                else REASON_CONTRADICTION
+            )
+            if reason != expected:
+                raise _pac_chain_invalid(
+                    f"{row_where} reason must match its conclusion"
+                )
+        else:
+            raise _pac_chain_invalid(f"{row_where} conclusion is not known")
+        identity_present = reason != PA_CONCLUSION_INVALID
+        if identity_present:
+            if site is None:
+                raise _pac_chain_invalid(
+                    f"{row_where} an authenticated or authorized row must "
+                    "carry its issuer"
+                )
+        elif site is not None:
+            raise _pac_chain_invalid(
+                f"{row_where} an invalid row must carry no issuer"
+            )
+        if conclusion == PA_CONCLUSION_INVALID:
+            if row[PBA_DECLARATION] is not None:
+                raise _pac_chain_invalid(
+                    f"{row_where} an invalid row must carry no declaration"
+                )
+            declaration = None
+        else:
+            if not isinstance(row[PBA_DECLARATION], list):
+                raise TypeError(
+                    f"{row_where} declaration must be a list"
+                )
+            declaration = _validated_signed_batch_items(
+                row[PBA_DECLARATION], _pac_chain_invalid,
+                f"{row_where} declaration",
+            )
+        parsed_rows.append({
+            ADJ_CONCLUSION: conclusion,
+            CP_DIGEST: digest,
+            ID: row_id,
+            VD_ISSUER: site,
+            KEY_VERSION: key_version,
+            ADJ_REASON: reason,
+            PBA_DECLARATION: declaration,
+        })
+    return parsed_rows
+
+
+def _parse_pac_successor(raw: object) -> tuple[dict, str, list[dict]]:
+    """Validate successor bytes into ``(payload, signature, increment)``.
+
+    A non-bytes argument or a public field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, digest, row or increment fault raises
+    :class:`InvalidAggregateChainError`.  The predecessor, policy,
+    moment, tally and signature bindings are checked by the chain
+    verifier.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("successor must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _pac_chain_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _pac_chain_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_pac_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _pac_chain_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("successor must be a JSON object")
+    if set(data.keys()) != _PAC_TOP_KEYS:
+        raise _pac_chain_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("successor signature must be a str")
+    if _PRUNE_HEX64.fullmatch(signature) is None:
+        raise _pac_chain_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("successor payload must be an object")
+    if set(payload.keys()) != _PAC_SUCCESSOR_PAYLOAD_KEYS:
+        raise _pac_chain_invalid("payload must contain exactly the bound keys")
+
+    for key in (
+        PAC_ROOT_DIGEST, PAC_PREDECESSOR_DIGEST,
+        PBA_PRUNE_POLICY_DIGEST, PAC_OLD_POLICY_DIGEST, PAC_NEW_POLICY_DIGEST,
+    ):
+        value = payload[key]
+        if not isinstance(value, str):
+            raise TypeError(f"payload {key} must be a str")
+        if not _prune_is_digest(value):
+            raise _pac_chain_invalid(
+                f"payload {key} must be 64 lowercase hex characters"
+            )
+    height = payload[PAC_HEIGHT]
+    if isinstance(height, bool) or not isinstance(height, int):
+        raise TypeError("payload height must be an int")
+    if height < 1:
+        raise _pac_chain_invalid("payload height must be a positive integer")
+    policy_version = payload[PAC_POLICY_VERSION]
+    if isinstance(policy_version, bool) or not isinstance(policy_version, int):
+        raise TypeError("payload policyVersion must be an int")
+    if policy_version <= 0:
+        raise _pac_chain_invalid("payload policyVersion must be positive")
+    effective = payload[PAC_EFFECTIVE_AT]
+    if isinstance(effective, bool) or not isinstance(effective, int):
+        raise TypeError("payload effectiveAt must be an int")
+    if effective < 0:
+        raise _pac_chain_invalid("payload effectiveAt must be non-negative")
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("payload issuer must be a str")
+    if issuer == "":
+        raise _pac_chain_invalid("payload issuer must be a non-empty str")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _pac_chain_invalid("payload keyVersion must be positive")
+    packet_version = payload[VERSION]
+    if isinstance(packet_version, bool) or not isinstance(
+        packet_version, int
+    ):
+        raise TypeError("payload version must be an int")
+    if packet_version != PRUNE_AGGREGATE_CHAIN_VERSION:
+        raise _pac_chain_invalid("payload version must be the integer 1")
+
+    status = payload[STATUS]
+    if not isinstance(status, str):
+        raise TypeError("payload status must be a str")
+    if status not in _PA_STATUSES:
+        raise _pac_chain_invalid("payload status is not known")
+
+    inputs = payload[PBA_INPUTS]
+    if not isinstance(inputs, list):
+        raise TypeError("payload inputs must be a list")
+    if not inputs:
+        raise _pac_chain_invalid("payload inputs must be a non-empty list")
+    for position, digest in enumerate(inputs):
+        if not _prune_is_digest(digest):
+            raise _pac_chain_invalid(
+                f"payload input {position} digest must be 64 lowercase hex "
+                "characters"
+            )
+
+    rows = _pac_validated_rows(payload[PA_ITEMS], "payload")
+    if len(rows) != len(inputs):
+        raise _pac_chain_invalid(
+            "the items must cover every handover and vice versa"
+        )
+    raw_declaration = payload[PBA_DECLARATION]
+    if raw_declaration is None:
+        declaration = None
+    else:
+        if not isinstance(raw_declaration, list):
+            raise TypeError("payload declaration must be a list or null")
+        declaration = _validated_signed_batch_items(
+            raw_declaration, _pac_chain_invalid, "payload declaration"
+        )
+    if status == PA_STATUS_ACCEPTED and declaration is None:
+        raise _pac_chain_invalid(
+            "an accepted verdict must keep the common declaration"
+        )
+    if status == PA_STATUS_CONFLICTED and declaration is not None:
+        raise _pac_chain_invalid(
+            "a conflicted verdict must bind a null common declaration"
+        )
+
+    increment = _pac_bound_increment(payload[PAC_HANDOVERS], "payload")
+
+    normalized_payload = {
+        PAC_ROOT_DIGEST: payload[PAC_ROOT_DIGEST],
+        PAC_PREDECESSOR_DIGEST: payload[PAC_PREDECESSOR_DIGEST],
+        PAC_HEIGHT: height,
+        PBA_INPUTS: list(inputs),
+        PA_ITEMS: rows,
+        PBA_DECLARATION: declaration,
+        STATUS: status,
+        PBA_PRUNE_POLICY_DIGEST: payload[PBA_PRUNE_POLICY_DIGEST],
+        PAC_OLD_POLICY_DIGEST: payload[PAC_OLD_POLICY_DIGEST],
+        PAC_NEW_POLICY_DIGEST: payload[PAC_NEW_POLICY_DIGEST],
+        PAC_POLICY_VERSION: policy_version,
+        PAC_EFFECTIVE_AT: effective,
+        PAC_HANDOVERS: [
+            {ID: item[ID], PAC_PACKET: item[PAC_PACKET].hex()}
+            for item in increment
+        ],
+        VD_ISSUER: issuer,
+        KEY_VERSION: key_version,
+        VERSION: PRUNE_AGGREGATE_CHAIN_VERSION,
+    }
+    if _prune_compact({TICKET_PAYLOAD: normalized_payload,
+                       SIGNATURE: signature}) != raw:
+        raise _pac_chain_invalid(
+            "encoding is not the canonical compact form"
+        )
+    return normalized_payload, signature, increment
+
+
+# -- Sealing a successor -------------------------------------------------------
+
+def supersede_prune_aggregate(
+    predecessor, increment, prune_policy, old_policy, new_policy, keyring,
+    moment, effective_at, issuer, version
+):
+    """Issue one signed supersession successor over a prune batch aggregate.
+
+    ``predecessor`` is either the chain root (an
+    :func:`aggregate_prune_batches` packet) or the previous successor
+    packet.  ``increment`` is the stage's non-empty list of new
+    handover items in the exact shape of :func:`aggregate_prune_batches`
+    items -- each exactly a unique non-empty ``id`` and ``packet``
+    bytes (a :func:`sign_prune_adjudication_batch` handover).  The
+    stage keeps every predecessor handover verbatim as an ordered
+    digest prefix and only appends the increment; existing statements
+    are never deleted, changed or reordered.  ``prune_policy`` is the
+    original ``{"batch", "sites", "threshold"}`` pruning policy,
+    invariant along the whole chain; ``old_policy``/``new_policy``
+    carry exactly ``sites``, ``threshold`` and a positive
+    ``policyVersion``: unchanged sites and threshold keep the version,
+    any content change increments it by exactly one.  ``effective_at``
+    is the hop's non-negative effective moment and never moves
+    backwards; ``moment`` is the issuance/verification moment and
+    ``issuer``/``version`` name the successor sealing key, which must
+    be authorized under both policies and usable at both moments.
+
+    The successor conclusion is recomputed in full: the predecessor's
+    already-verified statements stay as the ordered prefix, every new
+    handover is authenticated and authorized through the existing
+    aggregation rules under the new policy at the effective moment, and
+    the complete statement set is re-tallied.  Supplemental handovers
+    may move ``insufficient`` to ``accepted`` or ``conflicted``; an
+    ``accepted`` head only keeps the identical common declaration or
+    advances to ``conflicted`` (it never falls back or swaps), and a
+    ``conflicted`` verdict can never be masked by a later majority.
+    The settled verdict must still hold with credentials usable at
+    ``moment``.
+
+    Returns canonical compact UTF-8 JSON with exactly ``payload`` and
+    ``signature``; the payload binds the root digest, predecessor
+    digest, height, the complete recomputed conclusion (the full
+    original-order input digests, the re-tallied rows, the status and
+    common declaration), the invariant prune policy digest, the
+    old/new policy digests, the policy version, the effective moment,
+    the raw handover increment (bytes as lowercase hex), the issuer
+    and key version and ``version`` (the integer 1), signed with
+    HMAC-SHA256 under the exact issuer/version key.  A parameter or
+    public field type fault raises :class:`TypeError` (a :class:`bool`
+    never poses as an int); an empty value, illegal version, wrong
+    policy count or backwards moment raises :class:`ValueError`; a
+    malformed root raises :class:`InvalidPruneBatchAggregateError`; a
+    malformed successor or broken chain rule raises
+    :class:`InvalidAggregateChainError`; a credential fault raises
+    :class:`AuthenticationError`.  No file is read or written and no
+    input is modified.
+    """
+    validated_increment = _pac_validated_increment(increment)
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_old = _validated_pac_site_policy(old_policy)
+    validated_new = _validated_pac_site_policy(new_policy)
+    validated_keyring = _validated_keyring(keyring)
+    sign_moment = _fe_moment(moment, "moment")
+    effective = _fe_moment(effective_at, "effectiveAt")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+    if not isinstance(predecessor, bytes):
+        raise TypeError("predecessor must be bytes")
+
+    previous = _pac_predecessor_view(predecessor)
+
+    old_digest = _pac_policy_digest(validated_old)
+    new_digest = _pac_policy_digest(validated_new)
+    if previous["kind"] == "root":
+        # The root binds an unversioned {sites, threshold} policy; the
+        # first versioned policy over it starts at version 1 and must
+        # keep the same sites and threshold.
+        if not _pac_policy_matches_root(validated_old, previous):
+            raise _pac_chain_invalid(
+                "oldPolicy sites and threshold must match the root aggregate "
+                "site policy"
+            )
+        prior_version = PRUNE_BATCH_AGGREGATE_VERSION
+    else:
+        if old_digest != previous["policy_digest"]:
+            raise _pac_chain_invalid(
+                "oldPolicy must equal the policy bound by the predecessor"
+            )
+        prior_version = previous[DS_POLICY_VERSION]
+    old_version = validated_old[DS_POLICY_VERSION]
+    if old_version != prior_version:
+        raise _pac_chain_invalid(
+            "oldPolicy policyVersion must match the predecessor policy version"
+        )
+    new_version = validated_new[DS_POLICY_VERSION]
+    unchanged = (
+        validated_old[ADJ_SITES] == validated_new[ADJ_SITES]
+        and validated_old[ADJ_THRESHOLD] == validated_new[ADJ_THRESHOLD]
+    )
+    if unchanged:
+        if new_version != old_version:
+            raise _pac_chain_invalid(
+                "an unchanged policy must keep its policy version"
+            )
+    elif new_version != old_version + 1:
+        raise _pac_chain_invalid(
+            "a changed policy must increment policyVersion by exactly one"
+        )
+
+    if previous[PAC_EFFECTIVE_AT] is not None and effective < previous[
+        PAC_EFFECTIVE_AT
+    ]:
+        raise ValueError("effectiveAt must not move backwards")
+
+    prune_policy_digest = hashlib.sha256(
+        _verdict_policy_bytes(validated_prune_policy)
+    ).hexdigest()
+    if prune_policy_digest != previous["prune_policy_digest"]:
+        raise _pac_chain_invalid(
+            "the original prune policy must stay invariant along the chain"
+        )
+
+    verdict = _pac_recompute(
+        previous[PBA_INPUTS], previous[PA_ITEMS], validated_increment,
+        prune_policy_digest, validated_prune_policy[ADJ_THRESHOLD],
+        _pac_plain_site_policy(validated_new), validated_keyring, effective,
+    )
+    _pac_assert_extends(
+        previous, verdict[PBA_INPUTS], validated_increment, unchanged
+    )
+    _pac_assert_transition(previous, verdict)
+    _pac_assert_sealer_authorized(
+        validated_old, validated_new, issuer, version
+    )
+
+    # The newly added handovers must authenticate identically at the
+    # issuance moment, and the settled verdict must still hold then.
+    verdict_now = _pac_recompute(
+        previous[PBA_INPUTS], previous[PA_ITEMS], validated_increment,
+        prune_policy_digest, validated_prune_policy[ADJ_THRESHOLD],
+        _pac_plain_site_policy(validated_new), validated_keyring, sign_moment,
+    )
+    if (
+        verdict_now[STATUS] != verdict[STATUS]
+        or verdict_now[PA_ITEMS] != verdict[PA_ITEMS]
+        or verdict_now[PBA_DECLARATION] != verdict[PBA_DECLARATION]
+    ):
+        raise AuthenticationError(
+            "new handover credentials are not all usable at the issuance "
+            "moment"
+        )
+
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, effective
+    )
+    _usable_checkpoint_key(
+        validated_keyring, issuer, version, sign_moment
+    )
+
+    payload = {
+        PAC_ROOT_DIGEST: previous[PAC_ROOT_DIGEST],
+        PAC_PREDECESSOR_DIGEST: hashlib.sha256(predecessor).hexdigest(),
+        PAC_HEIGHT: previous[PAC_HEIGHT] + 1,
+        PBA_INPUTS: verdict[PBA_INPUTS],
+        PA_ITEMS: verdict[PA_ITEMS],
+        PBA_DECLARATION: verdict[PBA_DECLARATION],
+        STATUS: verdict[STATUS],
+        PBA_PRUNE_POLICY_DIGEST: prune_policy_digest,
+        PAC_OLD_POLICY_DIGEST: old_digest,
+        PAC_NEW_POLICY_DIGEST: new_digest,
+        PAC_POLICY_VERSION: new_version,
+        PAC_EFFECTIVE_AT: effective,
+        PAC_HANDOVERS: [
+            {ID: item[ID], PAC_PACKET: item[PBA_PACKET].hex()}
+            for item in validated_increment
+        ],
+        VD_ISSUER: issuer,
+        KEY_VERSION: version,
+        VERSION: PRUNE_AGGREGATE_CHAIN_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+# -- Offline chain verification -----------------------------------------------
+
+def _pac_validated_policy_sequence(policies: object) -> list[dict]:
+    """Validate a chain's versioned policy sequence (one more than hops)."""
+    if not isinstance(policies, list):
+        raise TypeError("policies must be a list")
+    if not policies:
+        raise ValueError("policies must be a non-empty list")
+    return [_validated_pac_site_policy(policy) for policy in policies]
+
+
+def _verify_pac_hop(
+    successor: bytes,
+    previous: dict,
+    previous_digest: str,
+    old_policy: dict,
+    new_policy: dict,
+    validated_prune_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one successor against its predecessor and both policies."""
+    payload, signature, increment = _parse_pac_successor(successor)
+
+    if payload[PAC_ROOT_DIGEST] != previous[PAC_ROOT_DIGEST]:
+        raise _pac_chain_invalid("root digest does not match the chain root")
+    if payload[PAC_PREDECESSOR_DIGEST] != previous_digest:
+        raise _pac_chain_invalid(
+            "predecessor digest does not match the previous packet"
+        )
+    if payload[PAC_HEIGHT] != previous[PAC_HEIGHT] + 1:
+        raise _pac_chain_invalid("height must increase by exactly one")
+
+    old_digest = _pac_policy_digest(old_policy)
+    new_digest = _pac_policy_digest(new_policy)
+    if previous["kind"] == "root":
+        if not _pac_policy_matches_root(old_policy, previous):
+            raise _pac_chain_invalid(
+                "oldPolicy sites and threshold must match the root site policy"
+            )
+        prior_version = PRUNE_BATCH_AGGREGATE_VERSION
+    else:
+        if old_digest != previous["policy_digest"]:
+            raise _pac_chain_invalid(
+                "oldPolicy must equal the policy bound by the predecessor"
+            )
+        prior_version = previous[DS_POLICY_VERSION]
+    if old_policy[DS_POLICY_VERSION] != prior_version:
+        raise _pac_chain_invalid(
+            "oldPolicy policyVersion must match the predecessor version"
+        )
+    if payload[PAC_OLD_POLICY_DIGEST] != old_digest:
+        raise _pac_chain_invalid("bound oldPolicyDigest does not match")
+    if payload[PAC_NEW_POLICY_DIGEST] != new_digest:
+        raise _pac_chain_invalid("bound newPolicyDigest does not match")
+    unchanged = (
+        old_policy[ADJ_SITES] == new_policy[ADJ_SITES]
+        and old_policy[ADJ_THRESHOLD] == new_policy[ADJ_THRESHOLD]
+    )
+    new_version = new_policy[DS_POLICY_VERSION]
+    if unchanged:
+        if new_version != old_policy[DS_POLICY_VERSION]:
+            raise _pac_chain_invalid(
+                "an unchanged policy must keep its policy version"
+            )
+    elif new_version != old_policy[DS_POLICY_VERSION] + 1:
+        raise _pac_chain_invalid(
+            "a changed policy must increment policyVersion by exactly one"
+        )
+    if payload[PAC_POLICY_VERSION] != new_version:
+        raise _pac_chain_invalid("bound policyVersion does not match the policy")
+
+    effective = payload[PAC_EFFECTIVE_AT]
+    if previous[PAC_EFFECTIVE_AT] is not None and effective < previous[
+        PAC_EFFECTIVE_AT
+    ]:
+        raise _pac_chain_invalid("effectiveAt must not move backwards")
+
+    prune_policy_digest = hashlib.sha256(
+        _verdict_policy_bytes(validated_prune_policy)
+    ).hexdigest()
+    if payload[PBA_PRUNE_POLICY_DIGEST] != prune_policy_digest:
+        raise _pac_chain_invalid(
+            "bound prunePolicyDigest does not match the original prune policy"
+        )
+    if prune_policy_digest != previous["prune_policy_digest"]:
+        raise _pac_chain_invalid(
+            "the original prune policy must stay invariant along the chain"
+        )
+
+    # The bound full handover list must be the predecessor's ordered
+    # prefix followed by exactly the bound increment digests.
+    prefix_inputs = previous[PBA_INPUTS]
+    increment_digests = [
+        hashlib.sha256(item[PBA_PACKET]).hexdigest() for item in increment
+    ]
+    expected_inputs = list(prefix_inputs) + increment_digests
+    if payload[PBA_INPUTS] != expected_inputs:
+        raise _pac_chain_invalid(
+            "bound inputs must be the predecessor prefix plus the increment"
+        )
+    _pac_assert_extends(previous, expected_inputs, increment, unchanged)
+
+    verdict = _pac_recompute(
+        prefix_inputs, previous[PA_ITEMS], increment,
+        prune_policy_digest, validated_prune_policy[ADJ_THRESHOLD],
+        _pac_plain_site_policy(new_policy), validated_keyring, effective,
+    )
+    verdict_now = _pac_recompute(
+        prefix_inputs, previous[PA_ITEMS], increment,
+        prune_policy_digest, validated_prune_policy[ADJ_THRESHOLD],
+        _pac_plain_site_policy(new_policy), validated_keyring, moment,
+    )
+    _pac_assert_transition(previous, verdict)
+    _pac_assert_sealer_authorized(
+        old_policy, new_policy, payload[VD_ISSUER], payload[KEY_VERSION]
+    )
+
+    if payload[PA_ITEMS] != verdict[PA_ITEMS]:
+        raise _pac_chain_invalid(
+            "bound items do not match the recomputed stage conclusion"
+        )
+    if payload[STATUS] != verdict[STATUS]:
+        raise _pac_chain_invalid(
+            "bound status does not match the recomputed stage conclusion"
+        )
+    if payload[PBA_DECLARATION] != verdict[PBA_DECLARATION]:
+        raise _pac_chain_invalid(
+            "bound common declaration does not match the recomputed conclusion"
+        )
+    if (
+        verdict_now[STATUS] != verdict[STATUS]
+        or verdict_now[PA_ITEMS] != verdict[PA_ITEMS]
+        or verdict_now[PBA_DECLARATION] != verdict[PBA_DECLARATION]
+    ):
+        raise AuthenticationError(
+            "new handover credentials are not all usable at the verification "
+            "moment"
+        )
+
+    _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION], effective
+    )
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION], moment
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "prune aggregate successor signature does not match"
+        )
+
+    return {
+        "packet": successor,
+        "view": _pac_successor_view(successor),
+    }
+
+
+def _verify_pac_chain(
+    root: bytes,
+    successors: list,
+    validated_prune_policy: dict,
+    validated_policies: list[dict],
+    validated_keyring: dict[str, list[dict]],
+    verify_moment: int,
+) -> dict:
+    """Verify one validated chain hop by hop; see the public entry point."""
+    root_result = _verify_prune_batch_aggregate_core(
+        root, validated_prune_policy,
+        _pac_plain_site_policy(validated_policies[0]),
+        validated_keyring, verify_moment,
+    )
+    root_digest = hashlib.sha256(root).hexdigest()
+    view = _pac_root_view(root)
+    head_packet = root
+    head_status = root_result[STATUS]
+    head_declaration = root_result[PBA_DECLARATION]
+    head_policy_version = validated_policies[0][DS_POLICY_VERSION]
+
+    previous_packet = root
+    for index, successor in enumerate(successors):
+        hop = _verify_pac_hop(
+            successor, view, hashlib.sha256(previous_packet).hexdigest(),
+            validated_policies[index], validated_policies[index + 1],
+            validated_prune_policy, validated_keyring, verify_moment,
+        )
+        view = hop["view"]
+        previous_packet = successor
+        head_packet = successor
+        head_status = view[STATUS]
+        head_declaration = view[PBA_DECLARATION]
+        head_policy_version = view[DS_POLICY_VERSION]
+
+    common_digest = None
+    if head_declaration is not None:
+        common_digest = hashlib.sha256(
+            _prune_compact(head_declaration)
+        ).hexdigest()
+    return {
+        PAC_ROOT_DIGEST: root_digest,
+        PAC_HEAD_DIGEST: hashlib.sha256(head_packet).hexdigest(),
+        PAC_HEIGHT: view[PAC_HEIGHT],
+        PAC_POLICY_VERSION: head_policy_version,
+        STATUS: head_status,
+        PAC_COMMON_DIGEST: common_digest,
+    }
+
+
+def verify_prune_aggregate_chain(
+    root, successors, prune_policy, policies, keyring, moment
+):
+    """Verify one prune aggregate supersession chain hop by hop, offline.
+
+    ``root`` is the chain's cross-site prune batch aggregate packet and
+    ``successors`` the ordered successor packets (possibly empty for a
+    height-zero chain).  ``prune_policy`` is the invariant original
+    ``{"batch", "sites", "threshold"}`` pruning policy and
+    ``policies`` the complete versioned site policy history -- one
+    entry per stage (the root policy plus one per successor), so its
+    length is ``len(successors) + 1`` and the first carries
+    ``policyVersion`` 1.  Only the root, the ordered successors, the
+    original prune policy, the policy history, the current keyring and
+    the verification moment are consulted; no file is read or written
+    and no input is modified.
+
+    An empty successor list still verifies the root in full under the
+    original prune policy and the root stage's sites/threshold.  For a
+    non-empty chain every hop is re-checked: the root, predecessor and
+    height links, the append-only handover prefix, the old/new policy
+    digests and the single-step version rule, the non-decreasing
+    effective moment, the invariant prune policy, the per-new-handover
+    re-authentication and the full stage re-tally, the verdict state
+    machine and the exact-issuer/version HMAC with a credential usable
+    at both moments.
+
+    On success returns a fresh mapping with the fixed keys
+    ``rootDigest``, ``headDigest``, ``height`` (0 for a bare root),
+    ``policyVersion`` (the head policy's version), ``status`` and
+    ``commonDigest`` (the SHA-256 of the canonical common declaration
+    when one is bound, otherwise null).  A non-bytes argument or a
+    public field of the wrong type raises :class:`TypeError`; an empty
+    value, an illegal version, a wrong policy count or a backwards
+    moment raises :class:`ValueError`; a bad root raises
+    :class:`InvalidPruneBatchAggregateError`; a bad successor or chain
+    binding raises :class:`InvalidAggregateChainError`; a credential or
+    signature fault raises :class:`AuthenticationError`.
+    """
+    if not isinstance(root, bytes):
+        raise TypeError("root must be bytes")
+    if not isinstance(successors, list):
+        raise TypeError("successors must be a list")
+    for index, successor in enumerate(successors):
+        if not isinstance(successor, bytes):
+            raise TypeError(f"successor {index} must be bytes")
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_policies = _pac_validated_policy_sequence(policies)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    if len(validated_policies) != len(successors) + 1:
+        raise ValueError(
+            "policies must provide one entry per chain stage (one more than "
+            "the number of successors)"
+        )
+    if validated_policies[0][DS_POLICY_VERSION] != 1:
+        raise ValueError("the root stage policy must carry policyVersion 1")
+
+    return _verify_pac_chain(
+        root, successors, validated_prune_policy, validated_policies,
+        validated_keyring, verify_moment,
+    )
+
+
+# -- Stable head anchors for verified, accepted prune aggregate chains --------
+
+def _parse_pac_anchor(raw: object) -> tuple[dict, str]:
+    """Validate anchor bytes structurally into ``(payload, signature)``."""
+    if not isinstance(raw, bytes):
+        raise TypeError("anchor must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _pac_anchor_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _pac_anchor_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_pac_anchor_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _pac_anchor_invalid("is not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise TypeError("anchor must be a JSON object")
+    if set(data.keys()) != _PAC_ANCHOR_TOP_KEYS:
+        raise _pac_anchor_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("anchor signature must be a str")
+    if _PRUNE_HEX64.fullmatch(signature) is None:
+        raise _pac_anchor_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("anchor payload must be an object")
+    if set(payload.keys()) != _PAC_ANCHOR_PAYLOAD_KEYS:
+        raise _pac_anchor_invalid(
+            "payload must contain exactly the keys 'rootDigest', "
+            "'headDigest', 'height', 'policyDigest', 'policyVersion', "
+            "'moment', 'issuer', 'keyVersion' and 'version'"
+        )
+    for key in (PAC_ROOT_DIGEST, PAC_HEAD_DIGEST, PAC_POLICY_DIGEST):
+        value = payload[key]
+        if not isinstance(value, str):
+            raise TypeError(f"payload {key} must be a str")
+        if not _prune_is_digest(value):
+            raise _pac_anchor_invalid(
+                f"payload {key} must be 64 lowercase hex characters"
+            )
+    height = payload[PAC_HEIGHT]
+    if isinstance(height, bool) or not isinstance(height, int):
+        raise TypeError("payload height must be an int")
+    if height < 0:
+        raise _pac_anchor_invalid("payload height must be non-negative")
+    policy_version = payload[PAC_POLICY_VERSION]
+    if isinstance(policy_version, bool) or not isinstance(policy_version, int):
+        raise TypeError("payload policyVersion must be an int")
+    if policy_version <= 0:
+        raise _pac_anchor_invalid("payload policyVersion must be positive")
+    anchor_moment = payload[CP_MOMENT]
+    if isinstance(anchor_moment, bool) or not isinstance(anchor_moment, int):
+        raise TypeError("payload moment must be an int")
+    if anchor_moment < 0:
+        raise _pac_anchor_invalid("payload moment must be non-negative")
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("payload issuer must be a str")
+    if issuer == "":
+        raise _pac_anchor_invalid("payload issuer must be a non-empty str")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _pac_anchor_invalid("payload keyVersion must be positive")
+    anchor_version = payload[VERSION]
+    if isinstance(anchor_version, bool) or not isinstance(
+        anchor_version, int
+    ):
+        raise TypeError("payload version must be an int")
+    if anchor_version != PRUNE_AGGREGATE_CHAIN_VERSION:
+        raise _pac_anchor_invalid("payload version must be the integer 1")
+    if _prune_compact(data) != raw:
+        raise _pac_anchor_invalid(
+            "encoding is not the canonical compact form"
+        )
+    return payload, signature
+
+
+def seal_prune_aggregate_head(
+    root, successors, prune_policy, policies, keyring, moment, issuer, version
+):
+    """Seal a stable anchor over one verified, accepted prune chain head.
+
+    The chain is first verified through the exact
+    :func:`verify_prune_aggregate_chain` rules against the invariant
+    original ``prune_policy``, the complete versioned site policy
+    history, the current keyring and ``moment``.  An anchor is sealed
+    only when the chain verifies and its head status is ``accepted``;
+    otherwise sealing raises :class:`ValueError`.  The anchor binds the
+    root digest, head digest and height together with the head policy
+    digest, the head policy version and the sealing moment, and is
+    signed with HMAC-SHA256 under the exact ``issuer``/``version`` key
+    usable at ``moment``.
+
+    Returns canonical compact UTF-8 JSON with exactly ``payload`` and
+    ``signature``.  A parameter or public field type fault raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); an
+    empty value, an illegal version or a wrong policy count raises
+    :class:`ValueError`; a chain that does not verify raises the
+    underlying :class:`InvalidPruneBatchAggregateError` or
+    :class:`InvalidAggregateChainError`; an unknown, revoked,
+    not-yet-valid or expired sealing credential raises
+    :class:`AuthenticationError`.  No file is read or written and no
+    input is modified.
+    """
+    if not isinstance(root, bytes):
+        raise TypeError("root must be bytes")
+    if not isinstance(successors, list):
+        raise TypeError("successors must be a list")
+    for index, successor in enumerate(successors):
+        if not isinstance(successor, bytes):
+            raise TypeError(f"successor {index} must be bytes")
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_policies = _pac_validated_policy_sequence(policies)
+    validated_keyring = _validated_keyring(keyring)
+    seal_moment = _fe_moment(moment, "moment")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+    if len(validated_policies) != len(successors) + 1:
+        raise ValueError(
+            "policies must provide one entry per chain stage (one more than "
+            "the number of successors)"
+        )
+    if validated_policies[0][DS_POLICY_VERSION] != 1:
+        raise ValueError("the root stage policy must carry policyVersion 1")
+
+    result = _verify_pac_chain(
+        root, successors, validated_prune_policy, validated_policies,
+        validated_keyring, seal_moment,
+    )
+    if result[STATUS] != PA_STATUS_ACCEPTED:
+        raise ValueError("an anchor seals only an accepted head")
+
+    head_policy = validated_policies[-1]
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, seal_moment
+    )
+    payload = {
+        PAC_ROOT_DIGEST: result[PAC_ROOT_DIGEST],
+        PAC_HEAD_DIGEST: result[PAC_HEAD_DIGEST],
+        PAC_HEIGHT: result[PAC_HEIGHT],
+        PAC_POLICY_DIGEST: _pac_policy_digest(head_policy),
+        PAC_POLICY_VERSION: result[PAC_POLICY_VERSION],
+        CP_MOMENT: seal_moment,
+        VD_ISSUER: issuer,
+        KEY_VERSION: version,
+        VERSION: PRUNE_AGGREGATE_CHAIN_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+def verify_prune_aggregate_head(
+    anchor, root, successors, prune_policy, policies, keyring, moment
+):
+    """Re-verify a sealed prune aggregate anchor entirely offline.
+
+    Only the anchor bytes, the whole chain (root aggregate and ordered
+    successors), the invariant original ``prune_policy``, the complete
+    versioned site policy history, the current keyring and the
+    verification moment are consulted; no file is read or written and
+    no argument is modified.  The anchor HMAC is checked against the
+    key the current keyring binds to its exact issuer and version,
+    usable at ``moment``; the chain is then re-verified in full, must
+    be accepted, and every bound root digest, head digest, height and
+    policy version/digest must still match.
+
+    Returns a fresh independent mapping with the fixed keys
+    ``rootDigest``, ``headDigest``, ``height``, ``policyDigest``,
+    ``policyVersion`` and ``anchorDigest`` (the SHA-256 of the anchor
+    bytes).  A non-bytes argument or a wrong public field type raises
+    :class:`TypeError`; an empty value, an illegal version or a wrong
+    policy count raises :class:`ValueError`; a bad anchor raises
+    :class:`InvalidAggregateAnchorError`; a chain fault raises the
+    underlying :class:`InvalidPruneBatchAggregateError` or
+    :class:`InvalidAggregateChainError`; a credential or signature
+    fault raises :class:`AuthenticationError`.
+    """
+    if not isinstance(anchor, bytes):
+        raise TypeError("anchor must be bytes")
+    payload, signature = _parse_pac_anchor(anchor)
+    if not isinstance(root, bytes):
+        raise TypeError("root must be bytes")
+    if not isinstance(successors, list):
+        raise TypeError("successors must be a list")
+    for index, successor in enumerate(successors):
+        if not isinstance(successor, bytes):
+            raise TypeError(f"successor {index} must be bytes")
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_policies = _pac_validated_policy_sequence(policies)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    if len(validated_policies) != len(successors) + 1:
+        raise ValueError(
+            "policies must provide one entry per chain stage (one more than "
+            "the number of successors)"
+        )
+    if validated_policies[0][DS_POLICY_VERSION] != 1:
+        raise ValueError("the root stage policy must carry policyVersion 1")
+
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION],
+        verify_moment,
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "prune aggregate anchor signature does not match"
+        )
+
+    result = _verify_pac_chain(
+        root, successors, validated_prune_policy, validated_policies,
+        validated_keyring, verify_moment,
+    )
+    if result[STATUS] != PA_STATUS_ACCEPTED:
+        raise _pac_anchor_invalid("the anchored head is not accepted")
+    head_policy_digest = _pac_policy_digest(validated_policies[-1])
+    if result[PAC_ROOT_DIGEST] != payload[PAC_ROOT_DIGEST]:
+        raise _pac_anchor_invalid("root digest does not match the anchor")
+    if result[PAC_HEAD_DIGEST] != payload[PAC_HEAD_DIGEST]:
+        raise _pac_anchor_invalid("head digest does not match the anchor")
+    if result[PAC_HEIGHT] != payload[PAC_HEIGHT]:
+        raise _pac_anchor_invalid("height does not match the anchor")
+    if result[PAC_POLICY_VERSION] != payload[PAC_POLICY_VERSION]:
+        raise _pac_anchor_invalid(
+            "policy version does not match the anchor"
+        )
+    if head_policy_digest != payload[PAC_POLICY_DIGEST]:
+        raise _pac_anchor_invalid("policy digest does not match the anchor")
+    return {
+        PAC_ROOT_DIGEST: payload[PAC_ROOT_DIGEST],
+        PAC_HEAD_DIGEST: payload[PAC_HEAD_DIGEST],
+        PAC_HEIGHT: payload[PAC_HEIGHT],
+        PAC_POLICY_DIGEST: head_policy_digest,
+        PAC_POLICY_VERSION: payload[PAC_POLICY_VERSION],
+        PAC_ANCHOR_DIGEST: hashlib.sha256(anchor).hexdigest(),
+    }
