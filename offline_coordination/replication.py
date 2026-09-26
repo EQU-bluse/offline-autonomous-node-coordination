@@ -20254,7 +20254,8 @@ def verify_prune_adjudications(items, policy, keyring, moment):
 
 
 def _validated_prune_adjudications_report(
-    report: object, expected_id: str, where: str
+    report: object, expected_id: str, where: str,
+    invalid=_prune_adjudication_batch_invalid,
 ) -> dict:
     """Validate one adjudication batch report bound into a signed packet.
 
@@ -20265,14 +20266,18 @@ def _validated_prune_adjudications_report(
     packet item's ``id``, keeping the positional binding between the
     ordered items and their reports.
 
-    A field of the wrong JSON type raises :class:`TypeError`; every
-    key-set, value-format, id-binding or nested-payload fault raises
-    :class:`InvalidPruneAdjudicationBatchError`.
+    ``invalid`` builds the packet-specific structural error (the
+    handover packet uses :class:`InvalidPruneAdjudicationBatchError`,
+    the multi-site aggregate uses
+    :class:`InvalidPruneBatchAggregateError`).  A field of the wrong
+    JSON type raises :class:`TypeError`; every key-set, value-format,
+    id-binding or nested-payload fault raises the error ``invalid``
+    builds.
     """
     if not isinstance(report, dict):
         raise TypeError(f"{where} report must be an object")
     if set(report.keys()) != _PA_REPORT_KEYS:
-        raise _prune_adjudication_batch_invalid(
+        raise invalid(
             f"{where} report must contain exactly the keys 'error', 'id', "
             "'result' and 'status'"
         )
@@ -20280,25 +20285,25 @@ def _validated_prune_adjudications_report(
     if not isinstance(report_id, str):
         raise TypeError(f"{where} report id must be a str")
     if report_id == "":
-        raise _prune_adjudication_batch_invalid(
+        raise invalid(
             f"{where} report id must be a non-empty str"
         )
     if report_id != expected_id:
-        raise _prune_adjudication_batch_invalid(
+        raise invalid(
             f"{where} report id does not match the item id"
         )
     status = report[STATUS]
     if not isinstance(status, str):
         raise TypeError(f"{where} report status must be a str")
     if status not in _PADB_VERIFY_STATUSES:
-        raise _prune_adjudication_batch_invalid(
+        raise invalid(
             f"{where} report status is not a known status"
         )
     error = report[PRUNE_ERROR]
     raw_result = report[VERDICT_ITEM_RESULT]
     if status == _VERIFY_VERIFIED:
         if error is not None:
-            raise _prune_adjudication_batch_invalid(
+            raise invalid(
                 f"{where} report error must be null when verified"
             )
         try:
@@ -20309,16 +20314,16 @@ def _validated_prune_adjudications_report(
             # An embedded key-set, version, digest, ordering, row or
             # report-shape fault is a fault of this packet's content; a
             # wrong JSON field type is a TypeError and propagates as one.
-            raise _prune_adjudication_batch_invalid(str(exc)) from exc
+            raise invalid(str(exc)) from exc
     else:
         if not isinstance(error, str):
             raise TypeError(f"{where} report error must be a str for a failure")
         if error == "":
-            raise _prune_adjudication_batch_invalid(
+            raise invalid(
                 f"{where} report error must be a non-empty str for a failure"
             )
         if raw_result is not None:
-            raise _prune_adjudication_batch_invalid(
+            raise invalid(
                 f"{where} report result must be null for a failure"
             )
         validated_result = None
@@ -20327,6 +20332,121 @@ def _validated_prune_adjudications_report(
         ID: report_id,
         VERDICT_ITEM_RESULT: validated_result,
         STATUS: status,
+    }
+
+
+def _validated_signed_batch_items(
+    items: object, invalid, what: str
+) -> list[dict]:
+    """Validate the original-order item list of a signed batch handover.
+
+    Each item carries exactly ``id``, ``digest`` and the full batch
+    verification ``report``.  ``invalid`` builds the packet-specific
+    structural error.  A field of the wrong JSON type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    key-set, value, digest, id or report-shape fault raises the error
+    ``invalid`` builds.
+    """
+    if not isinstance(items, list):
+        raise TypeError(f"{what} items must be a list")
+    if not items:
+        raise invalid(f"{what} items must be a non-empty list")
+    seen_ids: set[str] = set()
+    normalized_items: list[dict] = []
+    for position, item in enumerate(items):
+        where = f"{what} item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(item.keys()) != _PADB_ITEM_KEYS:
+            raise invalid(
+                f"{where} must contain exactly the keys 'id', 'digest' and "
+                "'report'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise invalid(f"{where} id must be a non-empty str")
+        if item_id in seen_ids:
+            raise invalid(f"{what} item ids must be unique")
+        seen_ids.add(item_id)
+        digest = item[CP_DIGEST]
+        if not _prune_is_digest(digest):
+            raise invalid(
+                f"{where} digest must be 64 lowercase hex characters"
+            )
+        report = _validated_prune_adjudications_report(
+            item[RECEIPT_ITEM_REPORT], item_id, where, invalid=invalid
+        )
+        normalized_items.append({
+            ID: item_id,
+            CP_DIGEST: digest,
+            RECEIPT_ITEM_REPORT: report,
+        })
+    return normalized_items
+
+
+def _validated_signed_batch_payload(
+    payload: object, invalid, what: str
+) -> dict:
+    """Validate the shared signed-batch payload shape into a fresh copy.
+
+    The shape is the one :func:`sign_prune_adjudication_batch` and
+    :func:`aggregate_prune_batches` bind: ``issuer``, ``keyVersion``,
+    ``moment``, ``policyDigest``, ``items`` and ``version`` (the integer
+    1), with one item per verified-or-failed handover in the original
+    order carrying exactly ``id``, ``digest`` and the full batch
+    verification ``report``.  ``what`` names the packet for error text
+    and ``invalid`` builds the packet-specific structural error.
+
+    A field of the wrong JSON type raises :class:`TypeError` (a
+    :class:`bool` never poses as an int); every key-set, value, digest,
+    id, report-shape or canonical-content fault raises the error
+    ``invalid`` builds.
+    """
+    if not isinstance(payload, dict):
+        raise TypeError(f"{what} payload must be an object")
+    if set(payload.keys()) != _PADB_PAYLOAD_KEYS:
+        raise invalid(
+            f"{what} payload must contain exactly the keys 'issuer', "
+            "'keyVersion', 'moment', 'policyDigest', 'items' and 'version'"
+        )
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError(f"{what} payload issuer must be a str")
+    if issuer == "":
+        raise invalid(f"{what} payload issuer must be a non-empty str")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError(f"{what} payload keyVersion must be an int")
+    if key_version <= 0:
+        raise invalid(f"{what} payload keyVersion must be positive")
+    moment = payload[CP_MOMENT]
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError(f"{what} payload moment must be an int")
+    if moment < 0:
+        raise invalid(f"{what} payload moment must be non-negative")
+    if not _prune_is_digest(payload[VD_POLICY_DIGEST]):
+        raise invalid(
+            f"{what} policyDigest must be 64 lowercase hex characters"
+        )
+    version = payload[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError(f"{what} payload version must be an int")
+    if version != PRUNE_ADJUDICATION_BATCH_VERSION:
+        raise invalid(f"{what} payload version must be the integer 1")
+
+    normalized_items = _validated_signed_batch_items(
+        payload[PA_ITEMS], invalid, what
+    )
+
+    return {
+        VD_ISSUER: issuer,
+        KEY_VERSION: key_version,
+        CP_MOMENT: moment,
+        VD_POLICY_DIGEST: payload[VD_POLICY_DIGEST],
+        PA_ITEMS: normalized_items,
+        VERSION: PRUNE_ADJUDICATION_BATCH_VERSION,
     }
 
 
@@ -20376,99 +20496,10 @@ def _parse_prune_adjudication_batch(raw: object) -> tuple[dict, str]:
         raise _prune_adjudication_batch_invalid(
             "batch packet signature must be 64 lowercase hex characters"
         )
-    payload = data[TICKET_PAYLOAD]
-    if not isinstance(payload, dict):
-        raise TypeError("batch packet payload must be an object")
-    if set(payload.keys()) != _PADB_PAYLOAD_KEYS:
-        raise _prune_adjudication_batch_invalid(
-            "batch packet payload must contain exactly the keys 'issuer', "
-            "'keyVersion', 'moment', 'policyDigest', 'items' and 'version'"
-        )
-    issuer = payload[VD_ISSUER]
-    if not isinstance(issuer, str):
-        raise TypeError("batch packet payload issuer must be a str")
-    if issuer == "":
-        raise _prune_adjudication_batch_invalid(
-            "batch packet payload issuer must be a non-empty str"
-        )
-    key_version = payload[KEY_VERSION]
-    if isinstance(key_version, bool) or not isinstance(key_version, int):
-        raise TypeError("batch packet payload keyVersion must be an int")
-    if key_version <= 0:
-        raise _prune_adjudication_batch_invalid(
-            "batch packet payload keyVersion must be positive"
-        )
-    moment = payload[CP_MOMENT]
-    if isinstance(moment, bool) or not isinstance(moment, int):
-        raise TypeError("batch packet payload moment must be an int")
-    if moment < 0:
-        raise _prune_adjudication_batch_invalid(
-            "batch packet payload moment must be non-negative"
-        )
-    if not _prune_is_digest(payload[VD_POLICY_DIGEST]):
-        raise _prune_adjudication_batch_invalid(
-            "batch packet policyDigest must be 64 lowercase hex characters"
-        )
-    version = payload[VERSION]
-    if isinstance(version, bool) or not isinstance(version, int):
-        raise TypeError("batch packet payload version must be an int")
-    if version != PRUNE_ADJUDICATION_BATCH_VERSION:
-        raise _prune_adjudication_batch_invalid(
-            "batch packet payload version must be the integer 1"
-        )
 
-    items = payload[PA_ITEMS]
-    if not isinstance(items, list):
-        raise TypeError("batch packet payload items must be a list")
-    if not items:
-        raise _prune_adjudication_batch_invalid(
-            "batch packet payload items must be a non-empty list"
-        )
-    seen_ids: set[str] = set()
-    normalized_items: list[dict] = []
-    for position, item in enumerate(items):
-        where = f"batch item {position}"
-        if not isinstance(item, dict):
-            raise TypeError(f"{where} must be an object")
-        if set(item.keys()) != _PADB_ITEM_KEYS:
-            raise _prune_adjudication_batch_invalid(
-                f"{where} must contain exactly the keys 'id', 'digest' and "
-                "'report'"
-            )
-        item_id = item[ID]
-        if not isinstance(item_id, str):
-            raise TypeError(f"{where} id must be a str")
-        if item_id == "":
-            raise _prune_adjudication_batch_invalid(
-                f"{where} id must be a non-empty str"
-            )
-        if item_id in seen_ids:
-            raise _prune_adjudication_batch_invalid(
-                "batch item ids must be unique"
-            )
-        seen_ids.add(item_id)
-        digest = item[CP_DIGEST]
-        if not _prune_is_digest(digest):
-            raise _prune_adjudication_batch_invalid(
-                f"{where} digest must be 64 lowercase hex characters"
-            )
-        report = _validated_prune_adjudications_report(
-            item[RECEIPT_ITEM_REPORT], item_id, where
-        )
-        normalized_items.append({
-            ID: item_id,
-            CP_DIGEST: digest,
-            RECEIPT_ITEM_REPORT: report,
-        })
-
-    normalized_payload = {
-        VD_ISSUER: issuer,
-        KEY_VERSION: key_version,
-        CP_MOMENT: moment,
-        VD_POLICY_DIGEST: payload[VD_POLICY_DIGEST],
-        PA_ITEMS: normalized_items,
-        VERSION: PRUNE_ADJUDICATION_BATCH_VERSION,
-    }
+    normalized_payload = _validated_signed_batch_payload(
+        data[TICKET_PAYLOAD], _prune_adjudication_batch_invalid, "batch packet"
+    )
     if _prune_compact({TICKET_PAYLOAD: normalized_payload,
                        SIGNATURE: signature}) != raw:
         raise _prune_adjudication_batch_invalid(
@@ -20648,5 +20679,967 @@ def verify_prune_adjudication_batch(packet, policy, keyring, moment):
     if not hmac.compare_digest(expected_signature, signature):
         raise AuthenticationError(
             "prune adjudication batch signature does not match"
+        )
+    return copy.deepcopy(payload)
+
+
+# --- Cross-site aggregation of signed prune adjudication batches --------------
+
+PRUNE_BATCH_AGGREGATE_VERSION = CHAIN_PRUNE_VERSION
+
+PBA_PACKET = "packet"
+PBA_INPUTS = "inputs"
+PBA_PRUNE_POLICY_DIGEST = "prunePolicyDigest"
+PBA_SITE_POLICY_DIGEST = "sitePolicyDigest"
+PBA_DECLARATION = "declaration"
+
+_PBA_ITEM_KEYS = frozenset((ID, PBA_PACKET))
+_PBA_SITE_POLICY_KEYS = frozenset((ADJ_SITES, ADJ_THRESHOLD))
+_PBA_PAYLOAD_KEYS = frozenset((
+    PBA_INPUTS,
+    VD_ISSUER,
+    PA_ITEMS,
+    KEY_VERSION,
+    PBA_PRUNE_POLICY_DIGEST,
+    PBA_SITE_POLICY_DIGEST,
+    PBA_DECLARATION,
+    STATUS,
+    VERSION,
+))
+_PBA_ROW_KEYS = frozenset((
+    ADJ_CONCLUSION,
+    CP_DIGEST,
+    ID,
+    VD_ISSUER,
+    KEY_VERSION,
+    ADJ_REASON,
+    PBA_DECLARATION,
+))
+_PBA_INVALID_REASONS = frozenset((
+    PA_CONCLUSION_INVALID,
+    PA_REASON_UNAUTHENTICATED,
+    PA_REASON_UNAUTHORIZED,
+))
+
+
+class InvalidPruneBatchAggregateError(ValueError):
+    """A signed prune batch aggregate breaks its canonical contract."""
+
+
+def _prune_batch_aggregate_invalid(
+    message: str,
+) -> InvalidPruneBatchAggregateError:
+    return InvalidPruneBatchAggregateError(
+        f"invalid prune batch aggregate: {message}"
+    )
+
+
+def _reject_duplicate_prune_batch_aggregate_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate aggregate keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _prune_batch_aggregate_invalid(
+                f"duplicate key {key!r} in object"
+            )
+        result[key] = value
+    return result
+
+
+def _validated_prune_batch_site_policy(policy: object) -> dict:
+    """Validate the site authorization policy into a fresh normalized dict.
+
+    The policy carries exactly ``sites`` (a non-empty mapping of each
+    authorized non-empty site to its non-empty set of allowed positive
+    key versions) and ``threshold`` (a positive integer no greater than
+    the site count).  Type faults raise :class:`TypeError` (a
+    :class:`bool` never poses as an int); key-set, threshold, site or
+    version-set faults raise :class:`ValueError`.
+    """
+    if not isinstance(policy, dict):
+        raise TypeError("site policy must be a dict")
+    if set(policy.keys()) != _PBA_SITE_POLICY_KEYS:
+        raise ValueError(
+            "site policy must contain exactly the keys 'sites' and "
+            "'threshold'"
+        )
+    threshold = policy[ADJ_THRESHOLD]
+    if isinstance(threshold, bool) or not isinstance(threshold, int):
+        raise TypeError("site policy threshold must be an int")
+    if threshold <= 0:
+        raise ValueError("site policy threshold must be a positive integer")
+    sites = policy[ADJ_SITES]
+    if not isinstance(sites, dict):
+        raise TypeError("site policy sites must be a dict")
+    if not sites:
+        raise ValueError("site policy sites must be non-empty")
+    allowed: dict[str, frozenset[int]] = {}
+    for site, versions in sites.items():
+        if not isinstance(site, str):
+            raise TypeError("site policy site names must be str")
+        if site == "":
+            raise ValueError("site policy site names must be non-empty")
+        if not isinstance(versions, set):
+            raise TypeError(
+                f"allowed versions for site {site!r} must be a set"
+            )
+        site_versions: set[int] = set()
+        for version in versions:
+            if isinstance(version, bool) or not isinstance(version, int):
+                raise TypeError(
+                    f"allowed versions for site {site!r} must be ints"
+                )
+            if version <= 0:
+                raise ValueError(
+                    f"allowed versions for site {site!r} must be positive"
+                )
+            site_versions.add(version)
+        if not site_versions:
+            raise ValueError(
+                f"site {site!r} must allow at least one key version"
+            )
+        allowed[site] = frozenset(site_versions)
+    if threshold > len(allowed):
+        raise ValueError(
+            "site policy threshold must not exceed the number of policy sites"
+        )
+    return {ADJ_THRESHOLD: threshold, ADJ_SITES: allowed}
+
+
+def _prune_batch_site_policy_bytes(policy: dict) -> bytes:
+    """Canonical compact bytes of the normalized site authorization policy.
+
+    Sites are listed in ascending site order and each site's allowed
+    versions are an ascending array; every object key is recursively
+    sorted and non-ASCII is preserved.
+    """
+    ordered_sites = {
+        site: sorted(policy[ADJ_SITES][site])
+        for site in sorted(policy[ADJ_SITES])
+    }
+    return _prune_compact({
+        ADJ_SITES: ordered_sites,
+        ADJ_THRESHOLD: policy[ADJ_THRESHOLD],
+    })
+
+
+def _validated_prune_batch_items(items: object) -> list[dict]:
+    """Validate the aggregate item container before any packet is read.
+
+    A non-list container or a non-dict element, non-str id or non-bytes
+    packet raises :class:`TypeError`; an empty list, an empty or
+    duplicate id or a wrong item key set raises :class:`ValueError`.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _PBA_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'id' and 'packet'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        packet = item[PBA_PACKET]
+        if not isinstance(packet, bytes):
+            raise TypeError(f"{where} packet must be bytes")
+        validated.append({ID: item_id, PBA_PACKET: packet})
+    return validated
+
+
+def _prune_batch_aggregate_row(
+    item_id: str,
+    packet_digest: str,
+    site: str | None,
+    key_version: int | None,
+    statement: dict | None,
+    conclusion: str,
+    reason: str | None,
+) -> dict:
+    """One per-packet aggregation row with the bound key order."""
+    return {
+        ADJ_CONCLUSION: conclusion,
+        CP_DIGEST: packet_digest,
+        ID: item_id,
+        VD_ISSUER: site,
+        KEY_VERSION: key_version,
+        ADJ_REASON: reason,
+        PBA_DECLARATION: statement,
+    }
+
+
+def _aggregate_prune_batch_one(
+    item: dict,
+    prune_policy_digest: str,
+    prune_threshold: int,
+    site_policy: dict,
+    keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Authenticate and authorize one prune adjudication batch in isolation.
+
+    Returns a fresh row carrying the fixed reason ``invalid``,
+    ``unauthenticated`` or ``unauthorized`` for a rejecting packet and
+    no trusted declaration, or a ``valid`` row whose declaration is the
+    packet's complete original-order item list (each entry's id, input
+    digest and full per-item verdict report), never just its final
+    status.  One packet's failure never affects the other packets.  An
+    ``invalid`` row (bad structure, a future moment, another prune
+    policy or a broken embedded binding) carries no identity; the
+    credential and authorization rejects keep the packet's parsed
+    issuer/key version, matching the adjudication taxonomy.
+    """
+    item_id = item[ID]
+    raw = item[PBA_PACKET]
+    packet_digest = hashlib.sha256(raw).hexdigest()
+
+    def invalid_row() -> dict:
+        return _prune_batch_aggregate_row(
+            item_id, packet_digest, None, None, None,
+            PA_CONCLUSION_INVALID, PA_CONCLUSION_INVALID,
+        )
+
+    try:
+        payload, signature = _parse_prune_adjudication_batch(raw)
+    except (TypeError, ValueError):
+        return invalid_row()
+
+    site = payload[VD_ISSUER]
+    key_version = payload[KEY_VERSION]
+
+    def reject_unauthenticated() -> dict:
+        return _prune_batch_aggregate_row(
+            item_id, packet_digest, site, key_version, None,
+            PA_CONCLUSION_INVALID, PA_REASON_UNAUTHENTICATED,
+        )
+
+    # --- Existing handover verification rules, in full -----------------
+    # A handover dated after the aggregation moment cannot yet be relied
+    # upon; like a structurally bad packet it is invalid.
+    if payload[CP_MOMENT] > moment:
+        return invalid_row()
+
+    # It must be bound to the exact original prune policy.
+    if payload[VD_POLICY_DIGEST] != prune_policy_digest:
+        return invalid_row()
+
+    # Every verified report carries the complete adjudication; re-derive
+    # each one's aggregate bindings against the prune policy purely from
+    # the signed bytes, exactly as verify_prune_adjudication_batch does,
+    # so a reordered row, a policy swap or a changed verdict cannot
+    # become a declaration.
+    try:
+        for bound_item in payload[PA_ITEMS]:
+            report = bound_item[RECEIPT_ITEM_REPORT]
+            if report[STATUS] != _VERIFY_VERIFIED:
+                continue
+            embedded = report[VERDICT_ITEM_RESULT]
+            if embedded[VD_POLICY_DIGEST] != prune_policy_digest:
+                return invalid_row()
+            _reconcile_prune_adjudication(embedded, prune_threshold)
+    except InvalidPruneAdjudicationError:
+        return invalid_row()
+
+    key_entry = None
+    for candidate in keyring.get(site, ()):
+        if candidate[VERSION] == key_version:
+            key_entry = candidate
+            break
+    if key_entry is None or key_entry[REVOKED]:
+        return reject_unauthenticated()
+    if moment < key_entry[NOT_BEFORE] or moment > key_entry[NOT_AFTER]:
+        return reject_unauthenticated()
+
+    expected_signature = hmac.new(
+        bytes.fromhex(key_entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        return reject_unauthenticated()
+
+    # --- Precise site/version authorization, with no fallback ----------
+    # The exact-issuer HMAC above established the site/version identity,
+    # so an authorized-policy miss may carry that identity on the row.
+    allowed_versions = site_policy[ADJ_SITES].get(site)
+    if allowed_versions is None or key_version not in allowed_versions:
+        return _prune_batch_aggregate_row(
+            item_id, packet_digest, site, key_version, None,
+            PA_CONCLUSION_INVALID, PA_REASON_UNAUTHORIZED,
+        )
+
+    return _prune_batch_aggregate_row(
+        item_id, packet_digest, site, key_version,
+        copy.deepcopy(payload[PA_ITEMS]), PA_CONCLUSION_VALID, None,
+    )
+
+
+def _validated_prune_batch_declaration(value: object, where: str) -> list:
+    """Structurally validate one site declaration bound into an aggregate.
+
+    The declaration is the handover's complete original-order item
+    list: each entry carries exactly ``id``, ``digest`` and the full
+    per-item verdict ``report`` -- never just a final status.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise TypeError(f"{where} must be a list or null")
+    return _validated_signed_batch_items(
+        value, _prune_batch_aggregate_invalid, where
+    )
+
+
+def _tally_prune_batch_rows(
+    rows: list[dict], threshold: int
+) -> tuple[str, list | None]:
+    """Mark duplicate/contradiction rows and derive the overall status.
+
+    Rows from one site are the same declaration only when their complete
+    authenticated original-order item list agrees field for field --
+    every entry's id, input digest and full per-item verdict report,
+    never just the final status.  The smallest-id packet of one
+    identical group is the vote and exact repeats are duplicates, while
+    distinct declarations from one site contradict each other.
+    Distinct sites must agree on that same complete declaration -- any
+    field-level disagreement conflicts and no majority can outvote it.
+
+    A conflict of either kind binds no declaration.  Otherwise the one
+    unique agreed declaration, when one exists, is always carried:
+    backed by at least the threshold of distinct sites the tally is
+    ``accepted``, and short of the threshold it stays ``insufficient``
+    but keeps that unique declaration.  With no valid vote at all the
+    tally is ``insufficient`` with the declaration null.
+    """
+    by_site: dict[str, dict[bytes, list[dict]]] = {}
+    for row in rows:
+        if row[ADJ_CONCLUSION] in (
+            PA_CONCLUSION_VALID,
+            PA_CONCLUSION_DUPLICATE,
+            PA_CONCLUSION_CONTRADICTION,
+        ):
+            content = _prune_compact(row[PBA_DECLARATION])
+            by_site.setdefault(row[VD_ISSUER], {}).setdefault(
+                content, []
+            ).append(row)
+
+    contradicted = False
+    votes: dict[str, bytes] = {}
+    representatives: dict[str, dict] = {}
+    for site, groups in by_site.items():
+        if len(groups) > 1:
+            contradicted = True
+            ordered_groups = sorted(
+                groups.values(),
+                key=lambda members: min(member[ID] for member in members),
+            )
+            for members in ordered_groups:
+                members.sort(key=lambda row: row[ID])
+                members[0][ADJ_CONCLUSION] = PA_CONCLUSION_CONTRADICTION
+                members[0][ADJ_REASON] = REASON_CONTRADICTION
+                for extra in members[1:]:
+                    extra[ADJ_CONCLUSION] = PA_CONCLUSION_DUPLICATE
+                    extra[ADJ_REASON] = REASON_DUPLICATE
+        else:
+            content, members = next(iter(groups.items()))
+            members.sort(key=lambda row: row[ID])
+            members[0][ADJ_CONCLUSION] = PA_CONCLUSION_VALID
+            members[0][ADJ_REASON] = None
+            for extra in members[1:]:
+                extra[ADJ_CONCLUSION] = PA_CONCLUSION_DUPLICATE
+                extra[ADJ_REASON] = REASON_DUPLICATE
+            votes[site] = content
+            representatives[site] = members[0]
+
+    contents = set(votes.values())
+    if contradicted or len(contents) > 1:
+        return PA_STATUS_CONFLICTED, None
+    if len(contents) == 1:
+        first_site = min(votes)
+        common_declaration = copy.deepcopy(
+            representatives[first_site][PBA_DECLARATION]
+        )
+        if len(votes) >= threshold:
+            return PA_STATUS_ACCEPTED, common_declaration
+        # Unique, conflict-free evidence short of the threshold keeps
+        # the one common declaration but cannot be accepted yet.
+        return PA_STATUS_INSUFFICIENT, common_declaration
+    return PA_STATUS_INSUFFICIENT, None
+
+
+def aggregate_prune_batches(
+    items, prune_policy, site_policy, keyring, moment, issuer, version
+):
+    """Aggregate multi-site signed prune adjudication handovers offline.
+
+    ``items`` is a non-empty list; each item contains exactly a unique,
+    non-empty str ``id`` and ``packet`` bytes produced by
+    :func:`sign_prune_adjudication_batch`; the whole batch structure is
+    validated before any packet is parsed.  ``prune_policy`` is the
+    original ``{"batch", "sites", "threshold"}`` pruning/adjudication
+    policy the handovers were issued against, ``site_policy`` carries
+    exactly ``sites`` (a non-empty mapping of each site allowed to hand
+    over results to its non-empty set of allowed positive key versions)
+    and ``threshold`` (a positive integer no greater than the site
+    count), ``keyring`` follows the :func:`apply_signed_remote` rules,
+    ``moment`` is the current time and ``issuer``/``version`` name the
+    aggregate signing credentials.  No file is read or written and no
+    input is modified.
+
+    Every packet is first authenticated on its own through the exact
+    :func:`verify_prune_adjudication_batch` rules -- canonical
+    structure, a signing moment no later than ``moment``, the exact
+    original prune policy digest, a full re-tally of every verified
+    embedded adjudication and an exact-issuer/version HMAC under a
+    currently usable key -- and then authorized by its exact signing
+    site and key version against ``site_policy`` with no fallback: a
+    structurally illegal packet, a future-dated handover, a packet
+    bound to another prune policy or one with a broken embedded
+    binding is recorded ``invalid`` with reason ``invalid`` (and
+    carries no identity), unknown, revoked, not-yet-valid or expired
+    credentials or a wrong signature ``unauthenticated``, and an
+    authenticated but unauthorized site or key version
+    ``unauthorized``, each rejecting only that item while the others
+    continue.  A valid packet counts as the issuing site's
+    declaration: the complete authenticated handover item list in its
+    full original order, every entry carrying its id, its input
+    adjudication digest and its full per-item verdict report, never
+    just a final status.  For one site, an exactly identical
+    declaration counts once and repeats are ``duplicate``; any
+    field-level difference is a ``contradiction``.  Distinct sites must
+    agree on that same complete declaration -- any difference makes the
+    aggregate ``conflicted``, the common declaration is bound null and
+    no majority can outvote the disagreement.  One unique declaration
+    backed by at least the threshold of distinct sites is ``accepted``;
+    short of the threshold it stays ``insufficient`` but still carries
+    that common declaration; with no valid vote the declaration is null.
+
+    The result is one canonical compact UTF-8 JSON object with
+    recursively sorted keys, non-ASCII preserved and no trailing byte,
+    carrying exactly ``payload`` and ``signature``.  The payload binds
+    exactly ``inputs`` (each input packet's SHA-256 in the original
+    input order, so a reordering is detectable), ``issuer``, ``items``
+    (the per-packet rows sorted stably by site then id, each carrying
+    ``conclusion``, the packet ``digest``, ``id``, ``issuer``,
+    ``keyVersion``, ``reason`` and the authenticated ``declaration`` or
+    null), ``keyVersion``, ``prunePolicyDigest`` (the SHA-256 of the
+    canonical original prune policy), ``sitePolicyDigest`` (the SHA-256
+    of the canonical site policy), ``declaration`` (the one common
+    complete original-order site declaration, or null), ``status`` and
+    ``version`` (the integer 1).  The signature is the lowercase hex
+    HMAC-SHA256 of the canonical compact payload bytes under the exact
+    issuer/version key.  A parameter, container or public field type
+    fault raises :class:`TypeError` (a :class:`bool` never poses as an
+    int); an empty list, an empty or duplicate id or an illegal policy,
+    threshold, moment, issuer or version raises :class:`ValueError`;
+    unknown, revoked, not-yet-valid or expired aggregate credentials
+    raise :class:`AuthenticationError`.
+    """
+    validated_items = _validated_prune_batch_items(items)
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
+    validated_keyring = _validated_keyring(keyring)
+    aggregate_moment = _fe_moment(moment, "moment")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+
+    prune_policy_digest = hashlib.sha256(
+        _verdict_policy_bytes(validated_prune_policy)
+    ).hexdigest()
+    rows = [
+        _aggregate_prune_batch_one(
+            item, prune_policy_digest,
+            validated_prune_policy[ADJ_THRESHOLD],
+            validated_site_policy, validated_keyring, aggregate_moment,
+        )
+        for item in validated_items
+    ]
+    input_digests = [row[CP_DIGEST] for row in rows]
+    status, common_declaration = _tally_prune_batch_rows(
+        rows, validated_site_policy[ADJ_THRESHOLD]
+    )
+    rows.sort(
+        key=lambda row: (
+            row[VD_ISSUER] is not None,
+            row[VD_ISSUER] or "",
+            row[ID],
+        )
+    )
+
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, aggregate_moment
+    )
+    payload = {
+        PBA_INPUTS: input_digests,
+        VD_ISSUER: issuer,
+        PA_ITEMS: rows,
+        KEY_VERSION: version,
+        PBA_PRUNE_POLICY_DIGEST: prune_policy_digest,
+        PBA_SITE_POLICY_DIGEST: hashlib.sha256(
+            _prune_batch_site_policy_bytes(validated_site_policy)
+        ).hexdigest(),
+        PBA_DECLARATION: common_declaration,
+        STATUS: status,
+        VERSION: PRUNE_BATCH_AGGREGATE_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+def _parse_prune_batch_aggregate(raw: object) -> tuple[dict, str]:
+    """Validate aggregate bytes structurally into ``(payload, signature)``.
+
+    A non-bytes argument or a public field of the wrong JSON type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, digest, ordering, row-shape or
+    statement-shape fault raises
+    :class:`InvalidPruneBatchAggregateError`.  The policy digests,
+    tally, moment and credential bindings are checked by
+    :func:`verify_prune_batch_aggregate`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("aggregate packet must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _prune_batch_aggregate_invalid(
+            "aggregate packet must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _prune_batch_aggregate_invalid(
+            "aggregate packet is not valid UTF-8"
+        ) from exc
+    try:
+        data = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_prune_batch_aggregate_keys,
+        )
+    except json.JSONDecodeError as exc:
+        raise _prune_batch_aggregate_invalid(
+            "aggregate packet is not valid JSON"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("aggregate packet must be a JSON object")
+    if set(data.keys()) != _PA_PACKET_KEYS:
+        raise _prune_batch_aggregate_invalid(
+            "aggregate packet must contain exactly the keys 'payload' and "
+            "'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("aggregate packet signature must be a str")
+    if _PRUNE_HEX64.fullmatch(signature) is None:
+        raise _prune_batch_aggregate_invalid(
+            "aggregate packet signature must be 64 lowercase hex characters"
+        )
+
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("aggregate packet payload must be an object")
+    if set(payload.keys()) != _PBA_PAYLOAD_KEYS:
+        raise _prune_batch_aggregate_invalid(
+            "aggregate packet payload must contain exactly the keys "
+            "'inputs', 'issuer', 'items', 'keyVersion', "
+            "'prunePolicyDigest', 'sitePolicyDigest', 'declaration', "
+            "'status' and 'version'"
+        )
+
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("aggregate payload issuer must be a str")
+    if issuer == "":
+        raise _prune_batch_aggregate_invalid(
+            "aggregate payload issuer must be a non-empty str"
+        )
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("aggregate payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _prune_batch_aggregate_invalid(
+            "aggregate payload keyVersion must be positive"
+        )
+    if not _prune_is_digest(payload[PBA_PRUNE_POLICY_DIGEST]):
+        raise _prune_batch_aggregate_invalid(
+            "aggregate prunePolicyDigest must be 64 lowercase hex characters"
+        )
+    if not _prune_is_digest(payload[PBA_SITE_POLICY_DIGEST]):
+        raise _prune_batch_aggregate_invalid(
+            "aggregate sitePolicyDigest must be 64 lowercase hex characters"
+        )
+    status = payload[STATUS]
+    if not isinstance(status, str):
+        raise TypeError("aggregate status must be a str")
+    if status not in _PA_STATUSES:
+        raise _prune_batch_aggregate_invalid(
+            "aggregate status is not a known status"
+        )
+    version = payload[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("aggregate payload version must be an int")
+    if version != PRUNE_BATCH_AGGREGATE_VERSION:
+        raise _prune_batch_aggregate_invalid(
+            "aggregate payload version must be the integer 1"
+        )
+
+    inputs = payload[PBA_INPUTS]
+    if not isinstance(inputs, list):
+        raise TypeError("aggregate inputs must be a list")
+    if not inputs:
+        raise _prune_batch_aggregate_invalid(
+            "aggregate inputs must be a non-empty list"
+        )
+    for position, digest in enumerate(inputs):
+        if not _prune_is_digest(digest):
+            raise _prune_batch_aggregate_invalid(
+                f"aggregate input {position} digest must be 64 lowercase hex "
+                "characters"
+            )
+
+    rows = payload[PA_ITEMS]
+    if not isinstance(rows, list):
+        raise TypeError("aggregate items must be a list")
+    if not rows:
+        raise _prune_batch_aggregate_invalid(
+            "aggregate items must be a non-empty list"
+        )
+    if len(rows) != len(inputs):
+        raise _prune_batch_aggregate_invalid(
+            "the items must cover every input and vice versa"
+        )
+    seen_row_ids: set[str] = set()
+    parsed_rows: list[dict] = []
+    for position, row in enumerate(rows):
+        where = f"aggregate item {position}"
+        if not isinstance(row, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(row.keys()) != _PBA_ROW_KEYS:
+            raise _prune_batch_aggregate_invalid(
+                f"{where} must contain exactly the keys 'conclusion', "
+                "'digest', 'id', 'issuer', 'keyVersion', 'reason' and "
+                "'declaration'"
+            )
+        row_id = row[ID]
+        if not isinstance(row_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if row_id == "":
+            raise _prune_batch_aggregate_invalid(
+                f"{where} id must be non-empty"
+            )
+        if row_id in seen_row_ids:
+            raise _prune_batch_aggregate_invalid(f"{where} repeats an id")
+        seen_row_ids.add(row_id)
+        digest = row[CP_DIGEST]
+        if not _prune_is_digest(digest):
+            raise _prune_batch_aggregate_invalid(
+                f"{where} digest must be 64 lowercase hex characters"
+            )
+        site = row[VD_ISSUER]
+        if site is not None and not isinstance(site, str):
+            raise TypeError(f"{where} issuer must be a str or null")
+        if site == "":
+            raise _prune_batch_aggregate_invalid(
+                f"{where} issuer must be non-empty"
+            )
+        row_key_version = row[KEY_VERSION]
+        if isinstance(row_key_version, bool) or not isinstance(
+            row_key_version, int
+        ):
+            if row_key_version is not None:
+                raise TypeError(f"{where} keyVersion must be an int or null")
+        elif row_key_version <= 0:
+            raise _prune_batch_aggregate_invalid(
+                f"{where} keyVersion must be positive"
+            )
+        if (site is None) != (row_key_version is None):
+            raise _prune_batch_aggregate_invalid(
+                f"{where} issuer and keyVersion must be null together"
+            )
+        conclusion = row[ADJ_CONCLUSION]
+        if not isinstance(conclusion, str):
+            raise TypeError(f"{where} conclusion must be a str")
+        reason = row[ADJ_REASON]
+        if conclusion == PA_CONCLUSION_VALID:
+            if reason is not None:
+                raise _prune_batch_aggregate_invalid(
+                    f"{where} reason must be null for a valid row"
+                )
+        elif conclusion == PA_CONCLUSION_INVALID:
+            if reason not in _PBA_INVALID_REASONS:
+                raise _prune_batch_aggregate_invalid(
+                    f"{where} reason must be one of 'invalid', "
+                    "'unauthenticated' or 'unauthorized'"
+                )
+        elif conclusion in (
+            PA_CONCLUSION_DUPLICATE, PA_CONCLUSION_CONTRADICTION
+        ):
+            expected = (
+                REASON_DUPLICATE
+                if conclusion == PA_CONCLUSION_DUPLICATE
+                else REASON_CONTRADICTION
+            )
+            if reason != expected:
+                raise _prune_batch_aggregate_invalid(
+                    f"{where} reason must match its conclusion"
+                )
+        else:
+            raise _prune_batch_aggregate_invalid(
+                f"{where} conclusion is not known"
+            )
+        identity_present = reason != PA_CONCLUSION_INVALID
+        if identity_present:
+            if site is None:
+                raise _prune_batch_aggregate_invalid(
+                    f"{where} an authenticated or authorized row must carry "
+                    "its issuer"
+                )
+        elif site is not None:
+            raise _prune_batch_aggregate_invalid(
+                f"{where} an invalid row must carry no issuer"
+            )
+        raw_declaration = row[PBA_DECLARATION]
+        if conclusion == PA_CONCLUSION_INVALID:
+            if raw_declaration is not None:
+                raise _prune_batch_aggregate_invalid(
+                    f"{where} an invalid row must carry no declaration"
+                )
+            parsed_declaration = None
+        else:
+            parsed_declaration = _validated_prune_batch_declaration(
+                raw_declaration, f"{where} declaration"
+            )
+        parsed_rows.append({
+            ADJ_CONCLUSION: conclusion,
+            CP_DIGEST: digest,
+            ID: row_id,
+            VD_ISSUER: site,
+            KEY_VERSION: row_key_version,
+            ADJ_REASON: reason,
+            PBA_DECLARATION: parsed_declaration,
+        })
+
+    common_declaration = _validated_prune_batch_declaration(
+        payload[PBA_DECLARATION], "aggregate declaration"
+    )
+
+    normalized_payload = {
+        PBA_INPUTS: [d for d in inputs],
+        VD_ISSUER: issuer,
+        PA_ITEMS: parsed_rows,
+        KEY_VERSION: key_version,
+        PBA_PRUNE_POLICY_DIGEST: payload[PBA_PRUNE_POLICY_DIGEST],
+        PBA_SITE_POLICY_DIGEST: payload[PBA_SITE_POLICY_DIGEST],
+        PBA_DECLARATION: common_declaration,
+        STATUS: status,
+        VERSION: PRUNE_BATCH_AGGREGATE_VERSION,
+    }
+    if _prune_compact({TICKET_PAYLOAD: normalized_payload,
+                       SIGNATURE: signature}) != raw:
+        raise _prune_batch_aggregate_invalid(
+            "aggregate packet encoding is not the canonical compact form"
+        )
+    return normalized_payload, signature
+
+
+def _reconcile_prune_batch_aggregate(payload: dict, threshold: int) -> None:
+    """Re-derive every aggregate binding of a parsed aggregate payload.
+
+    Re-tallies the per-packet rows the signature covers -- the
+    original-order input digest bindings, row ordering, same-site
+    duplicate and contradiction markings, cross-site declaration
+    agreement, the threshold acceptance and the claimed common
+    declaration and status -- without seeing any packet bytes.  Any
+    mismatch raises :class:`InvalidPruneBatchAggregateError`.
+    """
+    rows = payload[PA_ITEMS]
+    inputs = payload[PBA_INPUTS]
+
+    expected_order = sorted(
+        rows,
+        key=lambda row: (
+            row[VD_ISSUER] is not None,
+            row[VD_ISSUER] or "",
+            row[ID],
+        ),
+    )
+    if [row[ID] for row in expected_order] != [row[ID] for row in rows]:
+        raise _prune_batch_aggregate_invalid(
+            "items must be sorted by issuer then id"
+        )
+    if sorted(row[CP_DIGEST] for row in rows) != sorted(inputs):
+        raise _prune_batch_aggregate_invalid(
+            "the bound input digests must equal the per-item digests"
+        )
+
+    # Deep-copy the parsed rows before the tally mutates their
+    # conclusion/reason markings; the signed payload itself is compared
+    # through freshly derived structures only.
+    working_rows = copy.deepcopy(rows)
+    derived_status, derived_declaration = _tally_prune_batch_rows(
+        working_rows, threshold
+    )
+
+    for expected_row, bound_row in zip(working_rows, rows):
+        if expected_row[ADJ_CONCLUSION] != bound_row[ADJ_CONCLUSION]:
+            raise _prune_batch_aggregate_invalid(
+                f"item {bound_row[ID]!r} has the wrong conclusion"
+            )
+        if expected_row[ADJ_REASON] != bound_row[ADJ_REASON]:
+            raise _prune_batch_aggregate_invalid(
+                f"item {bound_row[ID]!r} has the wrong reason"
+            )
+
+    if payload[STATUS] != derived_status:
+        raise _prune_batch_aggregate_invalid(
+            "the bound status does not match the tallied items"
+        )
+    bound_declaration = payload[PBA_DECLARATION]
+    if derived_declaration is None:
+        if bound_declaration is not None:
+            raise _prune_batch_aggregate_invalid(
+                "the common declaration must be null when no unique "
+                "conflict-free declaration was tallied"
+            )
+    else:
+        if bound_declaration is None:
+            raise _prune_batch_aggregate_invalid(
+                "an aggregate over one unique conflict-free declaration "
+                "must carry the common declaration"
+            )
+        normalized_bound = _validated_prune_batch_declaration(
+            bound_declaration, "aggregate declaration"
+        )
+        if normalized_bound != derived_declaration:
+            raise _prune_batch_aggregate_invalid(
+                "the bound common declaration does not match the tallied "
+                "packets"
+            )
+
+
+def verify_prune_batch_aggregate(
+    aggregate, prune_policy, site_policy, keyring, moment
+):
+    """Verify a signed cross-site prune batch aggregate entirely offline.
+
+    Only the aggregate bytes, the expected original ``prune_policy``,
+    the expected ``site_policy``, the current ``keyring`` and the
+    verification ``moment`` are consulted -- no file is read or written
+    and no argument is modified.  Verification validates the canonical
+    encoding and every key set, recomputes both policy digests, and
+    re-tallies the bound per-packet rows purely from the signed payload:
+    the original-order input digest bindings, the issuer/id row
+    ordering, same-site duplicate and contradiction markings,
+    cross-site declaration agreement (the complete original-order
+    declarations, not just their final statuses), the threshold outcome
+    and the claimed common declaration, together with a full structural
+    re-tally of every verified adjudication embedded in each bound
+    declaration against the original prune policy.  It then checks the
+    HMAC-SHA256 against the key the *current* keyring binds to the
+    payload's exact issuer and version, usable at the verification
+    moment, so a later revocation or expiry rejects the aggregate with
+    no fallback.
+
+    On success a fresh dict equal to the authenticated payload
+    (``inputs``, ``issuer``, ``items``, ``keyVersion``,
+    ``prunePolicyDigest``, ``sitePolicyDigest``, ``declaration``,
+    ``status`` and ``version``) is returned -- repeated calls return
+    equal but mutually independent objects sharing no mutable
+    structure.  A non-bytes aggregate or a public field of the wrong
+    type raises :class:`TypeError` (a :class:`bool` never poses as an
+    int); an illegal policy, keyring or moment raises
+    :class:`ValueError`; an illegal encoding, key set, digest, ordering,
+    tally or declaration binding raises
+    :class:`InvalidPruneBatchAggregateError` (a :class:`ValueError`
+    subclass); unknown, revoked, not-yet-valid or expired credentials
+    or a signature mismatch raise :class:`AuthenticationError`.
+    """
+    if not isinstance(aggregate, bytes):
+        raise TypeError("aggregate packet must be bytes")
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+
+    payload, signature = _parse_prune_batch_aggregate(aggregate)
+    expected_prune_digest = hashlib.sha256(
+        _verdict_policy_bytes(validated_prune_policy)
+    ).hexdigest()
+    if payload[PBA_PRUNE_POLICY_DIGEST] != expected_prune_digest:
+        raise _prune_batch_aggregate_invalid(
+            "prune policy digest does not match the prune policy"
+        )
+    expected_site_digest = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_site_policy)
+    ).hexdigest()
+    if payload[PBA_SITE_POLICY_DIGEST] != expected_site_digest:
+        raise _prune_batch_aggregate_invalid(
+            "site policy digest does not match the site policy"
+        )
+
+    _reconcile_prune_batch_aggregate(
+        payload, validated_site_policy[ADJ_THRESHOLD]
+    )
+
+    # Every counted row carries the complete original-order
+    # declaration; re-derive the embedded per-item adjudications of each
+    # verified report against the original prune policy purely from the
+    # signed bytes, so a reordered entry, a changed verdict or a swapped
+    # common declaration cannot hide behind a valid outer HMAC.
+    threshold = validated_prune_policy[ADJ_THRESHOLD]
+    for position, row in enumerate(payload[PA_ITEMS]):
+        declaration = row[PBA_DECLARATION]
+        if declaration is None:
+            continue
+        for entry_position, bound_item in enumerate(declaration):
+            report = bound_item[RECEIPT_ITEM_REPORT]
+            if report[STATUS] != _VERIFY_VERIFIED:
+                continue
+            embedded = report[VERDICT_ITEM_RESULT]
+            if embedded[VD_POLICY_DIGEST] != expected_prune_digest:
+                raise _prune_batch_aggregate_invalid(
+                    f"aggregate item {position} declaration entry "
+                    f"{entry_position} is bound to another prune policy"
+                )
+            try:
+                _reconcile_prune_adjudication(embedded, threshold)
+            except InvalidPruneAdjudicationError as exc:
+                raise _prune_batch_aggregate_invalid(str(exc)) from exc
+
+    entry = _usable_checkpoint_key(
+        validated_keyring,
+        payload[VD_ISSUER],
+        payload[KEY_VERSION],
+        verify_moment,
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "prune batch aggregate signature does not match"
         )
     return copy.deepcopy(payload)
