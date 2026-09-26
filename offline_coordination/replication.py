@@ -19416,7 +19416,11 @@ def _tally_prune_rows(
     group is the vote and exact repeats are duplicates, while distinct
     contents from one site contradict each other.  Distinct sites must
     agree on that same complete content -- any report or bound digest
-    disagreement conflicts and no majority can outvote it.
+    disagreement conflicts and no majority can outvote it.  A unique
+    agreed content is ``accepted`` at the threshold and otherwise
+    ``insufficient``, either way carrying the one common report; only a
+    contradiction, a cross-site disagreement or the absence of any valid
+    vote leaves the common report null.
     """
     by_site: dict[str, dict[bytes, list[dict]]] = {}
     for row in rows:
@@ -19461,12 +19465,14 @@ def _tally_prune_rows(
     contents = set(votes.values())
     if contradicted or len(contents) > 1:
         return PA_STATUS_CONFLICTED, None
-    if len(contents) == 1 and len(votes) >= threshold:
+    if len(contents) == 1:
         first_site = min(votes)
-        return (
-            PA_STATUS_ACCEPTED,
-            _common_prune_report(representatives[first_site][PA_ENTRIES]),
-        )
+        common = _common_prune_report(representatives[first_site][PA_ENTRIES])
+        if len(votes) >= threshold:
+            return PA_STATUS_ACCEPTED, common
+        # Valid votes agree on one content but do not reach the
+        # threshold: the unique common report is still retained.
+        return PA_STATUS_INSUFFICIENT, common
     return PA_STATUS_INSUFFICIENT, None
 
 
@@ -19500,8 +19506,10 @@ def adjudicate_prune_attestations(
     majority can outvote.  A unique content backed by at least the
     threshold of distinct sites is ``accepted`` (carrying the one
     common complete report); a contradiction or disagreement is
-    ``conflicted``; every other case is ``insufficient`` with the
-    common report null.
+    ``conflicted`` with the common report null; a unique content below
+    the threshold is ``insufficient`` and still carries the one common
+    report, while only the absence of any valid vote leaves
+    ``insufficient`` with the common report null.
 
     The result is one canonical compact UTF-8 JSON object with
     recursively sorted keys, non-ASCII preserved and no trailing byte,
@@ -19662,6 +19670,25 @@ def _parse_prune_adjudication(raw: object) -> tuple[dict, str]:
             "adjudication signature must be 64 lowercase hex characters"
         )
     payload = data[TICKET_PAYLOAD]
+    _validated_prune_adjudication_payload(payload)
+    if _prune_compact(data) != raw:
+        raise _prune_adjudication_invalid(
+            "adjudication encoding is not the canonical compact form"
+        )
+    return payload, signature
+
+
+def _validated_prune_adjudication_payload(payload: object) -> None:
+    """Validate one adjudication payload's complete structure in place.
+
+    Shared by :func:`_parse_prune_adjudication` (which owns the packet
+    envelope and canonical-encoding checks) and the signed batch
+    handover, where a verified report binds this exact payload shape as
+    its result.  A field of the wrong JSON type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    key-set, version, digest, ordering or row-shape fault raises
+    :class:`InvalidPruneAdjudicationError`.
+    """
     if not isinstance(payload, dict):
         raise TypeError("adjudication payload must be an object")
     if set(payload.keys()) != _PAD_PAYLOAD_KEYS:
@@ -19855,13 +19882,7 @@ def _parse_prune_adjudication(raw: object) -> tuple[dict, str]:
             ADJ_SITE: site,
         })
 
-    common_report = _validated_bound_common_report(payload[PA_REPORT])
-
-    if _prune_compact(data) != raw:
-        raise _prune_adjudication_invalid(
-            "adjudication encoding is not the canonical compact form"
-        )
-    return payload, signature
+    _validated_bound_common_report(payload[PA_REPORT])
 
 
 def _reconcile_prune_adjudication(payload: dict, threshold: int) -> str:
@@ -19921,12 +19942,14 @@ def _reconcile_prune_adjudication(payload: dict, threshold: int) -> str:
     if derived_report is None:
         if bound_report is not None:
             raise _prune_adjudication_invalid(
-                "the common report must be null unless accepted"
+                "the common report must be null when no unique content "
+                "is tallied"
             )
     else:
         if bound_report is None:
             raise _prune_adjudication_invalid(
-                "an accepted adjudication must carry the common report"
+                "an adjudication tallying a unique content must carry "
+                "the common report"
             )
         normalized_bound = _validated_bound_common_report(bound_report)
         if normalized_bound != derived_report:
@@ -19935,6 +19958,47 @@ def _reconcile_prune_adjudication(payload: dict, threshold: int) -> str:
                 "attestations"
             )
     return derived_status
+
+
+def _verify_prune_adjudication(
+    adjudication: bytes,
+    validated_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one prune adjudication against already-validated inputs.
+
+    Shared core of :func:`verify_prune_adjudication` and the batch
+    :func:`verify_prune_adjudications`; the caller owns the
+    argument-type and shared-material validation.
+    """
+    payload, signature = _parse_prune_adjudication(adjudication)
+    expected_policy_digest = hashlib.sha256(
+        _verdict_policy_bytes(validated_policy)
+    ).hexdigest()
+    if payload[VD_POLICY_DIGEST] != expected_policy_digest:
+        raise _prune_adjudication_invalid(
+            "policy digest does not match the policy"
+        )
+
+    _reconcile_prune_adjudication(
+        payload, validated_policy[ADJ_THRESHOLD]
+    )
+
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION],
+        moment,
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "prune adjudication signature does not match"
+        )
+    return copy.deepcopy(payload)
 
 
 def verify_prune_adjudication(adjudication, policy, keyring, moment):
@@ -19969,19 +20033,509 @@ def verify_prune_adjudication(adjudication, policy, keyring, moment):
     validated_policy = _validated_adjudication_policy(policy)
     validated_keyring = _validated_keyring(keyring)
     verify_moment = _fe_moment(moment, "moment")
+    return _verify_prune_adjudication(
+        adjudication, validated_policy, validated_keyring, verify_moment
+    )
 
-    payload, signature = _parse_prune_adjudication(adjudication)
+
+# --- Batch verification of prune adjudications and its signed handover --------
+
+PRUNE_ADJUDICATIONS_VERSION = CHAIN_PRUNE_VERSION
+PRUNE_ADJUDICATION_BATCH_VERSION = CHAIN_PRUNE_VERSION
+
+PAB_ADJUDICATION = "adjudication"
+
+_PRUNE_ADJUDICATION_ITEM_KEYS = frozenset((ID, PAB_ADJUDICATION))
+
+_PAB_PACKET_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_PAB_PAYLOAD_KEYS = frozenset((
+    VD_ISSUER,
+    ITEMS,
+    KEY_VERSION,
+    CP_MOMENT,
+    VD_POLICY_DIGEST,
+    VERSION,
+))
+_PAB_ITEM_KEYS = frozenset((CP_DIGEST, ID, RECEIPT_ITEM_REPORT))
+
+
+def _validated_prune_adjudication_items(items: object) -> list[dict]:
+    """Validate the adjudication-verification batch before any packet is read.
+
+    Each item holds exactly a batch-unique non-empty ``id`` and the
+    ``adjudication`` bytes.  Container, element or field type faults
+    raise :class:`TypeError`; an empty list, an empty or duplicate id
+    or a wrong key set raises :class:`ValueError`.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _PRUNE_ADJUDICATION_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'adjudication' "
+                "and 'id'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen.add(item_id)
+        adjudication = item[PAB_ADJUDICATION]
+        if not isinstance(adjudication, bytes):
+            raise TypeError(f"{where} adjudication must be bytes")
+        validated.append({ID: item_id, PAB_ADJUDICATION: adjudication})
+    return validated
+
+
+def _verify_prune_adjudication_item(
+    item: dict,
+    validated_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one prune adjudication in isolation and report its outcome."""
+    item_id = item[ID]
+    try:
+        result = _verify_prune_adjudication(
+            item[PAB_ADJUDICATION],
+            validated_policy,
+            validated_keyring,
+            moment,
+        )
+    except AuthenticationError as exc:
+        return _prune_receipt_report(
+            item_id, VERIFY_UNAUTHENTICATED, str(exc), None
+        )
+    except (InvalidPruneAdjudicationError, TypeError) as exc:
+        # A TypeError here can only come from a wrong JSON field type
+        # inside the adjudication; the public argument types were
+        # validated before the batch ran.
+        return _prune_receipt_report(
+            item_id, _PRUNE_RECEIPT_VERIFY_INVALID, str(exc), None
+        )
+    return _prune_receipt_report(item_id, _VERIFY_VERIFIED, None, result)
+
+
+def verify_prune_adjudications(items, policy, keyring, moment):
+    """Verify a batch of signed prune adjudications entirely offline.
+
+    ``items`` is a non-empty list; each item is a dict with exactly the
+    keys ``id`` (a non-empty str, unique across the batch) and
+    ``adjudication`` (the signed adjudication bytes
+    :func:`adjudicate_prune_attestations` produced).  ``policy`` is the
+    same ``{"batch", "sites", "threshold"}`` object the adjudications
+    were decided under, ``keyring`` follows the
+    :func:`apply_signed_remote` rules and ``moment`` is the current
+    non-negative integer time.  No file is read or written and no
+    argument is modified.
+
+    The whole batch structure, policy, keyring and moment are validated
+    before any adjudication is parsed: container, element or field type
+    faults raise :class:`TypeError` (a :class:`bool` never poses as an
+    int) and an empty list, an empty or duplicate id, a wrong item key
+    set or an illegal shared input raises :class:`ValueError`.  Only
+    these batch-level faults raise -- one item's failure never stops
+    later items or changes an earlier report.
+
+    Each adjudication is then re-checked in input order and in
+    isolation through the exact :func:`verify_prune_adjudication`
+    rules.  Unknown, revoked, not-yet-valid or expired credentials and
+    any wrong signature make the item ``unauthenticated``; an illegal
+    encoding, key set, version, digest, ordering, tally or binding
+    makes it ``invalid``; a passing adjudication is ``verified``.
+
+    The result is a fresh dict with the fixed keys ``items`` and
+    ``version`` (the integer 1).  Each report preserves input order and
+    carries, in this key order, ``error`` (``None`` when verified,
+    otherwise a definite non-empty message), ``id``, ``result`` (a
+    fresh single-entry result when verified, otherwise ``None``) and
+    ``status``.  Repeated calls return equal but independent results.
+    """
+    validated_items = _validated_prune_adjudication_items(items)
+    validated_policy = _validated_adjudication_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    return {
+        ITEMS: [
+            _verify_prune_adjudication_item(
+                item, validated_policy, validated_keyring, verify_moment
+            )
+            for item in validated_items
+        ],
+        VERSION: PRUNE_ADJUDICATIONS_VERSION,
+    }
+
+
+class InvalidPruneAdjudicationBatchError(ValueError):
+    """A signed prune adjudication batch breaks its canonical contract."""
+
+
+def _prune_adjudication_batch_invalid(
+    message: str,
+) -> InvalidPruneAdjudicationBatchError:
+    return InvalidPruneAdjudicationBatchError(
+        f"invalid prune adjudication batch: {message}"
+    )
+
+
+def _validated_prune_adjudication_batch_report(
+    report: object, item_id: str, where: str
+) -> None:
+    """Validate one adjudication verification report bound into a batch item.
+
+    The report must follow the public :func:`verify_prune_adjudications`
+    item shape -- ``error``, ``id``, ``result`` and ``status`` -- with
+    ``error`` null and a complete adjudication payload bound as
+    ``result`` exactly when ``verified``, and its ``id`` must equal the
+    batch item's ``id``, keeping the positional binding between the
+    ordered items and their reports.  A field of the wrong type raises
+    :class:`TypeError`; every key-set, value-format or binding fault
+    raises :class:`InvalidPruneAdjudicationBatchError`.
+    """
+    if not isinstance(report, dict):
+        raise TypeError(f"{where} report must be an object")
+    if set(report.keys()) != _PA_REPORT_KEYS:
+        raise _prune_adjudication_batch_invalid(
+            f"{where} report must contain exactly the keys 'error', 'id', "
+            "'result' and 'status'"
+        )
+    report_id = report[ID]
+    if not isinstance(report_id, str):
+        raise TypeError(f"{where} report id must be a str")
+    if report_id == "":
+        raise _prune_adjudication_batch_invalid(
+            f"{where} report id must be a non-empty str"
+        )
+    if report_id != item_id:
+        raise _prune_adjudication_batch_invalid(
+            f"{where} report id does not match the item id"
+        )
+    status = report[STATUS]
+    if not isinstance(status, str):
+        raise TypeError(f"{where} report status must be a str")
+    if status not in _PA_VERIFY_STATUSES:
+        raise _prune_adjudication_batch_invalid(
+            f"{where} report status is not a known status"
+        )
+    error = report[PRUNE_ERROR]
+    result = report[VERDICT_ITEM_RESULT]
+    if status == _VERIFY_VERIFIED:
+        if error is not None:
+            raise _prune_adjudication_batch_invalid(
+                f"{where} report error must be null when verified"
+            )
+        try:
+            _validated_prune_adjudication_payload(result)
+        except InvalidPruneAdjudicationError as exc:
+            raise _prune_adjudication_batch_invalid(
+                f"{where} report result is not a valid adjudication "
+                f"payload: {exc}"
+            ) from exc
+    else:
+        if not isinstance(error, str):
+            raise TypeError(
+                f"{where} report error must be a str for a failure"
+            )
+        if error == "":
+            raise _prune_adjudication_batch_invalid(
+                f"{where} report error must be a non-empty str for a "
+                "failure"
+            )
+        if result is not None:
+            raise _prune_adjudication_batch_invalid(
+                f"{where} report result must be null for a failure"
+            )
+
+
+def _parse_prune_adjudication_batch(raw: object) -> tuple[dict, str]:
+    """Validate batch bytes structurally into ``(payload, signature)``.
+
+    A non-bytes argument or a public field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, digest, report-shape or canonical-form
+    fault raises :class:`InvalidPruneAdjudicationBatchError`.  The
+    policy, moment, credential and signature bindings are checked by
+    :func:`verify_prune_adjudication_batch`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("batch must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _prune_adjudication_batch_invalid(
+            "batch must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _prune_adjudication_batch_invalid(
+            "batch is not valid UTF-8"
+        ) from exc
+
+    def reject_duplicates(pairs: list[tuple]) -> dict:
+        result: dict = {}
+        for key, value in pairs:
+            if key in result:
+                raise _prune_adjudication_batch_invalid(
+                    f"duplicate key {key!r} in object"
+                )
+            result[key] = value
+        return result
+
+    try:
+        data = json.loads(text, object_pairs_hook=reject_duplicates)
+    except json.JSONDecodeError as exc:
+        raise _prune_adjudication_batch_invalid(
+            "batch is not valid JSON"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("batch must be a JSON object")
+    if set(data.keys()) != _PAB_PACKET_KEYS:
+        raise _prune_adjudication_batch_invalid(
+            "batch must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("batch signature must be a str")
+    if _PRUNE_HEX64.fullmatch(signature) is None:
+        raise _prune_adjudication_batch_invalid(
+            "batch signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("batch payload must be an object")
+    if set(payload.keys()) != _PAB_PAYLOAD_KEYS:
+        raise _prune_adjudication_batch_invalid(
+            "batch payload must contain exactly the keys 'issuer', "
+            "'items', 'keyVersion', 'moment', 'policyDigest' and 'version'"
+        )
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("batch payload issuer must be a str")
+    if issuer == "":
+        raise _prune_adjudication_batch_invalid(
+            "batch payload issuer must be a non-empty str"
+        )
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("batch payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _prune_adjudication_batch_invalid(
+            "batch payload keyVersion must be positive"
+        )
+    moment = payload[CP_MOMENT]
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("batch payload moment must be an int")
+    if moment < 0:
+        raise _prune_adjudication_batch_invalid(
+            "batch payload moment must be non-negative"
+        )
+    if not _prune_is_digest(payload[VD_POLICY_DIGEST]):
+        raise _prune_adjudication_batch_invalid(
+            "batch payload policyDigest must be 64 lowercase hex "
+            "characters"
+        )
+    version = payload[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("batch payload version must be an int")
+    if version != PRUNE_ADJUDICATION_BATCH_VERSION:
+        raise _prune_adjudication_batch_invalid(
+            "batch payload version must be the integer 1"
+        )
+    items = payload[ITEMS]
+    if not isinstance(items, list):
+        raise TypeError("batch payload items must be a list")
+    if not items:
+        raise _prune_adjudication_batch_invalid(
+            "batch payload items must be non-empty"
+        )
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(item.keys()) != _PAB_ITEM_KEYS:
+            raise _prune_adjudication_batch_invalid(
+                f"{where} must contain exactly the keys 'digest', 'id' "
+                "and 'report'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise _prune_adjudication_batch_invalid(
+                f"{where} id must be a non-empty str"
+            )
+        if item_id in seen_ids:
+            raise _prune_adjudication_batch_invalid(
+                f"{where} repeats an id"
+            )
+        seen_ids.add(item_id)
+        if not _prune_is_digest(item[CP_DIGEST]):
+            raise _prune_adjudication_batch_invalid(
+                f"{where} digest must be 64 lowercase hex characters"
+            )
+        _validated_prune_adjudication_batch_report(
+            item[RECEIPT_ITEM_REPORT], item_id, where
+        )
+
+    if _prune_compact(data) != raw:
+        raise _prune_adjudication_batch_invalid(
+            "batch encoding is not the canonical compact form"
+        )
+    return payload, signature
+
+
+def sign_prune_adjudication_batch(
+    items, policy, keyring, moment, issuer, version
+):
+    """Sign a prune adjudication batch verification into a handover package.
+
+    ``items`` is the same non-empty list of ``{"id", "adjudication"}``
+    dicts :func:`verify_prune_adjudications` takes; ``policy`` is the
+    same ``{"batch", "sites", "threshold"}`` object the adjudications
+    were decided under, ``keyring`` follows the
+    :func:`apply_signed_remote` rules, ``moment`` is the signing time
+    and ``issuer``/``version`` name the signing credentials.  No file
+    is read or written and no argument is modified.
+
+    The batch runs through the exact :func:`verify_prune_adjudications`
+    rules: batch-level faults raise directly (container, element or
+    public field type faults raise :class:`TypeError` -- a
+    :class:`bool` never poses as an int -- and an empty list, an empty
+    or duplicate id, a wrong item key set, an empty issuer or a
+    non-positive version raises :class:`ValueError`), while one
+    adjudication's failure never stops the batch and is recorded in
+    that item's report with its original status, definite error text
+    and a null ``result`` -- no identity, project or prune boundary is
+    ever filled in from unauthenticated content.
+
+    The package is one canonical compact UTF-8 JSON object -- every
+    object key recursively sorted, non-ASCII preserved, no trailing
+    newline or any other trailing byte -- carrying exactly ``payload``
+    and ``signature``.  The payload binds exactly ``issuer``,
+    ``items``, ``keyVersion``, ``moment``, ``policyDigest`` (the
+    lowercase hex SHA-256 of the canonical compact policy encoding:
+    sites ascending, each site's versions an ascending array) and
+    ``version`` (the integer 1).  Each payload item, in the original
+    input order with no sorting, deduplication or replacement, carries
+    exactly ``digest`` (the lowercase hex SHA-256 of that item's
+    original adjudication bytes), ``id`` and ``report`` (that item's
+    batch verification report, bound verbatim).  ``signature`` is the
+    lowercase hex HMAC-SHA256 of the canonical compact payload bytes
+    under the key the keyring binds to the exact issuer and version,
+    with no fallback; unknown, revoked, not-yet-valid or expired
+    credentials raise :class:`AuthenticationError`.
+    """
+    validated_items = _validated_prune_adjudication_items(items)
+    validated_policy = _validated_adjudication_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    sign_moment = _fe_moment(moment, "moment")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+
+    entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, sign_moment
+    )
+    reports = [
+        _verify_prune_adjudication_item(
+            item, validated_policy, validated_keyring, sign_moment
+        )
+        for item in validated_items
+    ]
+    batch_items = [
+        {
+            ID: item[ID],
+            CP_DIGEST: hashlib.sha256(item[PAB_ADJUDICATION]).hexdigest(),
+            RECEIPT_ITEM_REPORT: report,
+        }
+        for item, report in zip(validated_items, reports)
+    ]
+    payload = {
+        VD_ISSUER: issuer,
+        ITEMS: batch_items,
+        KEY_VERSION: version,
+        CP_MOMENT: sign_moment,
+        VD_POLICY_DIGEST: hashlib.sha256(
+            _verdict_policy_bytes(validated_policy)
+        ).hexdigest(),
+        VERSION: PRUNE_ADJUDICATION_BATCH_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+def verify_prune_adjudication_batch(batch, policy, keyring, moment):
+    """Verify a signed prune adjudication batch entirely offline.
+
+    Only the batch bytes, the expected ``policy``, the current
+    ``keyring`` and the verification ``moment`` are consulted -- no
+    file is read or written and no argument is modified.  Verification
+    recomputes the policy digest over the canonical compact policy
+    encoding and the HMAC-SHA256 signature over the canonical compact
+    payload bytes, and checks the payload structure, the item order
+    (each report's ``id`` must match its item's ``id``), every bound
+    digest, every report's shape -- a verified report's ``result``
+    must itself be a complete adjudication payload, and a failed
+    report keeps its error and a null result -- and the moment
+    binding: a batch whose signing moment is later than the
+    verification moment is rejected.  The key is the one the *current*
+    keyring binds to the payload's exact issuer and version, usable at
+    the verification moment, so a later revocation or expiry rejects
+    the batch just as it does a replay.
+
+    A non-bytes batch or a public field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); an
+    invalid policy, keyring or moment raises :class:`ValueError`; an
+    illegal encoding, a future moment, a duplicate id, a tampered
+    report or any other key-set, version, digest or binding fault
+    raises :class:`InvalidPruneAdjudicationBatchError` (a
+    :class:`ValueError` subclass); and unknown, revoked, not-yet-valid
+    or expired credentials or a signature mismatch raise
+    :class:`AuthenticationError`.
+
+    The result is a fresh deep copy of the authenticated payload with
+    the fixed keys ``issuer``, ``items``, ``keyVersion``, ``moment``,
+    ``policyDigest`` and ``version``; repeated calls return equal but
+    mutually independent results that share no mutable object.
+    """
+    if not isinstance(batch, bytes):
+        raise TypeError("batch must be bytes")
+    validated_policy = _validated_adjudication_policy(policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+
+    payload, signature = _parse_prune_adjudication_batch(batch)
     expected_policy_digest = hashlib.sha256(
         _verdict_policy_bytes(validated_policy)
     ).hexdigest()
     if payload[VD_POLICY_DIGEST] != expected_policy_digest:
-        raise _prune_adjudication_invalid(
+        raise _prune_adjudication_batch_invalid(
             "policy digest does not match the policy"
         )
-
-    _reconcile_prune_adjudication(
-        payload, validated_policy[ADJ_THRESHOLD]
-    )
+    if payload[CP_MOMENT] > verify_moment:
+        raise _prune_adjudication_batch_invalid(
+            "moment must not be later than the verification moment"
+        )
 
     entry = _usable_checkpoint_key(
         validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION],
@@ -19994,6 +20548,6 @@ def verify_prune_adjudication(adjudication, policy, keyring, moment):
     ).hexdigest()
     if not hmac.compare_digest(expected_signature, signature):
         raise AuthenticationError(
-            "prune adjudication signature does not match"
+            "prune adjudication batch signature does not match"
         )
     return copy.deepcopy(payload)
