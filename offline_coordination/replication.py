@@ -17141,12 +17141,20 @@ class InvalidPruneError(ValueError):
     """A chain prune archive, plan, receipt or intent breaks its contract."""
 
 
+class InvalidPruneReceiptError(ValueError):
+    """An offline prune receipt verification breaks its version-1 contract."""
+
+
 class StalePruneError(ValueError):
     """A prune target no longer matches the digest the plan was built from."""
 
 
 def _prune_invalid(message: str) -> InvalidPruneError:
     return InvalidPruneError(f"invalid chain prune: {message}")
+
+
+def _prune_receipt_invalid(message: str) -> InvalidPruneReceiptError:
+    return InvalidPruneReceiptError(f"invalid prune receipt: {message}")
 
 
 def _prune_stale(message: str) -> StalePruneError:
@@ -17582,10 +17590,13 @@ def _prune_parse_plan(raw: object) -> tuple[dict, str, dict]:
     """Validate a prune plan structurally into payload, signature, envelope."""
     if not isinstance(raw, bytes):
         raise TypeError("plan must be bytes")
-    envelope = _prune_loads_envelope(raw, "prune plan")
     payload, signature = _prune_parse_envelope(
         raw, "prune plan", _PRUNE_PLAN_PAYLOAD_KEYS
     )
+    # The canonical encoding check above guarantees this reconstructed
+    # envelope re-serializes to the exact plan bytes, so the envelope is
+    # decoded only once.
+    envelope = {TICKET_PAYLOAD: payload, SIGNATURE: signature}
     if not _prune_is_digest(payload[PRUNE_CHECKPOINT]):
         raise _prune_invalid(
             "plan checkpoint must be 64 lowercase hex characters"
@@ -18134,7 +18145,6 @@ def _prune_execute_one(item: dict, validated_keyring: dict) -> dict:
         return _prune_item_error(item_id, exc)
 
     path = item[PRUNE_PATH]
-    checkpoint = item[PRUNE_CHECKPOINT]
     plan_payload = prepared["plan_payload"]
     source_map = plan_payload[PRUNE_SOURCE]
     target_map = plan_payload[PRUNE_TARGET]
@@ -18406,3 +18416,352 @@ def recover_chain_prune(path):
     if phase == PHASE_PREPARED:
         return {"digest": old_digest, STATUS: STATUS_ROLLED_BACK}
     return {"digest": new_digest, STATUS: STATUS_COMPLETED}
+
+# --- Offline verification of signed prune receipts ---------------------------
+
+PRUNE_RECEIPT_VERIFIED = "verified"
+PRUNE_RECEIPT_INVALID = "invalid"
+PRUNE_RECEIPT_UNAUTHENTICATED = VERIFY_UNAUTHENTICATED
+
+PRUNE_RECEIPT_RESULT = "result"
+
+_PRUNE_RECEIPT_ITEM_KEYS = frozenset((ID, PRUNE_RECEIPT, PRUNE_CHECKPOINT))
+
+
+def _prune_receipt_item_report(
+    item_id: str, status: str, error: str | None, result: dict | None
+) -> dict:
+    """One batch prune-receipt report with the fixed key order."""
+    return {
+        PRUNE_ERROR: error,
+        ID: item_id,
+        PRUNE_RECEIPT_RESULT: result,
+        STATUS: status,
+    }
+
+
+def _prune_parse_embedded_plan(plan: object) -> tuple[dict, str, bytes]:
+    """Validate the complete plan embedded in a receipt into bytes.
+
+    The embedded plan must be a version-1 signed envelope in the same
+    canonical compact form as a standalone plan: recursively sorted
+    keys, non-ASCII preserved and no trailing byte.  It is serialized
+    through the canonical encoder and run through the exact standalone
+    plan rules, so its digest and payload signature cover the exact
+    bytes the receipt carries.
+    """
+    if not isinstance(plan, dict) or set(plan.keys()) != _DS_TOP_KEYS:
+        raise _prune_receipt_invalid(
+            "receipt plan must be an object with exactly 'payload' and "
+            "'signature'"
+        )
+    plan_raw = _prune_compact(plan)
+    try:
+        plan_payload, plan_signature, _envelope = _prune_parse_plan(plan_raw)
+    except InvalidPruneError as exc:
+        raise _prune_receipt_invalid(str(exc)) from exc
+    return plan_payload, plan_signature, plan_raw
+
+
+def _verify_prune_receipt_content(
+    receipt: bytes,
+    checkpoint: bytes,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """The content checks of :func:`verify_prune_receipt`.
+
+    Every encoding, key-set, version, digest, status or binding fault
+    raises :class:`InvalidPruneReceiptError`; unknown, revoked,
+    not-yet-valid or expired credentials and any wrong signature raise
+    :class:`AuthenticationError`.  Type faults carried inside the
+    receipt, plan or checkpoint bytes are content faults and so are
+    reported as :class:`InvalidPruneReceiptError`; only the public
+    argument types are checked by the caller.
+    """
+    try:
+        receipt_payload, receipt_signature = _prune_parse_receipt(receipt)
+    except (InvalidPruneError, TypeError) as exc:
+        raise _prune_receipt_invalid(str(exc)) from exc
+
+    try:
+        plan_payload, plan_signature, plan_raw = _prune_parse_embedded_plan(
+            receipt_payload[PRUNE_PLAN]
+        )
+    except TypeError as exc:
+        raise _prune_receipt_invalid(str(exc)) from exc
+
+    # The delete projects and retained digests must match the embedded
+    # plan exactly: a missing, extra, reordered or replaced entry is a
+    # broken binding, not a tolerated rewording.
+    if receipt_payload[PRUNE_DELETE] != plan_payload[PRUNE_DELETE]:
+        raise _prune_receipt_invalid(
+            "receipt delete projects do not match its embedded plan"
+        )
+    if receipt_payload[PRUNE_RETAIN] != plan_payload[PRUNE_RETAIN]:
+        raise _prune_receipt_invalid(
+            "receipt retain digests do not match its embedded plan"
+        )
+
+    checkpoint_digest = hashlib.sha256(checkpoint).hexdigest()
+    if receipt_payload[PRUNE_CHECKPOINT] != checkpoint_digest:
+        raise _prune_receipt_invalid(
+            "receipt checkpoint digest does not match the checkpoint bytes"
+        )
+    if plan_payload[PRUNE_CHECKPOINT] != checkpoint_digest:
+        raise _prune_receipt_invalid(
+            "embedded plan checkpoint digest does not match the checkpoint "
+            "bytes"
+        )
+
+    try:
+        cp_payload, cp_signature = _parse_chain_checkpoint(checkpoint)
+    except TypeError as exc:
+        raise _prune_receipt_invalid(str(exc)) from exc
+    except InvalidCheckpointError as exc:
+        raise _prune_receipt_invalid(str(exc)) from exc
+    issuer = cp_payload[VD_ISSUER]
+    key_version = cp_payload[KEY_VERSION]
+
+    # Checkpoint, plan and receipt are three signatures of one exact
+    # identity: the checkpoint sealer's exact issuer/version, selected
+    # from the current keyring and usable now, with no fallback.
+    entry = _usable_checkpoint_key(
+        validated_keyring, issuer, key_version, moment
+    )
+    secret = bytes.fromhex(entry[SECRET])
+    cp_expected = hmac.new(
+        secret, _checkpoint_compact(cp_payload), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(cp_expected, cp_signature):
+        raise AuthenticationError("chain checkpoint signature does not match")
+    plan_expected = hmac.new(
+        secret, _prune_compact(plan_payload), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(plan_expected, plan_signature):
+        raise AuthenticationError("prune plan signature does not match")
+    receipt_expected = hmac.new(
+        secret, _prune_compact(receipt_payload), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(receipt_expected, receipt_signature):
+        raise AuthenticationError("prune receipt signature does not match")
+
+    status = receipt_payload[PRUNE_STATUS]
+    before = receipt_payload[PRUNE_BEFORE]
+    after = receipt_payload[PRUNE_AFTER]
+    source_map = plan_payload[PRUNE_SOURCE]
+    target_map = plan_payload[PRUNE_TARGET]
+
+    # The status and the before/after digests must name exactly one
+    # plan target project; zero or several candidates are both rejected.
+    candidates = []
+    for project in plan_payload[PRUNE_DELETE]:
+        if status == PRUNE_STATUS_PRUNED:
+            matched = (
+                before == source_map[project]
+                and after == target_map[project]
+            )
+        else:
+            matched = (
+                before == target_map[project]
+                and after == target_map[project]
+            )
+        if matched:
+            candidates.append(project)
+    if len(candidates) != 1:
+        raise _prune_receipt_invalid(
+            "receipt status and before/after digests do not uniquely name a "
+            "plan target project"
+        )
+    project = candidates[0]
+
+    # Regenerate the version-1 prune marker independently and hash its
+    # exact bytes; the receipt's derived conclusion is never trusted.
+    marker_digest = hashlib.sha256(_prune_pruned_bytes(project)).hexdigest()
+    if marker_digest != target_map[project]:
+        raise _prune_receipt_invalid(
+            "embedded plan target digest does not match the recomputed "
+            "pruned marker"
+        )
+    if marker_digest != after:
+        raise _prune_receipt_invalid(
+            "receipt afterDigest does not match the recomputed pruned marker"
+        )
+
+    return {
+        PRUNE_PROJECT: project,
+        PRUNE_STATUS: status,
+        PRUNE_BEFORE: before,
+        PRUNE_AFTER: after,
+        PRUNE_CHECKPOINT: checkpoint_digest,
+        PRUNE_PLAN: hashlib.sha256(plan_raw).hexdigest(),
+        PRUNE_MOMENT: receipt_payload[PRUNE_MOMENT],
+        VERSION: CHAIN_PRUNE_VERSION,
+    }
+
+
+def verify_prune_receipt(receipt, checkpoint, keyring, moment):
+    """Verify one signed chain prune receipt entirely offline.
+
+    ``receipt`` is the canonical compact version-1 object
+    :func:`prune_chain_archives` issued (recursively sorted keys,
+    non-ASCII preserved, no trailing byte); ``checkpoint`` is the
+    sealing chain checkpoint bytes; ``keyring`` follows the
+    :func:`apply_signed_remote` rules and ``moment`` is the current
+    non-negative verification time.  No file is ever read or written
+    and no argument is modified.
+
+    The receipt and its complete embedded plan must be canonical
+    version-1 signed envelopes.  The receipt's delete projects and
+    retain digests must equal the plan's exactly -- a missing, extra,
+    reordered or replaced entry is binding corruption -- and both the
+    receipt and the plan must bind the SHA-256 of ``checkpoint``.  The
+    checkpoint, plan and receipt signatures are all rechecked under one
+    exact identity: the checkpoint payload's own issuer and key
+    version, selected from the current keyring and usable at ``moment``
+    with no fallback.
+
+    The status and the before/after digests must uniquely identify one
+    plan target project (zero or several candidates are rejected).  The
+    verifier regenerates that project's version-1 prune marker itself
+    and hashes its exact bytes; the recomputed digest must match both
+    the plan target and the receipt afterDigest -- the receipt's own
+    derived digests are never trusted.  A ``pruned`` receipt must name
+    the source archive digest before pruning; a ``duplicate`` receipt
+    must name the target marker digest both before and after.
+
+    Success returns a fresh dict in the fixed key order ``project``,
+    ``status``, ``beforeDigest``, ``afterDigest``, ``checkpoint`` (the
+    checkpoint SHA-256), ``plan`` (the embedded plan bytes' SHA-256),
+    ``moment`` (the receipt-bound moment) and ``version`` (the integer
+    1); repeated calls return equal, mutually independent objects.
+
+    A public argument type fault raises :class:`TypeError` (a
+    :class:`bool` never poses as an int); a negative moment raises
+    :class:`ValueError`; an illegal encoding, key set, version, digest,
+    status or binding raises :class:`InvalidPruneReceiptError` (a
+    :class:`ValueError`); and unknown, revoked, not-yet-valid or expired
+    credentials or any wrong signature raise
+    :class:`AuthenticationError`.
+    """
+    if not isinstance(receipt, bytes):
+        raise TypeError("receipt must be bytes")
+    if not isinstance(checkpoint, bytes):
+        raise TypeError("checkpoint must be bytes")
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    return _verify_prune_receipt_content(
+        receipt, checkpoint, validated_keyring, verify_moment
+    )
+
+
+def _validated_prune_receipt_items(items: object) -> list[dict]:
+    """Validate the prune-receipt batch completely before verification.
+
+    Each item holds exactly a batch-unique non-empty ``id``, the
+    ``receipt`` bytes and the sealing ``checkpoint`` bytes.  Container,
+    field and element type faults raise :class:`TypeError`; an empty
+    list, an empty or duplicate id or a wrong item key set raises
+    :class:`ValueError`.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _PRUNE_RECEIPT_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'id', 'receipt' and "
+                "'checkpoint'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        receipt = item[PRUNE_RECEIPT]
+        if not isinstance(receipt, bytes):
+            raise TypeError(f"{where} receipt must be bytes")
+        checkpoint = item[PRUNE_CHECKPOINT]
+        if not isinstance(checkpoint, bytes):
+            raise TypeError(f"{where} checkpoint must be bytes")
+        validated.append({
+            ID: item_id,
+            PRUNE_RECEIPT: receipt,
+            PRUNE_CHECKPOINT: checkpoint,
+        })
+    return validated
+
+
+def _verify_prune_receipt_item(item: dict, validated_keyring: dict,
+                               moment: int) -> dict:
+    """Verify one prune receipt in isolation and report its outcome."""
+    item_id = item[ID]
+    try:
+        result = _verify_prune_receipt_content(
+            item[PRUNE_RECEIPT], item[PRUNE_CHECKPOINT],
+            validated_keyring, moment,
+        )
+    except AuthenticationError as exc:
+        return _prune_receipt_item_report(
+            item_id, PRUNE_RECEIPT_UNAUTHENTICATED, str(exc), None
+        )
+    except InvalidPruneReceiptError as exc:
+        return _prune_receipt_item_report(
+            item_id, PRUNE_RECEIPT_INVALID, str(exc), None
+        )
+    return _prune_receipt_item_report(
+        item_id, PRUNE_RECEIPT_VERIFIED, None, result
+    )
+
+
+def verify_prune_receipts(items, keyring, moment):
+    """Verify a batch of signed chain prune receipts entirely offline.
+
+    ``items`` is a non-empty list fully preflighted before any receipt
+    is verified; each item is a dict with exactly the keys ``id`` (a
+    non-empty str, unique across the batch), ``receipt`` (the receipt
+    bytes :func:`prune_chain_archives` issued) and ``checkpoint`` (the
+    sealing checkpoint bytes).  ``keyring`` follows the
+    :func:`apply_signed_remote` rules and ``moment`` is the current
+    non-negative verification time.  No file is read or written and no
+    argument is modified.
+
+    The whole batch structure, keyring and moment are validated first:
+    container, element or field type faults raise :class:`TypeError` (a
+    :class:`bool` never poses as an int) and an empty list, an empty or
+    duplicate id, a wrong item key set or an illegal moment raises
+    :class:`ValueError`.  Only these batch-level faults raise -- each
+    receipt is then verified in strict input order and in isolation
+    through the exact :func:`verify_prune_receipt` rules, so a failed
+    item never stops or alters a later one.
+
+    Each item report carries, in the fixed key order, ``error`` (a
+    definite non-empty message for a failure, ``None`` when verified),
+    ``id``, ``result`` (a fresh copy of the single-entry result when
+    verified, otherwise ``None``) and ``status`` -- one of ``verified``,
+    ``invalid`` (an illegal encoding, key set, version, digest, status
+    or binding, i.e. :class:`InvalidPruneReceiptError`) or
+    ``unauthenticated`` (unknown, revoked, not-yet-valid or expired
+    credentials or any signature error).  The result is a fresh dict
+    with exactly the fixed keys ``items`` and ``version`` (the integer
+    1); repeated calls return equal, mutually independent results.
+    """
+    validated_items = _validated_prune_receipt_items(items)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    return {
+        ITEMS: [
+            _verify_prune_receipt_item(item, validated_keyring, verify_moment)
+            for item in validated_items
+        ],
+        VERSION: CHAIN_PRUNE_VERSION,
+    }
