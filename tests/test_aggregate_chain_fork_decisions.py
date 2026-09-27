@@ -869,6 +869,86 @@ class AggregateVerifyAuthenticationTest(AggregatePacketShapeTest):
                          InvalidChainDecisionError)
 
 
+class CrossEntryCompatibilityTest(ChainForkDecisionAggregateFixtures):
+    """A legal decision is accepted identically by every decision entry.
+
+    The single decision verifier, the decision batch verifier and the
+    cross-site aggregator (and its own verifier) must agree on what a
+    legal chain fork decision is: the per-row proof summaries are bound
+    term by term to the site/id-sorted rows, so reordering the summaries
+    after sealing and re-signing must be rejected by all three even
+    though the digest multiset is unchanged.
+    """
+
+    def _outcomes(self, raw):
+        try:
+            verify_chain_fork_decision(
+                raw, self.policy, self.sp, self.ring, self.m)
+            single = "ok"
+        except InvalidChainDecisionError:
+            single = "invalid"
+        except AuthenticationError:
+            single = "unauth"
+        batch = verify_chain_fork_decisions(
+            [decision_item("i", raw)], self.policy, self.sp, self.ring,
+            self.m,
+        )["items"][0]["status"]
+        aggregate = aggregate_chain_fork_decisions(
+            [decision_item("i", raw)], self.policy, self.sp, self.dsp,
+            self.ring, self.m, JUDGE, 1,
+        )
+        row = parse(aggregate)["payload"]["items"][0]
+        aggregate_verifies = True
+        try:
+            verify_chain_fork_decision_aggregate(
+                aggregate, self.policy, self.sp, self.dsp, self.ring, self.m)
+        except Exception:  # pragma: no cover - any divergence fails below
+            aggregate_verifies = False
+        return single, batch, (row["conclusion"], row["reason"]), (
+            aggregate_verifies)
+
+    def test_legal_decisions_accepted_everywhere(self):
+        for raw in (self.decision_a, self.decision_b):
+            single, batch, row, verifies = self._outcomes(raw)
+            self.assertEqual(single, "ok")
+            self.assertEqual(batch, "verified")
+            self.assertEqual(row, ("valid", None))
+            self.assertTrue(verifies)
+
+    def test_reordered_proof_summaries_rejected_everywhere(self):
+        payload = parse(self.decision_a)["payload"]
+        payload["proofs"] = list(reversed(payload["proofs"]))
+        forged = rewrap(payload)
+        single, batch, row, verifies = self._outcomes(forged)
+        self.assertEqual(single, "invalid")
+        self.assertEqual(batch, "invalid")
+        self.assertEqual(row, ("invalid", "invalid"))
+        self.assertTrue(verifies)
+
+    def test_reordered_rows_rejected_everywhere(self):
+        # Rows must be sorted by site then id; swapping two rows and
+        # re-signing is rejected regardless of the proofs vector.
+        payload = parse(self.decision_a)["payload"]
+        if len(payload["items"]) > 1:
+            payload["items"] = list(reversed(payload["items"]))
+            forged = rewrap(payload)
+            single, batch, row, _verifies = self._outcomes(forged)
+            self.assertEqual(single, "invalid")
+            self.assertEqual(batch, "invalid")
+            self.assertEqual(row[0], "invalid")
+
+    def test_bound_declaration_keeps_positional_binding(self):
+        # A counted declaration inside an aggregate embeds the decision's
+        # positional proof vector; reordering that vector inside an
+        # otherwise valid aggregate is rejected even after re-signing.
+        raw = self.make_aggregate(self.decision_items())
+        payload = parse(raw)["payload"]
+        declaration = payload["declaration"]
+        declaration["proofs"] = list(reversed(declaration["proofs"]))
+        with self.assertRaises(InvalidChainDecisionAggregateError):
+            self.verify_aggregate(rewrap(payload))
+
+
 class IndependenceTest(ChainForkDecisionAggregateFixtures):
     def test_no_file_is_read_or_written(self):
         raw = self.make_aggregate(self.decision_items())
