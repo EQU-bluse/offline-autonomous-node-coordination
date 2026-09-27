@@ -872,17 +872,33 @@ class DecisionPacketShapeTest(ChainForkFixtures):
             for edge in row["edges"]:
                 self.assertEqual(list(edge.keys()), EDGE_KEYS)
 
-    def test_proofs_bound_in_original_order(self):
+    def test_proofs_align_term_by_term_with_the_canonical_rows(self):
         payload = parse(self.raw)["payload"]
+        self.assertEqual(
+            payload["proofs"],
+            [row["digest"] for row in payload["items"]],
+        )
         self.assertEqual(payload["proofs"], [
             hashlib.sha256(self.p_a).hexdigest(),
             hashlib.sha256(self.p_b).hexdigest(),
         ])
+        # The summary order is the canonical row order, not the raw input
+        # order: reversing the inputs leaves the signed proofs vector
+        # (and rows) unchanged.
         reversed_raw = self.make_decision(list(reversed(self.items)))
+        reversed_payload = parse(reversed_raw)["payload"]
+        self.assertEqual(reversed_payload["proofs"], payload["proofs"])
         self.assertEqual(
-            parse(reversed_raw)["payload"]["proofs"],
-            list(reversed(payload["proofs"])),
+            [row["id"] for row in reversed_payload["items"]],
+            [row["id"] for row in payload["items"]],
         )
+
+    def test_reordered_proofs_cannot_be_resigned(self):
+        payload = parse(self.raw)["payload"]
+        tampered = dict(payload)
+        tampered["proofs"] = list(reversed(payload["proofs"]))
+        with self.assertRaises(InvalidChainDecisionError):
+            self.verify_decision(rewrap(tampered))
 
     def test_policy_digest_and_identity_bindings(self):
         payload = parse(self.raw)["payload"]
