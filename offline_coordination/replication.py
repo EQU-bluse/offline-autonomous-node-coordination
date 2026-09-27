@@ -24130,6 +24130,58 @@ def sign_prune_aggregate_fork_proof(
     return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
 
 
+def _verify_pac_fork_proof_core(
+    raw: bytes,
+    validated_prune_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    verify_moment: int,
+) -> dict:
+    """Verify one fork proof against already-validated shared materials.
+
+    This is the shared core of :func:`verify_prune_aggregate_fork_proof`
+    and the batch :func:`verify_prune_aggregate_fork_proofs`; the caller
+    owns the argument-type and shared-material validation.  The returned
+    dict is freshly built solely from authenticated proof material.
+    """
+    payload, signature, chains = _parse_pac_fork_proof(raw)
+    recomputed_policy = hashlib.sha256(
+        _verdict_policy_bytes(validated_prune_policy)
+    ).hexdigest()
+    if payload[RECEIPT_POLICY] != recomputed_policy:
+        raise _pac_fork_proof_invalid(
+            "policy digest does not match the policy"
+        )
+    if payload[CP_MOMENT] > verify_moment:
+        raise _pac_fork_proof_invalid(
+            "moment must not be later than the verification moment"
+        )
+
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION],
+        verify_moment,
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "prune aggregate fork proof signature does not match"
+        )
+
+    return {
+        FORK_PROOF_CHAINS: copy.deepcopy(chains),
+        VD_ISSUER: payload[VD_ISSUER],
+        KEY_VERSION: payload[KEY_VERSION],
+        CP_MOMENT: payload[CP_MOMENT],
+        VD_POLICY_DIGEST: recomputed_policy,
+        FORK_PROOF_DIGEST: hashlib.sha256(raw).hexdigest(),
+        FORK_PROOF_REPORT: copy.deepcopy(payload[FORK_PROOF_REPORT]),
+        VERSION: PRUNE_AGGREGATE_FORK_PROOF_VERSION,
+    }
+
+
 def verify_prune_aggregate_fork_proof(proof, prune_policy, keyring, moment):
     """Re-verify a signed prune aggregate fork proof entirely offline.
 
@@ -24167,18 +24219,1078 @@ def verify_prune_aggregate_fork_proof(proof, prune_policy, keyring, moment):
     validated_keyring = _validated_keyring(keyring)
     verify_moment = _fe_moment(moment, "moment")
 
-    payload, signature, chains = _parse_pac_fork_proof(proof)
-    recomputed_policy = hashlib.sha256(
+    return _verify_pac_fork_proof_core(
+        proof, validated_prune_policy, validated_keyring, verify_moment
+    )
+
+
+# -- Offline batch verification of prune aggregate fork proofs ----------------
+
+PAC_FORK_PROOFS_VERSION = 1
+
+_PAC_FORK_PROOF_BATCH_ITEM_KEYS = frozenset((ID, FORK_PROOF_ITEM_PROOF))
+_PAC_FORK_PROOFS_VERIFIED = "verified"
+_PAC_FORK_PROOFS_INVALID = "invalid-proof"
+_PAC_FORK_PROOFS_UNAUTHENTICATED = "unauthenticated"
+
+
+def _validated_pac_fork_proof_items(items: object) -> list[dict]:
+    """Validate the fork-proof batch before any proof is verified.
+
+    The argument must be a non-empty list of dicts each holding exactly
+    ``id`` (a non-empty str, unique across the batch) and ``proof``
+    (bytes).  Container, element and field type faults raise
+    :class:`TypeError`; an empty list, an empty or duplicate id or a
+    wrong key set raises :class:`ValueError`.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _PAC_FORK_PROOF_BATCH_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'id' and 'proof'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        proof = item[FORK_PROOF_ITEM_PROOF]
+        if not isinstance(proof, bytes):
+            raise TypeError(f"{where} proof must be bytes")
+        validated.append({ID: item_id, FORK_PROOF_ITEM_PROOF: proof})
+    return validated
+
+
+def _pac_fork_proofs_item_report(
+    item_id: str, status: str, error: str | None, result: dict | None
+) -> dict:
+    """One fork-proof batch report with the fixed key order."""
+    return {
+        CHECKPOINT_ITEM_ERROR: error,
+        ID: item_id,
+        VERDICT_ITEM_RESULT: result,
+        STATUS: status,
+    }
+
+
+def _verify_pac_fork_proof_item(
+    item: dict,
+    validated_prune_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one prune aggregate fork proof in isolation.
+
+    Unknown, revoked, not-yet-valid or expired credentials and a wrong
+    signature make the item ``unauthenticated``; every encoding,
+    key-set, version, digest, ordering, reference or report-binding
+    fault makes it ``invalid-proof``; a passing proof is ``verified``.
+    """
+    item_id = item[ID]
+    proof = item[FORK_PROOF_ITEM_PROOF]
+    try:
+        result = _verify_pac_fork_proof_core(
+            proof, validated_prune_policy, validated_keyring, moment
+        )
+    except AuthenticationError as exc:
+        return _pac_fork_proofs_item_report(
+            item_id, _PAC_FORK_PROOFS_UNAUTHENTICATED, str(exc), None
+        )
+    except (InvalidAggregateForkProofError, TypeError) as exc:
+        # A TypeError here can only come from a wrong JSON field type
+        # *inside* the proof bytes; the public argument types were all
+        # validated before the batch ran.
+        return _pac_fork_proofs_item_report(
+            item_id, _PAC_FORK_PROOFS_INVALID, str(exc), None
+        )
+    return _pac_fork_proofs_item_report(
+        item_id, _PAC_FORK_PROOFS_VERIFIED, None, result
+    )
+
+
+def verify_prune_aggregate_fork_proofs(
+    items: list, prune_policy: dict, keyring: dict, moment: int
+) -> dict:
+    """Verify a whole batch of prune aggregate fork proofs offline.
+
+    ``items`` is a non-empty list; each item is a dict with exactly the
+    keys ``id`` (a non-empty str, unique across the batch) and ``proof``
+    (the bytes :func:`sign_prune_aggregate_fork_proof` produced).
+    ``prune_policy`` is the shared invariant original pruning policy and
+    ``keyring``/``moment`` keep their single-proof meaning.  The whole
+    batch structure and the shared materials are validated in full
+    before any proof is verified: container, element or field type
+    faults raise :class:`TypeError` (a :class:`bool` never poses as an
+    int) and an empty list, an empty or duplicate id or a wrong item key
+    set raises :class:`ValueError` (policy, keyring and moment keep
+    their single-entry classification).  Only these batch-level faults
+    raise.
+
+    Each proof is then verified independently, in strict input order,
+    through the exact :func:`verify_prune_aggregate_fork_proof` rules:
+    one proof's failure never stops a later proof or alters an earlier
+    report.  Unknown, revoked, not-yet-valid or expired credentials or a
+    wrong signature make the item ``unauthenticated``; an illegal
+    encoding, key set, version, digest, count, ordering, reference or
+    report binding makes it ``invalid-proof``; a passing proof is
+    ``verified``.
+
+    The top-level result is a fresh dict with the fixed keys ``items``
+    and ``version`` (the integer 1); each item report carries, in this
+    key order, ``error`` (null exactly when verified), ``id``,
+    ``result`` (a fresh independent copy of the single-entry result
+    when verified, otherwise null) and ``status``.  Repeated calls
+    return equal but mutually independent results.  No file is read or
+    written and no input is modified.
+    """
+    validated_items = _validated_pac_fork_proof_items(items)
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    return {
+        ITEMS: [
+            _verify_pac_fork_proof_item(
+                item, validated_prune_policy, validated_keyring, verify_moment
+            )
+            for item in validated_items
+        ],
+        VERSION: PAC_FORK_PROOFS_VERSION,
+    }
+
+# -- Multi-site threshold adjudication over prune aggregate fork proofs --------
+
+PRUNE_AGGREGATE_FORK_DECISION_VERSION = 1
+
+PAFD_COMMON = "common"
+PAFD_PROOFS = "proofs"
+PAFD_FORK_PROOF_DIGEST = CP_DIGEST
+PAFD_EDGES = "edges"
+PAFD_PRUNE_POLICY_DIGEST = PBA_PRUNE_POLICY_DIGEST
+PAFD_SITE_POLICY_DIGEST = PBA_SITE_POLICY_DIGEST
+
+_PAFD_STATUS_ACCEPTED = PA_STATUS_ACCEPTED
+_PAFD_STATUS_CONFLICTED = PA_STATUS_CONFLICTED
+_PAFD_STATUS_INSUFFICIENT = PA_STATUS_INSUFFICIENT
+_PAFD_STATUSES = frozenset((
+    _PAFD_STATUS_ACCEPTED,
+    _PAFD_STATUS_CONFLICTED,
+    _PAFD_STATUS_INSUFFICIENT,
+))
+
+_PAFD_CONCLUSION_VALID = ADJ_CONCLUSION_VALID
+_PAFD_CONCLUSION_INVALID = ADJ_CONCLUSION_INVALID
+_PAFD_CONCLUSION_DUPLICATE = ADJ_CONCLUSION_DUPLICATE
+_PAFD_CONCLUSION_CONTRADICTION = ADJ_CONCLUSION_CONTRADICTION
+_PAFD_CONCLUSIONS = frozenset((
+    _PAFD_CONCLUSION_VALID,
+    _PAFD_CONCLUSION_INVALID,
+    _PAFD_CONCLUSION_DUPLICATE,
+    _PAFD_CONCLUSION_CONTRADICTION,
+))
+
+_PAFD_REASON_INVALID_PROOF = PA_REASON_INVALID_PROOF
+_PAFD_INVALID_REASONS = frozenset((
+    _PAFD_REASON_INVALID_PROOF,
+    REASON_UNAUTHORIZED_SITE,
+    REASON_UNAUTHORIZED_VERSION,
+    REASON_CREDENTIAL_UNAVAILABLE,
+    REASON_REVOKED,
+    REASON_NOT_YET_VALID,
+    REASON_EXPIRED,
+    REASON_BAD_SIGNATURE,
+))
+_PAFD_REASONS = _PAFD_INVALID_REASONS | frozenset((
+    REASON_DUPLICATE,
+    REASON_CONTRADICTION,
+))
+
+_PAFD_ITEM_KEYS = frozenset((ID, FORK_PROOF_ITEM_PROOF))
+_PAFD_DECISION_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_PAFD_PAYLOAD_KEYS = frozenset((
+    PAFD_COMMON,
+    VD_ISSUER,
+    ITEMS,
+    KEY_VERSION,
+    PAFD_PRUNE_POLICY_DIGEST,
+    PAFD_PROOFS,
+    PAFD_SITE_POLICY_DIGEST,
+    STATUS,
+    VERSION,
+))
+_PAFD_EDGE_KEYS = frozenset((
+    PAC_ROOT_DIGEST,
+    PAC_PREDECESSOR_DIGEST,
+    PAC_BATCH_SUCCESSORS,
+))
+_PAFD_ROW_KEYS = frozenset((
+    ADJ_CONCLUSION,
+    PAFD_EDGES,
+    ID,
+    KEY_VERSION,
+    PAFD_FORK_PROOF_DIGEST,
+    ADJ_REASON,
+    VD_ISSUER,
+))
+_PAFD_RESULT_KEYS = (
+    PAFD_COMMON,
+    FORK_PROOF_DIGEST,
+    VD_ISSUER,
+    ITEMS,
+    KEY_VERSION,
+    PAFD_PRUNE_POLICY_DIGEST,
+    PAFD_PROOFS,
+    PAFD_SITE_POLICY_DIGEST,
+    STATUS,
+    VERSION,
+)
+
+
+class InvalidAggregateForkDecisionError(ValueError):
+    """A signed prune aggregate fork decision breaks its binding contract."""
+
+
+def _pafd_invalid(message: str) -> InvalidAggregateForkDecisionError:
+    return InvalidAggregateForkDecisionError(
+        f"invalid prune aggregate fork decision: {message}"
+    )
+
+
+def _reject_duplicate_pafd_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate decision keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _pafd_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _pac_fork_edge_object(entry: dict) -> dict:
+    """One canonical ``{rootDigest, predecessorDigest, successors}`` edge."""
+    return {
+        PAC_ROOT_DIGEST: entry[PAC_ROOT_DIGEST],
+        PAC_PREDECESSOR_DIGEST: entry[PAC_PREDECESSOR_DIGEST],
+        PAC_BATCH_SUCCESSORS: list(entry[PAC_BATCH_SUCCESSORS]),
+    }
+
+
+def _pac_fork_proof_edges(payload: dict) -> list[dict]:
+    """The complete fork edge set a verified fork proof binds.
+
+    The proof parser already validated every fork entry, its ordering
+    and its successor set, so the entries are copied verbatim in the
+    report's own canonical (root, predecessor, successor) order.
+    """
+    return [
+        _pac_fork_edge_object(fork)
+        for fork in payload[FORK_PROOF_REPORT][CHAINS_FORKS]
+    ]
+
+
+def _pac_fork_edge_triples(
+    edges: list[dict],
+) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
+    """Order-preserving edge objects to comparable triples."""
+    return tuple(
+        (
+            edge[PAC_ROOT_DIGEST],
+            edge[PAC_PREDECESSOR_DIGEST],
+            tuple(edge[PAC_BATCH_SUCCESSORS]),
+        )
+        for edge in edges
+    )
+
+
+def _sorted_pac_fork_edge_objects(
+    triples: set | frozenset,
+) -> list[dict]:
+    """Unique fork edges sorted by (rootDigest, predecessorDigest, ...)."""
+    return [
+        {
+            PAC_ROOT_DIGEST: root_digest,
+            PAC_PREDECESSOR_DIGEST: predecessor,
+            PAC_BATCH_SUCCESSORS: list(successors),
+        }
+        for root_digest, predecessor, successors in sorted(triples)
+    ]
+
+
+def _validated_pafd_edge(value: object, where: str) -> dict:
+    """Validate one bound fork edge object into a fresh ordered dict."""
+    if not isinstance(value, dict):
+        raise TypeError(f"{where} edge must be an object")
+    if set(value.keys()) != _PAFD_EDGE_KEYS:
+        raise _pafd_invalid(
+            f"{where} edge must contain exactly the keys 'predecessorDigest', "
+            "'rootDigest' and 'successors'"
+        )
+    root_digest = value[PAC_ROOT_DIGEST]
+    predecessor = value[PAC_PREDECESSOR_DIGEST]
+    successors = value[PAC_BATCH_SUCCESSORS]
+    if not isinstance(root_digest, str):
+        raise TypeError(f"{where} edge rootDigest must be a str")
+    if not isinstance(predecessor, str):
+        raise TypeError(f"{where} edge predecessorDigest must be a str")
+    if not _prune_is_digest(root_digest):
+        raise _pafd_invalid(
+            f"{where} edge rootDigest must be 64 lowercase hex characters"
+        )
+    if not _prune_is_digest(predecessor):
+        raise _pafd_invalid(
+            f"{where} edge predecessorDigest must be 64 lowercase hex "
+            "characters"
+        )
+    if not isinstance(successors, list):
+        raise TypeError(f"{where} edge successors must be a list")
+    if not successors:
+        raise _pafd_invalid(f"{where} edge successors must be non-empty")
+    for position, successor in enumerate(successors):
+        if not isinstance(successor, str):
+            raise TypeError(
+                f"{where} edge successor {position} must be a str"
+            )
+        if not _prune_is_digest(successor):
+            raise _pafd_invalid(
+                f"{where} edge successor {position} must be 64 lowercase "
+                "hex characters"
+            )
+    if successors != sorted(successors) or len(set(successors)) != len(
+        successors
+    ):
+        raise _pafd_invalid(
+            f"{where} edge successors must be unique and sorted ascending"
+        )
+    return {
+        PAC_ROOT_DIGEST: root_digest,
+        PAC_PREDECESSOR_DIGEST: predecessor,
+        PAC_BATCH_SUCCESSORS: list(successors),
+    }
+
+
+def _pafd_row(
+    item_id: str,
+    proof_digest: str,
+    site: str | None,
+    key_version: int | None,
+    edges: list[dict] | None,
+    conclusion: str,
+    reason: str | None,
+) -> dict:
+    """One per-proof decision row with the fixed bound key set."""
+    return {
+        ADJ_CONCLUSION: conclusion,
+        PAFD_EDGES: edges,
+        ID: item_id,
+        KEY_VERSION: key_version,
+        PAFD_FORK_PROOF_DIGEST: proof_digest,
+        ADJ_REASON: reason,
+        VD_ISSUER: site,
+    }
+
+
+def _adjudicate_pac_fork_one(
+    item: dict,
+    prune_policy_digest: str,
+    site_policy: dict,
+    keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify, authorize and authenticate one fork proof in isolation.
+
+    The proof is first checked through the exact
+    :func:`verify_prune_aggregate_fork_proof` structural rules, then the
+    signing site and key version are authorized exactly against the site
+    policy with no fallback, and finally the HMAC is checked against the
+    current keyring.  Any failure rejects just this row with one fixed
+    reason and never affects the other items.
+    """
+    item_id = item[ID]
+    raw_proof = item[FORK_PROOF_ITEM_PROOF]
+    proof_digest = hashlib.sha256(raw_proof).hexdigest()
+
+    def structural_invalid() -> dict:
+        return _pafd_row(
+            item_id, proof_digest, None, None, None,
+            _PAFD_CONCLUSION_INVALID, _PAFD_REASON_INVALID_PROOF,
+        )
+
+    try:
+        payload, signature, _chains = _parse_pac_fork_proof(raw_proof)
+    except (TypeError, ValueError):
+        return structural_invalid()
+
+    site = payload[VD_ISSUER]
+    key_version = payload[KEY_VERSION]
+    try:
+        edges = _pac_fork_proof_edges(payload)
+    except (TypeError, ValueError):
+        return structural_invalid()
+
+    def reject(reason: str) -> dict:
+        return _pafd_row(
+            item_id, proof_digest, site, key_version, edges,
+            _PAFD_CONCLUSION_INVALID, reason,
+        )
+
+    # The proof must be bound to the exact shared prune policy and must
+    # not be dated after the adjudication moment; a mismatch makes the
+    # claimed identity untrustworthy, so the row carries none.
+    if payload[RECEIPT_POLICY] != prune_policy_digest:
+        return structural_invalid()
+    if payload[CP_MOMENT] > moment:
+        return structural_invalid()
+
+    allowed_versions = site_policy[ADJ_SITES].get(site)
+    if allowed_versions is None:
+        return reject(REASON_UNAUTHORIZED_SITE)
+    if key_version not in allowed_versions:
+        return reject(REASON_UNAUTHORIZED_VERSION)
+
+    key_entry = None
+    for candidate in keyring.get(site, ()):
+        if candidate[VERSION] == key_version:
+            key_entry = candidate
+            break
+    if key_entry is None:
+        return reject(REASON_CREDENTIAL_UNAVAILABLE)
+    if key_entry[REVOKED]:
+        return reject(REASON_REVOKED)
+    if moment < key_entry[NOT_BEFORE]:
+        return reject(REASON_NOT_YET_VALID)
+    if moment > key_entry[NOT_AFTER]:
+        return reject(REASON_EXPIRED)
+
+    expected_signature = hmac.new(
+        bytes.fromhex(key_entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        return reject(REASON_BAD_SIGNATURE)
+
+    return _pafd_row(
+        item_id, proof_digest, site, key_version, edges,
+        _PAFD_CONCLUSION_VALID, None,
+    )
+
+
+_PAFD_EDGE_SET = frozenset[tuple[str, str, tuple[str, ...]]]
+
+
+def _pafd_content(row: dict) -> _PAFD_EDGE_SET:
+    """The complete fork edge set one authenticated row declares."""
+    return frozenset(_pac_fork_edge_triples(row[PAFD_EDGES]))
+
+
+def _tally_pac_fork_rows(
+    rows: list[dict],
+) -> tuple[bool, dict[str, _PAFD_EDGE_SET]]:
+    """Group authenticated rows per site by their complete edge sets.
+
+    Two rows from one site are the same declaration only when their
+    complete fork edge set -- every ``(rootDigest, predecessorDigest,
+    successors)`` triple -- agrees, regardless of the proof digest.
+    The smallest-id row of one identical set is the vote and extras are
+    ``duplicate``, while two distinct edge sets from one site are both a
+    ``contradiction``.  Returns ``(contradicted, votes)`` where
+    ``votes`` maps each non-contradicting site to its one edge set.
+    """
+    by_site: dict[str, dict[_PAFD_EDGE_SET, list[dict]]] = {}
+    for row in rows:
+        if row[ADJ_CONCLUSION] in (
+            _PAFD_CONCLUSION_VALID,
+            _PAFD_CONCLUSION_DUPLICATE,
+            _PAFD_CONCLUSION_CONTRADICTION,
+        ):
+            by_site.setdefault(row[VD_ISSUER], {}).setdefault(
+                _pafd_content(row), []
+            ).append(row)
+
+    contradicted = False
+    votes: dict[str, _PAFD_EDGE_SET] = {}
+    for site, groups in by_site.items():
+        if len(groups) > 1:
+            contradicted = True
+            ordered_groups = sorted(
+                groups.values(),
+                key=lambda members: min(member[ID] for member in members),
+            )
+            for members in ordered_groups:
+                members.sort(key=lambda row: row[ID])
+                members[0][ADJ_CONCLUSION] = _PAFD_CONCLUSION_CONTRADICTION
+                members[0][ADJ_REASON] = REASON_CONTRADICTION
+                for extra in members[1:]:
+                    extra[ADJ_CONCLUSION] = _PAFD_CONCLUSION_DUPLICATE
+                    extra[ADJ_REASON] = REASON_DUPLICATE
+        else:
+            content, members = next(iter(groups.items()))
+            members.sort(key=lambda row: row[ID])
+            members[0][ADJ_CONCLUSION] = _PAFD_CONCLUSION_VALID
+            members[0][ADJ_REASON] = None
+            for extra in members[1:]:
+                extra[ADJ_CONCLUSION] = _PAFD_CONCLUSION_DUPLICATE
+                extra[ADJ_REASON] = REASON_DUPLICATE
+            votes[site] = content
+    return contradicted, votes
+
+
+def adjudicate_prune_aggregate_forks(
+    items, prune_policy, site_policy, keyring, moment, issuer, version
+):
+    """Adjudicate multi-site prune aggregate fork proofs offline.
+
+    ``items`` is a non-empty list; each item contains exactly a unique
+    non-empty ``id`` and ``proof`` bytes produced by
+    :func:`sign_prune_aggregate_fork_proof`.  ``prune_policy`` is the
+    shared invariant original ``{"batch","sites","threshold"}`` pruning
+    policy the proofs were issued against; ``site_policy`` carries
+    exactly ``sites`` (a non-empty map of each authorized non-empty site
+    to its non-empty set of allowed positive key versions) and
+    ``threshold`` (a positive integer no greater than the site count).
+    ``keyring`` follows the existing rules, ``moment`` is the
+    non-negative adjudication moment and ``issuer``/``version`` name the
+    adjudicator credentials.  No file is read or written and no input is
+    modified.
+
+    Every proof is first verified through the existing prune aggregate
+    fork proof rules, then authorized by the exact signing site and key
+    version its payload names with no fallback, then authenticated
+    against the current keyring.  An invalid, unauthenticated or
+    unauthorized proof rejects just that item with one fixed reason
+    (``invalid-proof``, ``unauthorized-site``, ``unauthorized-version``,
+    ``credential-unavailable``, ``revoked``, ``not-yet-valid``,
+    ``expired`` or ``bad-signature``) while the later items are still
+    processed.  For one site an identical proof digest counts once --
+    extras are ``duplicate`` -- while distinct valid proofs from one site
+    are a ``contradiction``.  Distinct sites must agree exactly on the
+    complete fork edge set made of the root digest, the forking
+    predecessor digest and the sorted legal successor digests; any
+    contradiction or cross-site disagreement is ``conflicted`` with a
+    null common edge set and no majority can outvote it.  A unique edge
+    set backed by at least the threshold of distinct sites is
+    ``accepted``; the same unique set short of the threshold stays
+    ``insufficient`` but keeps that common set; with no valid vote the
+    common set is null.
+
+    The result is one canonical compact UTF-8 JSON object with
+    recursively sorted keys, non-ASCII preserved and no trailing byte,
+    carrying exactly ``payload`` and ``signature``.  The payload binds
+    exactly ``common`` (the sorted common fork edge set, or null),
+    ``issuer``, ``items`` (the rows stably sorted by site then id, each
+    carrying ``conclusion``, its authenticated ``edges`` or null, ``id``,
+    ``keyVersion``, ``proofDigest``, ``reason`` and ``site``),
+    ``keyVersion``, ``prunePolicyDigest``, ``proofs`` (each proof digest
+    in the original input order), ``sitePolicyDigest``, ``status`` and
+    ``version`` (the integer 1).  ``signature`` is the lowercase hex
+    HMAC-SHA256 of the canonical compact payload bytes under the exact
+    issuer/version key.
+
+    A parameter, container or public-field type fault raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); an empty
+    list, an empty or duplicate id, or an illegal prune/site policy,
+    threshold, moment, issuer or version raises :class:`ValueError`;
+    unknown, revoked, not-yet-valid or expired adjudicator credentials
+    raise :class:`AuthenticationError`.
+    """
+    validated_items = _validated_pac_fork_proof_items(items)
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+
+    prune_policy_digest = hashlib.sha256(
         _verdict_policy_bytes(validated_prune_policy)
     ).hexdigest()
-    if payload[RECEIPT_POLICY] != recomputed_policy:
-        raise _pac_fork_proof_invalid(
-            "policy digest does not match the policy"
+
+    proof_digests = [
+        hashlib.sha256(item[FORK_PROOF_ITEM_PROOF]).hexdigest()
+        for item in validated_items
+    ]
+    rows = [
+        _adjudicate_pac_fork_one(
+            item, prune_policy_digest, validated_site_policy,
+            validated_keyring, moment,
         )
-    if payload[CP_MOMENT] > verify_moment:
-        raise _pac_fork_proof_invalid(
-            "moment must not be later than the verification moment"
+        for item in validated_items
+    ]
+
+    contradicted, votes = _tally_pac_fork_rows(rows)
+
+    edge_sets = set(votes.values())
+    if contradicted or len(edge_sets) > 1:
+        status = _PAFD_STATUS_CONFLICTED
+        common = None
+    elif len(edge_sets) == 1:
+        common = _sorted_pac_fork_edge_objects(next(iter(edge_sets)))
+        if len(votes) >= validated_site_policy[ADJ_THRESHOLD]:
+            status = _PAFD_STATUS_ACCEPTED
+        else:
+            status = _PAFD_STATUS_INSUFFICIENT
+    else:
+        status = _PAFD_STATUS_INSUFFICIENT
+        common = None
+
+    rows.sort(
+        key=lambda row: (
+            row[VD_ISSUER] is not None,
+            row[VD_ISSUER] or "",
+            row[ID],
         )
+    )
+
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, moment
+    )
+    payload = {
+        PAFD_COMMON: common,
+        VD_ISSUER: issuer,
+        ITEMS: [copy.deepcopy(row) for row in rows],
+        KEY_VERSION: version,
+        PAFD_PRUNE_POLICY_DIGEST: prune_policy_digest,
+        PAFD_PROOFS: proof_digests,
+        PAFD_SITE_POLICY_DIGEST: hashlib.sha256(
+            _prune_batch_site_policy_bytes(validated_site_policy)
+        ).hexdigest(),
+        STATUS: status,
+        VERSION: PRUNE_AGGREGATE_FORK_DECISION_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+def _parse_pafd(raw: object) -> tuple[dict, str]:
+    """Validate decision bytes structurally into ``(payload, signature)``.
+
+    A non-bytes argument or a field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, digest or value-format fault raises
+    :class:`InvalidAggregateForkDecisionError`.  The policy, tally and
+    credential bindings are checked by
+    :func:`verify_prune_aggregate_fork_decision`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("decision must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _pafd_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _pafd_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_pafd_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _pafd_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("decision must be a JSON object")
+    if set(data.keys()) != _PAFD_DECISION_TOP_KEYS:
+        raise _pafd_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("decision signature must be a str")
+    if not _prune_is_digest(signature):
+        raise _pafd_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("decision payload must be an object")
+    if set(payload.keys()) != _PAFD_PAYLOAD_KEYS:
+        raise _pafd_invalid(
+            "payload must contain exactly the keys 'common', 'issuer', "
+            "'items', 'keyVersion', 'prunePolicyDigest', 'proofs', "
+            "'sitePolicyDigest', 'status' and 'version'"
+        )
+
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("payload issuer must be a str")
+    if issuer == "":
+        raise _pafd_invalid("payload issuer must be a non-empty str")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _pafd_invalid("payload keyVersion must be positive")
+    status = payload[STATUS]
+    if not isinstance(status, str):
+        raise TypeError("payload status must be a str")
+    if status not in _PAFD_STATUSES:
+        raise _pafd_invalid("payload status is not a known status")
+    for field in (PAFD_PRUNE_POLICY_DIGEST, PAFD_SITE_POLICY_DIGEST):
+        digest = payload[field]
+        if not isinstance(digest, str):
+            raise TypeError(f"payload {field} must be a str")
+        if not _prune_is_digest(digest):
+            raise _pafd_invalid(
+                f"payload {field} must be 64 lowercase hex characters"
+            )
+
+    proofs = payload[PAFD_PROOFS]
+    if not isinstance(proofs, list):
+        raise TypeError("payload proofs must be a list")
+    if not proofs:
+        raise _pafd_invalid("payload proofs must be non-empty")
+    for position, digest in enumerate(proofs):
+        if not isinstance(digest, str):
+            raise TypeError(f"payload proof {position} digest must be a str")
+        if not _prune_is_digest(digest):
+            raise _pafd_invalid(
+                f"payload proof {position} digest must be 64 lowercase hex "
+                "characters"
+            )
+
+    raw_rows = payload[ITEMS]
+    if not isinstance(raw_rows, list):
+        raise TypeError("payload items must be a list")
+    if not raw_rows:
+        raise _pafd_invalid("payload items must be non-empty")
+    parsed_rows: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, row in enumerate(raw_rows):
+        where = f"payload item {position}"
+        if not isinstance(row, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(row.keys()) != _PAFD_ROW_KEYS:
+            raise _pafd_invalid(
+                f"{where} must contain exactly the keys 'conclusion', "
+                "'edges', 'id', 'keyVersion', 'proofDigest', 'reason' and "
+                "'site'"
+            )
+        row_id = row[ID]
+        if not isinstance(row_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if row_id == "":
+            raise _pafd_invalid(f"{where} id must be non-empty")
+        if row_id in seen_ids:
+            raise _pafd_invalid(f"{where} repeats an id")
+        seen_ids.add(row_id)
+        digest = row[PAFD_FORK_PROOF_DIGEST]
+        if not isinstance(digest, str):
+            raise TypeError(f"{where} proofDigest must be a str")
+        if not _prune_is_digest(digest):
+            raise _pafd_invalid(
+                f"{where} proofDigest must be 64 lowercase hex characters"
+            )
+        site = row[VD_ISSUER]
+        if site is not None:
+            if not isinstance(site, str):
+                raise TypeError(f"{where} site must be a str or null")
+            if site == "":
+                raise _pafd_invalid(f"{where} site must be non-empty")
+        row_key_version = row[KEY_VERSION]
+        if isinstance(row_key_version, bool) or not isinstance(
+            row_key_version, int
+        ):
+            if row_key_version is not None:
+                raise TypeError(f"{where} keyVersion must be an int or null")
+        elif row_key_version <= 0:
+            raise _pafd_invalid(f"{where} keyVersion must be positive")
+        if (site is None) != (row_key_version is None):
+            raise _pafd_invalid(
+                f"{where} site and keyVersion must be null together"
+            )
+        conclusion = row[ADJ_CONCLUSION]
+        if not isinstance(conclusion, str):
+            raise TypeError(f"{where} conclusion must be a str")
+        if conclusion not in _PAFD_CONCLUSIONS:
+            raise _pafd_invalid(f"{where} conclusion is not known")
+        reason = row[ADJ_REASON]
+        if conclusion == _PAFD_CONCLUSION_VALID:
+            if reason is not None:
+                raise _pafd_invalid(
+                    f"{where} reason must be null for a valid item"
+                )
+        else:
+            if not isinstance(reason, str):
+                raise TypeError(f"{where} reason must be a str")
+            if reason not in _PAFD_REASONS:
+                raise _pafd_invalid(f"{where} reason is not known")
+        if conclusion == _PAFD_CONCLUSION_INVALID:
+            if reason not in _PAFD_INVALID_REASONS:
+                raise _pafd_invalid(
+                    f"{where} reason does not match an invalid item"
+                )
+        elif conclusion != _PAFD_CONCLUSION_VALID:
+            if reason != conclusion:
+                raise _pafd_invalid(
+                    f"{where} reason must match its conclusion"
+                )
+
+        raw_edges = row[PAFD_EDGES]
+        if raw_edges is not None:
+            if not isinstance(raw_edges, list):
+                raise TypeError(f"{where} edges must be a list or null")
+            if not raw_edges:
+                raise _pafd_invalid(
+                    f"{where} edges must be non-empty for an authenticated "
+                    "proof"
+                )
+            row_edges = [
+                _validated_pafd_edge(value, where) for value in raw_edges
+            ]
+            triples = _pac_fork_edge_triples(row_edges)
+            if len(set(triples)) != len(triples):
+                raise _pafd_invalid(f"{where} edges must be unique")
+            if list(triples) != sorted(triples):
+                raise _pafd_invalid(f"{where} edges must be sorted ascending")
+        identity_expected = reason != _PAFD_REASON_INVALID_PROOF
+        if identity_expected:
+            if site is None or raw_edges is None:
+                raise _pafd_invalid(
+                    f"{where} an authenticated proof must carry its site and "
+                    "fork edges"
+                )
+        else:
+            if site is not None or raw_edges is not None:
+                raise _pafd_invalid(
+                    f"{where} an invalid-proof item must carry no site or "
+                    "fork edges"
+                )
+        parsed_rows.append(
+            {
+                ADJ_CONCLUSION: conclusion,
+                PAFD_EDGES: (
+                    None if raw_edges is None else [dict(edge)
+                                                    for edge in row_edges]
+                ),
+                ID: row_id,
+                KEY_VERSION: row_key_version,
+                PAFD_FORK_PROOF_DIGEST: digest,
+                ADJ_REASON: reason,
+                VD_ISSUER: site,
+            }
+        )
+
+    common = payload[PAFD_COMMON]
+    if common is not None:
+        if not isinstance(common, list):
+            raise TypeError("payload common must be a list or null")
+        if not common:
+            raise _pafd_invalid(
+                "a bound common edge set must be non-empty"
+            )
+        common_edges = [
+            _validated_pafd_edge(value, "payload common")
+            for value in common
+        ]
+        common_triples = _pac_fork_edge_triples(common_edges)
+        if len(set(common_triples)) != len(common_triples) or list(
+            common_triples
+        ) != sorted(common_triples):
+            raise _pafd_invalid(
+                "payload common edges must be unique and sorted ascending"
+            )
+
+    decision_version = payload[VERSION]
+    if isinstance(decision_version, bool) or not isinstance(
+        decision_version, int
+    ):
+        raise TypeError("payload version must be an int")
+    if decision_version != PRUNE_AGGREGATE_FORK_DECISION_VERSION:
+        raise _pafd_invalid("payload version must be the integer 1")
+
+    if _prune_compact(data) != raw:
+        raise _pafd_invalid("encoding is not the canonical compact form")
+    return payload, signature
+
+
+def _reconcile_pafd(payload: dict, threshold: int) -> str:
+    """Re-derive every aggregate binding of a parsed fork decision.
+
+    Re-tallies the per-proof rows the signature covers -- row ordering,
+    proof digests, duplicate/contradiction conclusions, the cross-site
+    complete-edge-set agreement, the threshold acceptance and the
+    claimed common set -- without seeing any fork proof.  Any mismatch
+    raises :class:`InvalidAggregateForkDecisionError`; otherwise the
+    derived status is returned.
+    """
+    rows = payload[ITEMS]
+    proofs = payload[PAFD_PROOFS]
+    if len(rows) != len(proofs):
+        raise _pafd_invalid(
+            "the items must cover every proof and vice versa"
+        )
+    expected_order = sorted(
+        rows,
+        key=lambda row: (
+            row[VD_ISSUER] is not None,
+            row[VD_ISSUER] or "",
+            row[ID],
+        ),
+    )
+    if [row[ID] for row in expected_order] != [row[ID] for row in rows]:
+        raise _pafd_invalid("items must be sorted by site then id")
+    row_digests = [row[PAFD_FORK_PROOF_DIGEST] for row in rows]
+    if sorted(row_digests) != sorted(proofs):
+        raise _pafd_invalid(
+            "the bound proof digests must equal the per-item digests"
+        )
+
+    by_site: dict[str, dict[_PAFD_EDGE_SET, list[dict]]] = {}
+    for row in rows:
+        if row[ADJ_CONCLUSION] == _PAFD_CONCLUSION_INVALID:
+            continue
+        by_site.setdefault(row[VD_ISSUER], {}).setdefault(
+            _pafd_content(row), []
+        ).append(row)
+
+    contradicted = False
+    votes: dict[str, _PAFD_EDGE_SET] = {}
+    for site, groups in by_site.items():
+        if len(groups) > 1:
+            contradicted = True
+            expected_conclusion = _PAFD_CONCLUSION_CONTRADICTION
+            expected_reason = REASON_CONTRADICTION
+        else:
+            expected_conclusion = _PAFD_CONCLUSION_VALID
+            expected_reason = None
+            votes[site] = next(iter(groups.keys()))
+        for members_raw in groups.values():
+            members = sorted(members_raw, key=lambda row: row[ID])
+            for index, row in enumerate(members):
+                if index == 0:
+                    if row[ADJ_CONCLUSION] != expected_conclusion:
+                        raise _pafd_invalid(
+                            f"item {row[ID]!r} has the wrong conclusion"
+                        )
+                    if row[ADJ_REASON] != expected_reason:
+                        raise _pafd_invalid(
+                            f"item {row[ID]!r} has the wrong reason"
+                        )
+                else:
+                    if row[ADJ_CONCLUSION] != _PAFD_CONCLUSION_DUPLICATE:
+                        raise _pafd_invalid(
+                            f"item {row[ID]!r} must be a duplicate"
+                        )
+                    if row[ADJ_REASON] != REASON_DUPLICATE:
+                        raise _pafd_invalid(
+                            f"item {row[ID]!r} must carry the duplicate "
+                            "reason"
+                        )
+            representative = members[0]
+            for row in members[1:]:
+                if _pac_fork_edge_triples(
+                    row[PAFD_EDGES]
+                ) != _pac_fork_edge_triples(representative[PAFD_EDGES]):
+                    raise _pafd_invalid(
+                        f"item {row[ID]!r} duplicates a proof with a "
+                        "different fork edge set"
+                    )
+
+    edge_sets = set(votes.values())
+    if contradicted or len(edge_sets) > 1:
+        status = _PAFD_STATUS_CONFLICTED
+        expected_common = None
+    elif len(edge_sets) == 1 and len(votes) >= threshold:
+        status = _PAFD_STATUS_ACCEPTED
+        expected_common = _sorted_pac_fork_edge_objects(
+            next(iter(edge_sets))
+        )
+    elif len(edge_sets) == 1:
+        status = _PAFD_STATUS_INSUFFICIENT
+        expected_common = _sorted_pac_fork_edge_objects(
+            next(iter(edge_sets))
+        )
+    else:
+        status = _PAFD_STATUS_INSUFFICIENT
+        expected_common = None
+
+    if payload[STATUS] != status:
+        raise _pafd_invalid("the status does not match the tallied items")
+    if payload[PAFD_COMMON] != expected_common:
+        raise _pafd_invalid(
+            "the bound common edge set does not match the tallied items"
+        )
+    return status
+
+
+def verify_prune_aggregate_fork_decision(
+    decision, prune_policy, site_policy, keyring, moment
+):
+    """Re-verify a signed prune aggregate fork decision entirely offline.
+
+    Only the decision bytes, the expected shared ``prune_policy``, the
+    expected ``site_policy``, the current ``keyring`` and the
+    verification ``moment`` are consulted -- no file is read or written
+    and no argument is modified.  Verification validates the canonical
+    encoding and every key set, recomputes both policy digests, re-tallies
+    the bound per-proof rows purely from the signed payload (the
+    original-order proof digest bindings, the site/id row ordering, the
+    same-site duplicate/contradiction markings, the cross-site complete
+    fork-edge-set agreement, the threshold outcome and the claimed
+    common set), and checks the HMAC-SHA256 against the key the *current*
+    keyring binds to the payload's exact issuer and version, usable at
+    the verification moment, so a later revocation or expiry rejects
+    the decision with no fallback.
+
+    On success a fresh mapping is returned with the fixed keys
+    ``common``, ``decisionDigest`` (the SHA-256 of the decision bytes),
+    ``issuer``, ``items``, ``keyVersion``, ``prunePolicyDigest``,
+    ``proofs``, ``sitePolicyDigest``, ``status`` and ``version`` (the
+    integer 1).  A non-bytes decision or a public field of the wrong
+    type raises :class:`TypeError` (a :class:`bool` never poses as an
+    int); an illegal prune/site policy, keyring or moment raises
+    :class:`ValueError`; an illegal encoding, key set, digest, ordering,
+    tally or binding raises
+    :class:`InvalidAggregateForkDecisionError` (a :class:`ValueError`
+    subclass); unknown, revoked, not-yet-valid or expired credentials
+    or a signature mismatch raise :class:`AuthenticationError`.
+    """
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+
+    payload, signature = _parse_pafd(decision)
+    expected_prune_digest = hashlib.sha256(
+        _verdict_policy_bytes(validated_prune_policy)
+    ).hexdigest()
+    if payload[PAFD_PRUNE_POLICY_DIGEST] != expected_prune_digest:
+        raise _pafd_invalid("prune policy digest does not match the policy")
+    expected_site_digest = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_site_policy)
+    ).hexdigest()
+    if payload[PAFD_SITE_POLICY_DIGEST] != expected_site_digest:
+        raise _pafd_invalid("site policy digest does not match the policy")
+
+    status = _reconcile_pafd(
+        payload, validated_site_policy[ADJ_THRESHOLD]
+    )
 
     entry = _usable_checkpoint_key(
         validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION],
@@ -24191,16 +25303,21 @@ def verify_prune_aggregate_fork_proof(proof, prune_policy, keyring, moment):
     ).hexdigest()
     if not hmac.compare_digest(expected_signature, signature):
         raise AuthenticationError(
-            "prune aggregate fork proof signature does not match"
+            "prune aggregate fork decision signature does not match"
         )
 
     return {
-        FORK_PROOF_CHAINS: copy.deepcopy(chains),
-        VD_ISSUER: payload[VD_ISSUER],
-        KEY_VERSION: payload[KEY_VERSION],
-        CP_MOMENT: payload[CP_MOMENT],
-        VD_POLICY_DIGEST: recomputed_policy,
-        FORK_PROOF_DIGEST: hashlib.sha256(proof).hexdigest(),
-        FORK_PROOF_REPORT: copy.deepcopy(payload[FORK_PROOF_REPORT]),
-        VERSION: PRUNE_AGGREGATE_FORK_PROOF_VERSION,
+        key: copy.deepcopy(value)
+        for key, value in (
+            (PAFD_COMMON, payload[PAFD_COMMON]),
+            (FORK_PROOF_DIGEST, hashlib.sha256(decision).hexdigest()),
+            (VD_ISSUER, payload[VD_ISSUER]),
+            (ITEMS, payload[ITEMS]),
+            (KEY_VERSION, payload[KEY_VERSION]),
+            (PAFD_PRUNE_POLICY_DIGEST, expected_prune_digest),
+            (PAFD_PROOFS, payload[PAFD_PROOFS]),
+            (PAFD_SITE_POLICY_DIGEST, expected_site_digest),
+            (STATUS, status),
+            (VERSION, PRUNE_AGGREGATE_FORK_DECISION_VERSION),
+        )
     }
