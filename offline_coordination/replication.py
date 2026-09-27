@@ -24771,9 +24771,10 @@ def adjudicate_prune_aggregate_forks(
     (``invalid-proof``, ``unauthorized-site``, ``unauthorized-version``,
     ``credential-unavailable``, ``revoked``, ``not-yet-valid``,
     ``expired`` or ``bad-signature``) while the later items are still
-    processed.  For one site an identical proof digest counts once --
-    extras are ``duplicate`` -- while distinct valid proofs from one site
-    are a ``contradiction``.  Distinct sites must agree exactly on the
+    processed.  For one site the complete fork edge set counts once --
+    extra proofs declaring an identical edge set are ``duplicate`` --
+    while distinct valid edge sets from one site are a
+    ``contradiction``.  Distinct sites must agree exactly on the
     complete fork edge set made of the root digest, the forking
     predecessor digest and the sorted legal successor digests; any
     contradiction or cross-site disagreement is ``conflicted`` with a
@@ -25275,7 +25276,27 @@ def verify_prune_aggregate_fork_decision(
     validated_site_policy = _validated_prune_batch_site_policy(site_policy)
     validated_keyring = _validated_keyring(keyring)
     verify_moment = _fe_moment(moment, "moment")
+    return _verify_pafd_core(
+        decision, validated_prune_policy, validated_site_policy,
+        validated_keyring, verify_moment,
+    )
 
+
+def _verify_pafd_core(
+    decision: bytes,
+    validated_prune_policy: dict,
+    validated_site_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    verify_moment: int,
+) -> dict:
+    """Verify one fork decision against already-validated shared materials.
+
+    This is the shared core of
+    :func:`verify_prune_aggregate_fork_decision` and the batch
+    :func:`verify_prune_aggregate_fork_decisions`; the caller owns the
+    argument-type and shared-material validation.  The returned dict is
+    freshly built solely from authenticated decision material.
+    """
     payload, signature = _parse_pafd(decision)
     expected_prune_digest = hashlib.sha256(
         _verdict_policy_bytes(validated_prune_policy)
@@ -25320,4 +25341,1315 @@ def verify_prune_aggregate_fork_decision(
             (STATUS, status),
             (VERSION, PRUNE_AGGREGATE_FORK_DECISION_VERSION),
         )
+    }
+
+
+# -- Offline batch verification of prune aggregate fork decisions -------------
+
+PRUNE_AGGREGATE_FORK_DECISIONS_VERSION = 1
+
+PFDA_DECISION = "decision"
+
+_PFDA_DECISION_ITEM_KEYS = frozenset((ID, PFDA_DECISION))
+_PFDA_DECISIONS_VERIFIED = _VERIFY_VERIFIED
+_PFDA_DECISIONS_INVALID = _PRUNE_RECEIPT_VERIFY_INVALID
+_PFDA_DECISIONS_UNAUTHENTICATED = VERIFY_UNAUTHENTICATED
+
+
+def _validated_pfda_decision_items(items: object) -> list[dict]:
+    """Validate the decision batch before any decision is parsed.
+
+    The argument must be a non-empty list of dicts each holding exactly
+    ``id`` (a non-empty str, unique across the batch) and ``decision``
+    (bytes).  Container, element and field type faults raise
+    :class:`TypeError`; an empty list, an empty or duplicate id or a
+    wrong key set raises :class:`ValueError`.
+    """
+    if not isinstance(items, list):
+        raise TypeError("items must be a list")
+    if not items:
+        raise ValueError("items must be a non-empty list")
+    validated: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(items):
+        where = f"item {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where} must be a dict")
+        if set(item.keys()) != _PFDA_DECISION_ITEM_KEYS:
+            raise ValueError(
+                f"{where} must contain exactly the keys 'decision' and 'id'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if item_id == "":
+            raise ValueError(f"{where} id must be non-empty")
+        if item_id in seen_ids:
+            raise ValueError(f"duplicate id {item_id!r}")
+        seen_ids.add(item_id)
+        decision = item[PFDA_DECISION]
+        if not isinstance(decision, bytes):
+            raise TypeError(f"{where} decision must be bytes")
+        validated.append({ID: item_id, PFDA_DECISION: decision})
+    return validated
+
+
+def _pfda_decisions_item_report(
+    item_id: str, status: str, error: str | None, result: dict | None
+) -> dict:
+    """One fork-decision batch report with the fixed key order."""
+    return {
+        CHECKPOINT_ITEM_ERROR: error,
+        ID: item_id,
+        VERDICT_ITEM_RESULT: result,
+        STATUS: status,
+    }
+
+
+def _verify_pfda_decision_item(
+    item: dict,
+    validated_prune_policy: dict,
+    validated_site_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one prune aggregate fork decision in isolation.
+
+    Unknown, revoked, not-yet-valid or expired credentials and a wrong
+    signature make the item ``unauthenticated``; every encoding,
+    key-set, digest, ordering, tally or binding fault makes it
+    ``invalid``; a passing decision is ``verified``.
+    """
+    item_id = item[ID]
+    try:
+        result = _verify_pafd_core(
+            item[PFDA_DECISION],
+            validated_prune_policy,
+            validated_site_policy,
+            validated_keyring,
+            moment,
+        )
+    except AuthenticationError as exc:
+        return _pfda_decisions_item_report(
+            item_id, _PFDA_DECISIONS_UNAUTHENTICATED, str(exc), None
+        )
+    except (InvalidAggregateForkDecisionError, TypeError) as exc:
+        # A TypeError here can only come from a wrong JSON field type
+        # *inside* the decision bytes; the public argument types were
+        # all validated before the batch ran.
+        return _pfda_decisions_item_report(
+            item_id, _PFDA_DECISIONS_INVALID, str(exc), None
+        )
+    return _pfda_decisions_item_report(
+        item_id, _PFDA_DECISIONS_VERIFIED, None, result
+    )
+
+
+def verify_prune_aggregate_fork_decisions(
+    items, prune_policy, site_policy, keyring, moment
+):
+    """Verify a batch of signed prune aggregate fork decisions offline.
+
+    ``items`` is a non-empty list; each item is a dict with exactly the
+    keys ``id`` (a non-empty str, unique across the batch) and
+    ``decision`` (the canonical signed decision bytes
+    :func:`adjudicate_prune_aggregate_forks` produced).  ``prune_policy``
+    is the shared invariant original pruning policy, ``site_policy``
+    the fork-proof site authorization policy the decisions were issued
+    against, and ``keyring``/``moment`` keep their single-decision
+    meaning.  No file is read or written and no argument is modified.
+
+    The whole batch structure and the shared policies, keyring and
+    moment are validated in full before any decision is parsed, so a
+    batch-level fault never yields a partial report: container, element
+    or field type faults raise :class:`TypeError` (a :class:`bool`
+    never poses as an int) and an empty list, an empty or duplicate id
+    or a wrong item key set raises :class:`ValueError` (the policies,
+    keyring and moment keep their single-entry classification).  Only
+    these batch-level faults raise.
+
+    Each decision is then verified independently, in strict input
+    order, through the exact
+    :func:`verify_prune_aggregate_fork_decision` rules: one decision's
+    failure never stops a later decision or alters an earlier report.
+    Unknown, revoked, not-yet-valid or expired credentials or a wrong
+    signature make the item ``unauthenticated``; an illegal encoding,
+    key set, digest, ordering, tally or binding makes it ``invalid``;
+    a passing decision is ``verified``.
+
+    The top-level result is a fresh dict with the fixed keys ``items``
+    and ``version`` (the integer 1); each item report preserves input
+    order and carries, in this key order, ``error`` (null exactly when
+    verified, otherwise a definite non-empty message), ``id``,
+    ``result`` (a fresh independent copy of the single-decision result
+    when verified, otherwise null) and ``status``.  Repeated calls
+    return equal but mutually independent results.
+    """
+    validated_items = _validated_pfda_decision_items(items)
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    return {
+        ITEMS: [
+            _verify_pfda_decision_item(
+                item, validated_prune_policy, validated_site_policy,
+                validated_keyring, verify_moment,
+            )
+            for item in validated_items
+        ],
+        VERSION: PRUNE_AGGREGATE_FORK_DECISIONS_VERSION,
+    }
+
+
+# -- Cross-site aggregation of prune aggregate fork decisions -----------------
+
+PRUNE_FORK_DECISION_AGGREGATE_VERSION = 1
+
+PFDA_PACKET = PFDA_DECISION
+PFDA_INPUTS = PBA_INPUTS
+PFDA_DECLARATION = PBA_DECLARATION
+PFDA_PRUNE_POLICY_DIGEST = PBA_PRUNE_POLICY_DIGEST
+PFDA_SITE_POLICY_DIGEST = PBA_SITE_POLICY_DIGEST
+PFDA_DECISION_SITE_POLICY_DIGEST = "decisionSitePolicyDigest"
+PFDA_AGGREGATE_DIGEST = "aggregateDigest"
+PFDA_CONCLUSIONS = "conclusions"
+PFDA_PROOFS = PAFD_PROOFS
+
+_PFDA_ITEM_KEYS = frozenset((ID, PFDA_PACKET))
+_PFDA_TOP_KEYS = frozenset((TICKET_PAYLOAD, SIGNATURE))
+_PFDA_PAYLOAD_KEYS = frozenset((
+    PFDA_INPUTS,
+    VD_ISSUER,
+    ITEMS,
+    KEY_VERSION,
+    PFDA_PRUNE_POLICY_DIGEST,
+    PFDA_SITE_POLICY_DIGEST,
+    PFDA_DECISION_SITE_POLICY_DIGEST,
+    PFDA_DECLARATION,
+    STATUS,
+    VERSION,
+))
+_PFDA_ROW_KEYS = frozenset((
+    ADJ_CONCLUSION,
+    CP_DIGEST,
+    ID,
+    VD_ISSUER,
+    KEY_VERSION,
+    ADJ_REASON,
+    PFDA_DECLARATION,
+))
+_PFDA_DECLARATION_KEYS = frozenset((
+    PAFD_COMMON,
+    PFDA_CONCLUSIONS,
+    PFDA_PROOFS,
+    STATUS,
+))
+_PFDA_DECLARATION_ENTRY_KEYS = frozenset((
+    ADJ_CONCLUSION,
+    CP_DIGEST,
+    PAFD_EDGES,
+    ID,
+    ADJ_REASON,
+    VD_ISSUER,
+))
+_PFDA_INVALID_REASONS = _PBA_INVALID_REASONS
+_PFDA_RESULT_KEYS = (
+    PFDA_AGGREGATE_DIGEST,
+    PFDA_INPUTS,
+    VD_ISSUER,
+    ITEMS,
+    KEY_VERSION,
+    PFDA_PRUNE_POLICY_DIGEST,
+    PFDA_SITE_POLICY_DIGEST,
+    PFDA_DECISION_SITE_POLICY_DIGEST,
+    PFDA_DECLARATION,
+    STATUS,
+    VERSION,
+)
+
+
+class InvalidAggregateForkDecisionAggregateError(ValueError):
+    """A signed fork-decision aggregate breaks its binding contract."""
+
+
+def _pfda_invalid(message: str) -> InvalidAggregateForkDecisionAggregateError:
+    return InvalidAggregateForkDecisionAggregateError(
+        f"invalid prune fork decision aggregate: {message}"
+    )
+
+
+def _reject_duplicate_pfda_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate aggregate keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _pfda_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _pfda_declaration_entry(row: dict) -> dict:
+    """One sorted per-item conclusion entry of a complete declaration."""
+    return {
+        ADJ_CONCLUSION: row[ADJ_CONCLUSION],
+        CP_DIGEST: row[PAFD_FORK_PROOF_DIGEST],
+        PAFD_EDGES: (
+            None
+            if row[PAFD_EDGES] is None
+            else [dict(edge) for edge in row[PAFD_EDGES]]
+        ),
+        ID: row[ID],
+        ADJ_REASON: row[ADJ_REASON],
+        VD_ISSUER: row[VD_ISSUER],
+    }
+
+
+def _pfda_declaration(payload: dict) -> dict:
+    """The complete declaration one authenticated decision carries.
+
+    The declaration binds the decision's common fork edge set, its
+    per-item conclusions (each entry carrying the conclusion, the proof
+    digest, the authenticated fork edges or null, the item id, the
+    reason and the declaring site, sorted by site then id), the
+    original-order proof digest vector and the overall status.
+    """
+    return {
+        PAFD_COMMON: copy.deepcopy(payload[PAFD_COMMON]),
+        PFDA_CONCLUSIONS: [
+            _pfda_declaration_entry(row) for row in payload[ITEMS]
+        ],
+        PFDA_PROOFS: list(payload[PAFD_PROOFS]),
+        STATUS: payload[STATUS],
+    }
+
+
+def _pfda_aggregate_row(
+    item_id: str,
+    decision_digest: str,
+    site: str | None,
+    key_version: int | None,
+    declaration: dict | None,
+    conclusion: str,
+    reason: str | None,
+) -> dict:
+    """One per-decision aggregation row with the bound key order."""
+    return {
+        ADJ_CONCLUSION: conclusion,
+        CP_DIGEST: decision_digest,
+        ID: item_id,
+        VD_ISSUER: site,
+        KEY_VERSION: key_version,
+        ADJ_REASON: reason,
+        PFDA_DECLARATION: declaration,
+    }
+
+
+def _aggregate_pfda_one(
+    item: dict,
+    prune_policy_digest: str,
+    site_policy_digest: str,
+    fork_threshold: int,
+    decision_site_policy: dict,
+    keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Re-verify, authenticate and authorize one fork decision in isolation.
+
+    The decision bytes first pass the exact
+    :func:`verify_prune_aggregate_fork_decision` structural and binding
+    rules, then the HMAC is checked against the current keyring, and
+    finally the exact payload issuer and key version are authorized
+    against the decision site policy with no fallback.  Any failure
+    rejects just this row with one fixed reason (``invalid``,
+    ``unauthenticated`` or ``unauthorized``) and never affects the
+    other items.
+    """
+    item_id = item[ID]
+    raw = item[PFDA_PACKET]
+    decision_digest = hashlib.sha256(raw).hexdigest()
+
+    def invalid_row() -> dict:
+        return _pfda_aggregate_row(
+            item_id, decision_digest, None, None, None,
+            PA_CONCLUSION_INVALID, PA_CONCLUSION_INVALID,
+        )
+
+    try:
+        payload, signature = _parse_pafd(raw)
+    except (TypeError, ValueError):
+        return invalid_row()
+
+    site = payload[VD_ISSUER]
+    key_version = payload[KEY_VERSION]
+
+    if payload[PAFD_PRUNE_POLICY_DIGEST] != prune_policy_digest:
+        return invalid_row()
+    if payload[PAFD_SITE_POLICY_DIGEST] != site_policy_digest:
+        return invalid_row()
+    try:
+        _reconcile_pafd(payload, fork_threshold)
+    except InvalidAggregateForkDecisionError:
+        return invalid_row()
+
+    def unauthenticated_row() -> dict:
+        return _pfda_aggregate_row(
+            item_id, decision_digest, site, key_version, None,
+            PA_CONCLUSION_INVALID, PA_REASON_UNAUTHENTICATED,
+        )
+
+    key_entry = None
+    for candidate in keyring.get(site, ()):
+        if candidate[VERSION] == key_version:
+            key_entry = candidate
+            break
+    if key_entry is None or key_entry[REVOKED]:
+        return unauthenticated_row()
+    if moment < key_entry[NOT_BEFORE] or moment > key_entry[NOT_AFTER]:
+        return unauthenticated_row()
+
+    expected_signature = hmac.new(
+        bytes.fromhex(key_entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        return unauthenticated_row()
+
+    # The exact-issuer HMAC above established the site/version
+    # identity, so an authorized-policy miss may carry that identity.
+    allowed_versions = decision_site_policy[ADJ_SITES].get(site)
+    if allowed_versions is None or key_version not in allowed_versions:
+        return _pfda_aggregate_row(
+            item_id, decision_digest, site, key_version, None,
+            PA_CONCLUSION_INVALID, PA_REASON_UNAUTHORIZED,
+        )
+
+    return _pfda_aggregate_row(
+        item_id, decision_digest, site, key_version,
+        _pfda_declaration(payload), PA_CONCLUSION_VALID, None,
+    )
+
+
+def _tally_pfda_rows(
+    rows: list[dict], threshold: int
+) -> tuple[str, dict | None]:
+    """Mark duplicate/contradiction rows and derive the overall status.
+
+    Rows from one site are the same declaration only when their
+    complete declarations agree field for field -- the common fork edge
+    set, every sorted per-item conclusion entry, the original-order
+    proof digest vector and the overall status.  The smallest-id row of
+    one identical group is the vote and exact repeats are ``duplicate``,
+    while distinct declarations from one site contradict each other.
+    Distinct sites must agree on that same complete declaration -- any
+    field-level disagreement conflicts and no majority can outvote it.
+
+    A conflict of either kind binds no declaration.  Otherwise the one
+    unique agreed declaration, when one exists, is always carried:
+    backed by at least the threshold of distinct sites the tally is
+    ``accepted``, and short of the threshold it stays ``insufficient``
+    but keeps that unique declaration.  With no valid vote at all the
+    tally is ``insufficient`` with the declaration null.
+    """
+    by_site: dict[str, dict[bytes, list[dict]]] = {}
+    for row in rows:
+        if row[ADJ_CONCLUSION] in (
+            PA_CONCLUSION_VALID,
+            PA_CONCLUSION_DUPLICATE,
+            PA_CONCLUSION_CONTRADICTION,
+        ):
+            content = _prune_compact(row[PFDA_DECLARATION])
+            by_site.setdefault(row[VD_ISSUER], {}).setdefault(
+                content, []
+            ).append(row)
+
+    contradicted = False
+    votes: dict[str, bytes] = {}
+    representatives: dict[str, dict] = {}
+    for site, groups in by_site.items():
+        if len(groups) > 1:
+            contradicted = True
+            ordered_groups = sorted(
+                groups.values(),
+                key=lambda members: min(member[ID] for member in members),
+            )
+            for members in ordered_groups:
+                members.sort(key=lambda row: row[ID])
+                members[0][ADJ_CONCLUSION] = PA_CONCLUSION_CONTRADICTION
+                members[0][ADJ_REASON] = REASON_CONTRADICTION
+                for extra in members[1:]:
+                    extra[ADJ_CONCLUSION] = PA_CONCLUSION_DUPLICATE
+                    extra[ADJ_REASON] = REASON_DUPLICATE
+        else:
+            content, members = next(iter(groups.items()))
+            members.sort(key=lambda row: row[ID])
+            members[0][ADJ_CONCLUSION] = PA_CONCLUSION_VALID
+            members[0][ADJ_REASON] = None
+            for extra in members[1:]:
+                extra[ADJ_CONCLUSION] = PA_CONCLUSION_DUPLICATE
+                extra[ADJ_REASON] = REASON_DUPLICATE
+            votes[site] = content
+            representatives[site] = members[0]
+
+    contents = set(votes.values())
+    if contradicted or len(contents) > 1:
+        return PA_STATUS_CONFLICTED, None
+    if len(contents) == 1:
+        first_site = min(votes)
+        common_declaration = copy.deepcopy(
+            representatives[first_site][PFDA_DECLARATION]
+        )
+        if len(votes) >= threshold:
+            return PA_STATUS_ACCEPTED, common_declaration
+        # Unique, conflict-free evidence short of the threshold keeps
+        # the one common declaration but cannot be accepted yet.
+        return PA_STATUS_INSUFFICIENT, common_declaration
+    return PA_STATUS_INSUFFICIENT, None
+
+
+def aggregate_prune_fork_decisions(
+    items, prune_policy, site_policy, decision_site_policy,
+    keyring, moment, issuer, version,
+):
+    """Aggregate multi-site prune aggregate fork decisions offline.
+
+    ``items`` is a non-empty list; each item contains exactly a unique,
+    non-empty str ``id`` and ``decision`` bytes produced by
+    :func:`adjudicate_prune_aggregate_forks`; the whole batch structure
+    is validated before any decision is parsed.  ``prune_policy`` is
+    the shared invariant original ``{"batch", "sites", "threshold"}``
+    pruning policy and ``site_policy`` the fork-proof site
+    authorization policy the decisions were issued against;
+    ``decision_site_policy`` carries exactly ``sites`` (a non-empty
+    mapping of each site allowed to hand over decisions to its
+    non-empty set of allowed positive key versions) and ``threshold``
+    (a positive integer no greater than the site count).  ``keyring``
+    follows the existing rules, ``moment`` is the current time and
+    ``issuer``/``version`` name the aggregate signing credentials.  No
+    file is read or written and no input is modified.
+
+    Every decision is first re-verified on its own through the exact
+    :func:`verify_prune_aggregate_fork_decision` rules -- canonical
+    structure, both policy digest bindings and a full re-tally of the
+    bound per-proof rows -- then authenticated against the current
+    keyring by its exact payload issuer and key version, and finally
+    authorized precisely against ``decision_site_policy`` with no
+    fallback: a structurally illegal decision or one with a broken
+    binding is recorded ``invalid`` with reason ``invalid`` (and
+    carries no identity), unknown, revoked, not-yet-valid or expired
+    credentials or a wrong signature ``unauthenticated``, and an
+    authenticated but unauthorized site or key version
+    ``unauthorized``, each rejecting only that item while the others
+    continue.  A valid decision counts as the issuing site's complete
+    declaration: the common fork edge set, the per-item conclusions
+    (sorted by site then id, each entry carrying its conclusion, proof
+    digest, authenticated fork edges or null, id, reason and site), the
+    original-order proof digest vector and the overall status.  For one
+    site, an exactly identical complete declaration counts once and
+    repeats are ``duplicate``; any field-level difference is a
+    ``contradiction``.  Distinct sites must agree on that same complete
+    declaration -- any difference makes the aggregate ``conflicted``,
+    the common declaration is bound null and no majority can outvote
+    the disagreement.  One unique declaration backed by at least the
+    threshold of distinct sites is ``accepted``; short of the threshold
+    it stays ``insufficient`` but still carries that common
+    declaration; with no valid vote the declaration is null.
+
+    The result is one canonical compact UTF-8 JSON object with
+    recursively sorted keys, non-ASCII preserved and no trailing byte,
+    carrying exactly ``payload`` and ``signature``.  The payload binds
+    exactly ``inputs`` (each input decision's SHA-256 in the original
+    input order, so a reordering is detectable), ``issuer``, ``items``
+    (the per-decision rows sorted stably by site then id, each carrying
+    ``conclusion``, the decision ``digest``, ``id``, ``issuer``,
+    ``keyVersion``, ``reason`` and the authenticated ``declaration`` or
+    null), ``keyVersion``, ``prunePolicyDigest``, ``sitePolicyDigest``,
+    ``decisionSitePolicyDigest``, ``declaration`` (the one common
+    complete declaration, or null), ``status`` and ``version`` (the
+    integer 1).  The signature is the lowercase hex HMAC-SHA256 of the
+    canonical compact payload bytes under the exact issuer/version key.
+    A parameter, container or public field type fault raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); an
+    empty list, an empty or duplicate id or an illegal policy,
+    threshold, moment, issuer or version raises :class:`ValueError`;
+    unknown, revoked, not-yet-valid or expired aggregate credentials
+    raise :class:`AuthenticationError`.
+    """
+    validated_items = _validated_pfda_decision_items(items)
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
+    validated_decision_site_policy = _validated_prune_batch_site_policy(
+        decision_site_policy
+    )
+    validated_keyring = _validated_keyring(keyring)
+    aggregate_moment = _fe_moment(moment, "moment")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+
+    prune_policy_digest = hashlib.sha256(
+        _verdict_policy_bytes(validated_prune_policy)
+    ).hexdigest()
+    site_policy_digest = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_site_policy)
+    ).hexdigest()
+    rows = [
+        _aggregate_pfda_one(
+            item,
+            prune_policy_digest,
+            site_policy_digest,
+            validated_site_policy[ADJ_THRESHOLD],
+            validated_decision_site_policy,
+            validated_keyring,
+            aggregate_moment,
+        )
+        for item in validated_items
+    ]
+    input_digests = [row[CP_DIGEST] for row in rows]
+    status, common_declaration = _tally_pfda_rows(
+        rows, validated_decision_site_policy[ADJ_THRESHOLD]
+    )
+    rows.sort(
+        key=lambda row: (
+            row[VD_ISSUER] is not None,
+            row[VD_ISSUER] or "",
+            row[ID],
+        )
+    )
+
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, aggregate_moment
+    )
+    payload = {
+        PFDA_INPUTS: input_digests,
+        VD_ISSUER: issuer,
+        ITEMS: rows,
+        KEY_VERSION: version,
+        PFDA_PRUNE_POLICY_DIGEST: prune_policy_digest,
+        PFDA_SITE_POLICY_DIGEST: site_policy_digest,
+        PFDA_DECISION_SITE_POLICY_DIGEST: hashlib.sha256(
+            _prune_batch_site_policy_bytes(validated_decision_site_policy)
+        ).hexdigest(),
+        PFDA_DECLARATION: common_declaration,
+        STATUS: status,
+        VERSION: PRUNE_FORK_DECISION_AGGREGATE_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+def _validated_pfda_declaration_entry(value: object, where: str) -> dict:
+    """Validate one per-item conclusion entry inside a declaration."""
+    if not isinstance(value, dict):
+        raise TypeError(f"{where} entry must be an object")
+    if set(value.keys()) != _PFDA_DECLARATION_ENTRY_KEYS:
+        raise _pfda_invalid(
+            f"{where} entry must contain exactly the keys 'conclusion', "
+            "'digest', 'edges', 'id', 'reason' and 'site'"
+        )
+    entry_id = value[ID]
+    if not isinstance(entry_id, str):
+        raise TypeError(f"{where} entry id must be a str")
+    if entry_id == "":
+        raise _pfda_invalid(f"{where} entry id must be non-empty")
+    digest = value[CP_DIGEST]
+    if not isinstance(digest, str):
+        raise TypeError(f"{where} entry digest must be a str")
+    if not _prune_is_digest(digest):
+        raise _pfda_invalid(
+            f"{where} entry digest must be 64 lowercase hex characters"
+        )
+    site = value[VD_ISSUER]
+    if site is not None:
+        if not isinstance(site, str):
+            raise TypeError(f"{where} entry site must be a str or null")
+        if site == "":
+            raise _pfda_invalid(f"{where} entry site must be non-empty")
+    conclusion = value[ADJ_CONCLUSION]
+    if not isinstance(conclusion, str):
+        raise TypeError(f"{where} entry conclusion must be a str")
+    if conclusion not in _PAFD_CONCLUSIONS:
+        raise _pfda_invalid(f"{where} entry conclusion is not known")
+    reason = value[ADJ_REASON]
+    if conclusion == _PAFD_CONCLUSION_VALID:
+        if reason is not None:
+            raise _pfda_invalid(
+                f"{where} entry reason must be null for a valid item"
+            )
+    else:
+        if not isinstance(reason, str):
+            raise TypeError(f"{where} entry reason must be a str")
+        if reason not in _PAFD_REASONS:
+            raise _pfda_invalid(f"{where} entry reason is not known")
+    if conclusion == _PAFD_CONCLUSION_INVALID:
+        if reason not in _PAFD_INVALID_REASONS:
+            raise _pfda_invalid(
+                f"{where} entry reason does not match an invalid item"
+            )
+    elif conclusion != _PAFD_CONCLUSION_VALID:
+        if reason != conclusion:
+            raise _pfda_invalid(
+                f"{where} entry reason must match its conclusion"
+            )
+    raw_edges = value[PAFD_EDGES]
+    if raw_edges is not None:
+        if not isinstance(raw_edges, list):
+            raise TypeError(f"{where} entry edges must be a list or null")
+        if not raw_edges:
+            raise _pfda_invalid(
+                f"{where} entry edges must be non-empty for an "
+                "authenticated proof"
+            )
+        edges = [
+            _validated_pafd_edge(edge_value, where)
+            for edge_value in raw_edges
+        ]
+        triples = _pac_fork_edge_triples(edges)
+        if len(set(triples)) != len(triples):
+            raise _pfda_invalid(f"{where} entry edges must be unique")
+        if list(triples) != sorted(triples):
+            raise _pfda_invalid(
+                f"{where} entry edges must be sorted ascending"
+            )
+    else:
+        edges = None
+    identity_expected = reason != _PAFD_REASON_INVALID_PROOF
+    if identity_expected:
+        if site is None or edges is None:
+            raise _pfda_invalid(
+                f"{where} an authenticated entry must carry its site and "
+                "fork edges"
+            )
+    elif site is not None or edges is not None:
+        raise _pfda_invalid(
+            f"{where} an invalid-proof entry must carry no site or fork "
+            "edges"
+        )
+    return {
+        ADJ_CONCLUSION: conclusion,
+        CP_DIGEST: digest,
+        PAFD_EDGES: edges,
+        ID: entry_id,
+        ADJ_REASON: reason,
+        VD_ISSUER: site,
+    }
+
+
+def _validated_pfda_declaration(value: object, where: str) -> dict | None:
+    """Structurally validate one complete declaration into a fresh dict.
+
+    The declaration carries exactly ``common`` (the common fork edge
+    set, or null), ``conclusions`` (the per-item conclusion entries,
+    sorted by site then id), ``proofs`` (the original-order proof
+    digest vector) and ``status``; a conflicted status binds no common
+    set and an accepted status must bind one.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise TypeError(f"{where} must be an object or null")
+    if set(value.keys()) != _PFDA_DECLARATION_KEYS:
+        raise _pfda_invalid(
+            f"{where} must contain exactly the keys 'common', "
+            "'conclusions', 'proofs' and 'status'"
+        )
+    status = value[STATUS]
+    if not isinstance(status, str):
+        raise TypeError(f"{where} status must be a str")
+    if status not in _PAFD_STATUSES:
+        raise _pfda_invalid(f"{where} status is not a known status")
+
+    common = value[PAFD_COMMON]
+    if common is not None:
+        if not isinstance(common, list):
+            raise TypeError(f"{where} common must be a list or null")
+        if not common:
+            raise _pfda_invalid(
+                f"{where} a bound common edge set must be non-empty"
+            )
+        common_edges = [
+            _validated_pafd_edge(edge_value, f"{where} common")
+            for edge_value in common
+        ]
+        common_triples = _pac_fork_edge_triples(common_edges)
+        if len(set(common_triples)) != len(common_triples) or list(
+            common_triples
+        ) != sorted(common_triples):
+            raise _pfda_invalid(
+                f"{where} common edges must be unique and sorted ascending"
+            )
+    else:
+        common_edges = None
+    if status == _PAFD_STATUS_CONFLICTED and common is not None:
+        raise _pfda_invalid(
+            f"{where} a conflicted declaration must bind no common set"
+        )
+    if status == _PAFD_STATUS_ACCEPTED and common is None:
+        raise _pfda_invalid(
+            f"{where} an accepted declaration must bind its common set"
+        )
+
+    raw_entries = value[PFDA_CONCLUSIONS]
+    if not isinstance(raw_entries, list):
+        raise TypeError(f"{where} conclusions must be a list")
+    if not raw_entries:
+        raise _pfda_invalid(f"{where} conclusions must be non-empty")
+    entries = [
+        _validated_pfda_declaration_entry(entry_value, where)
+        for entry_value in raw_entries
+    ]
+    entry_ids = [entry[ID] for entry in entries]
+    if len(set(entry_ids)) != len(entry_ids):
+        raise _pfda_invalid(f"{where} conclusions must not repeat an id")
+    expected_order = sorted(
+        entries,
+        key=lambda entry: (
+            entry[VD_ISSUER] is not None,
+            entry[VD_ISSUER] or "",
+            entry[ID],
+        ),
+    )
+    if [entry[ID] for entry in expected_order] != entry_ids:
+        raise _pfda_invalid(
+            f"{where} conclusions must be sorted by site then id"
+        )
+
+    proofs = value[PFDA_PROOFS]
+    if not isinstance(proofs, list):
+        raise TypeError(f"{where} proofs must be a list")
+    if not proofs:
+        raise _pfda_invalid(f"{where} proofs must be non-empty")
+    for position, digest in enumerate(proofs):
+        if not isinstance(digest, str):
+            raise TypeError(f"{where} proof {position} digest must be a str")
+        if not _prune_is_digest(digest):
+            raise _pfda_invalid(
+                f"{where} proof {position} digest must be 64 lowercase hex "
+                "characters"
+            )
+    if len(proofs) != len(entries):
+        raise _pfda_invalid(
+            f"{where} the conclusions must cover every proof and vice versa"
+        )
+    if sorted(proofs) != sorted(entry[CP_DIGEST] for entry in entries):
+        raise _pfda_invalid(
+            f"{where} the bound proof digests must equal the per-entry "
+            "digests"
+        )
+
+    return {
+        PAFD_COMMON: common_edges,
+        PFDA_CONCLUSIONS: entries,
+        PFDA_PROOFS: list(proofs),
+        STATUS: status,
+    }
+
+
+def _parse_pfda(raw: object) -> tuple[dict, str]:
+    """Validate aggregate bytes structurally into ``(payload, signature)``.
+
+    A non-bytes argument or a public field of the wrong JSON type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, digest, ordering, row-shape or
+    declaration-shape fault raises
+    :class:`InvalidAggregateForkDecisionAggregateError`.  The policy
+    digests, tally and credential bindings are checked by
+    :func:`verify_prune_fork_decision_aggregate`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("aggregate packet must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _pfda_invalid(
+            "aggregate packet must end with the closing brace, no "
+            "trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _pfda_invalid("aggregate packet is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_pfda_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _pfda_invalid("aggregate packet is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("aggregate packet must be a JSON object")
+    if set(data.keys()) != _PFDA_TOP_KEYS:
+        raise _pfda_invalid(
+            "aggregate packet must contain exactly the keys 'payload' and "
+            "'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("aggregate packet signature must be a str")
+    if not _prune_is_digest(signature):
+        raise _pfda_invalid(
+            "aggregate packet signature must be 64 lowercase hex characters"
+        )
+
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("aggregate packet payload must be an object")
+    if set(payload.keys()) != _PFDA_PAYLOAD_KEYS:
+        raise _pfda_invalid(
+            "aggregate packet payload must contain exactly the keys "
+            "'inputs', 'issuer', 'items', 'keyVersion', "
+            "'prunePolicyDigest', 'sitePolicyDigest', "
+            "'decisionSitePolicyDigest', 'declaration', 'status' and "
+            "'version'"
+        )
+
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("aggregate payload issuer must be a str")
+    if issuer == "":
+        raise _pfda_invalid("aggregate payload issuer must be a non-empty str")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("aggregate payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _pfda_invalid("aggregate payload keyVersion must be positive")
+    for field in (
+        PFDA_PRUNE_POLICY_DIGEST,
+        PFDA_SITE_POLICY_DIGEST,
+        PFDA_DECISION_SITE_POLICY_DIGEST,
+    ):
+        digest = payload[field]
+        if not isinstance(digest, str):
+            raise TypeError(f"aggregate payload {field} must be a str")
+        if not _prune_is_digest(digest):
+            raise _pfda_invalid(
+                f"aggregate payload {field} must be 64 lowercase hex "
+                "characters"
+            )
+    status = payload[STATUS]
+    if not isinstance(status, str):
+        raise TypeError("aggregate status must be a str")
+    if status not in _PA_STATUSES:
+        raise _pfda_invalid("aggregate status is not a known status")
+    version = payload[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("aggregate payload version must be an int")
+    if version != PRUNE_FORK_DECISION_AGGREGATE_VERSION:
+        raise _pfda_invalid("aggregate payload version must be the integer 1")
+
+    inputs = payload[PFDA_INPUTS]
+    if not isinstance(inputs, list):
+        raise TypeError("aggregate inputs must be a list")
+    if not inputs:
+        raise _pfda_invalid("aggregate inputs must be a non-empty list")
+    for position, digest in enumerate(inputs):
+        if not isinstance(digest, str):
+            raise TypeError(f"aggregate input {position} digest must be a str")
+        if not _prune_is_digest(digest):
+            raise _pfda_invalid(
+                f"aggregate input {position} digest must be 64 lowercase "
+                "hex characters"
+            )
+
+    rows = payload[ITEMS]
+    if not isinstance(rows, list):
+        raise TypeError("aggregate items must be a list")
+    if not rows:
+        raise _pfda_invalid("aggregate items must be a non-empty list")
+    if len(rows) != len(inputs):
+        raise _pfda_invalid(
+            "the items must cover every input and vice versa"
+        )
+    seen_row_ids: set[str] = set()
+    parsed_rows: list[dict] = []
+    for position, row in enumerate(rows):
+        where = f"aggregate item {position}"
+        if not isinstance(row, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(row.keys()) != _PFDA_ROW_KEYS:
+            raise _pfda_invalid(
+                f"{where} must contain exactly the keys 'conclusion', "
+                "'digest', 'id', 'issuer', 'keyVersion', 'reason' and "
+                "'declaration'"
+            )
+        row_id = row[ID]
+        if not isinstance(row_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if row_id == "":
+            raise _pfda_invalid(f"{where} id must be non-empty")
+        if row_id in seen_row_ids:
+            raise _pfda_invalid(f"{where} repeats an id")
+        seen_row_ids.add(row_id)
+        digest = row[CP_DIGEST]
+        if not isinstance(digest, str):
+            raise TypeError(f"{where} digest must be a str")
+        if not _prune_is_digest(digest):
+            raise _pfda_invalid(
+                f"{where} digest must be 64 lowercase hex characters"
+            )
+        site = row[VD_ISSUER]
+        if site is not None and not isinstance(site, str):
+            raise TypeError(f"{where} issuer must be a str or null")
+        if site == "":
+            raise _pfda_invalid(f"{where} issuer must be non-empty")
+        row_key_version = row[KEY_VERSION]
+        if isinstance(row_key_version, bool) or not isinstance(
+            row_key_version, int
+        ):
+            if row_key_version is not None:
+                raise TypeError(f"{where} keyVersion must be an int or null")
+        elif row_key_version <= 0:
+            raise _pfda_invalid(f"{where} keyVersion must be positive")
+        if (site is None) != (row_key_version is None):
+            raise _pfda_invalid(
+                f"{where} issuer and keyVersion must be null together"
+            )
+        conclusion = row[ADJ_CONCLUSION]
+        if not isinstance(conclusion, str):
+            raise TypeError(f"{where} conclusion must be a str")
+        reason = row[ADJ_REASON]
+        if conclusion == PA_CONCLUSION_VALID:
+            if reason is not None:
+                raise _pfda_invalid(
+                    f"{where} reason must be null for a valid row"
+                )
+        elif conclusion == PA_CONCLUSION_INVALID:
+            if reason not in _PFDA_INVALID_REASONS:
+                raise _pfda_invalid(
+                    f"{where} reason must be one of 'invalid', "
+                    "'unauthenticated' or 'unauthorized'"
+                )
+        elif conclusion in (
+            PA_CONCLUSION_DUPLICATE, PA_CONCLUSION_CONTRADICTION
+        ):
+            expected = (
+                REASON_DUPLICATE
+                if conclusion == PA_CONCLUSION_DUPLICATE
+                else REASON_CONTRADICTION
+            )
+            if reason != expected:
+                raise _pfda_invalid(
+                    f"{where} reason must match its conclusion"
+                )
+        else:
+            raise _pfda_invalid(f"{where} conclusion is not known")
+        identity_present = reason != PA_CONCLUSION_INVALID
+        if identity_present:
+            if site is None:
+                raise _pfda_invalid(
+                    f"{where} an authenticated or authorized row must carry "
+                    "its issuer"
+                )
+        elif site is not None:
+            raise _pfda_invalid(
+                f"{where} an invalid row must carry no issuer"
+            )
+        raw_declaration = row[PFDA_DECLARATION]
+        if conclusion == PA_CONCLUSION_INVALID:
+            if raw_declaration is not None:
+                raise _pfda_invalid(
+                    f"{where} an invalid row must carry no declaration"
+                )
+            parsed_declaration = None
+        else:
+            parsed_declaration = _validated_pfda_declaration(
+                raw_declaration, f"{where} declaration"
+            )
+            if parsed_declaration is None:
+                raise _pfda_invalid(
+                    f"{where} a counted row must carry its declaration"
+                )
+        parsed_rows.append({
+            ADJ_CONCLUSION: conclusion,
+            CP_DIGEST: digest,
+            ID: row_id,
+            VD_ISSUER: site,
+            KEY_VERSION: row_key_version,
+            ADJ_REASON: reason,
+            PFDA_DECLARATION: parsed_declaration,
+        })
+
+    common_declaration = _validated_pfda_declaration(
+        payload[PFDA_DECLARATION], "aggregate declaration"
+    )
+
+    normalized_payload = {
+        PFDA_INPUTS: list(inputs),
+        VD_ISSUER: issuer,
+        ITEMS: parsed_rows,
+        KEY_VERSION: key_version,
+        PFDA_PRUNE_POLICY_DIGEST: payload[PFDA_PRUNE_POLICY_DIGEST],
+        PFDA_SITE_POLICY_DIGEST: payload[PFDA_SITE_POLICY_DIGEST],
+        PFDA_DECISION_SITE_POLICY_DIGEST: payload[
+            PFDA_DECISION_SITE_POLICY_DIGEST
+        ],
+        PFDA_DECLARATION: common_declaration,
+        STATUS: status,
+        VERSION: PRUNE_FORK_DECISION_AGGREGATE_VERSION,
+    }
+    if _prune_compact({TICKET_PAYLOAD: normalized_payload,
+                       SIGNATURE: signature}) != raw:
+        raise _pfda_invalid(
+            "aggregate packet encoding is not the canonical compact form"
+        )
+    return normalized_payload, signature
+
+
+def _reconcile_pfda_declaration(
+    declaration: dict, fork_threshold: int, where: str
+) -> None:
+    """Re-tally one bound declaration as the decision it claims to be.
+
+    The declaration's per-item conclusion entries and original-order
+    proof digest vector are re-tallied through the exact
+    :func:`_reconcile_pafd` rules against the fork-proof site policy
+    threshold, so a reordered entry, a wrong duplicate or contradiction
+    marking, a tampered common set or a mis-stated status cannot hide
+    inside a counted declaration.  Any mismatch raises
+    :class:`InvalidAggregateForkDecisionAggregateError`.
+    """
+    synthetic_payload = {
+        PAFD_COMMON: declaration[PAFD_COMMON],
+        ITEMS: [
+            {
+                ADJ_CONCLUSION: entry[ADJ_CONCLUSION],
+                PAFD_EDGES: entry[PAFD_EDGES],
+                ID: entry[ID],
+                KEY_VERSION: None,
+                PAFD_FORK_PROOF_DIGEST: entry[CP_DIGEST],
+                ADJ_REASON: entry[ADJ_REASON],
+                VD_ISSUER: entry[VD_ISSUER],
+            }
+            for entry in declaration[PFDA_CONCLUSIONS]
+        ],
+        PAFD_PROOFS: declaration[PFDA_PROOFS],
+        STATUS: declaration[STATUS],
+    }
+    try:
+        _reconcile_pafd(synthetic_payload, fork_threshold)
+    except InvalidAggregateForkDecisionError as exc:
+        raise _pfda_invalid(f"{where}: {exc}") from exc
+
+
+def _reconcile_pfda_aggregate(
+    payload: dict, fork_threshold: int, decision_threshold: int
+) -> None:
+    """Re-derive every aggregate binding of a parsed aggregate payload.
+
+    Re-tallies the per-decision rows the signature covers -- the
+    original-order input digest bindings, row ordering, same-site
+    duplicate and contradiction markings, cross-site complete
+    declaration agreement, the threshold acceptance and the claimed
+    common declaration and status -- and re-tallies every counted
+    declaration against the fork-proof site policy threshold, without
+    seeing any decision bytes.  Any mismatch raises
+    :class:`InvalidAggregateForkDecisionAggregateError`.
+    """
+    rows = payload[ITEMS]
+    inputs = payload[PFDA_INPUTS]
+
+    expected_order = sorted(
+        rows,
+        key=lambda row: (
+            row[VD_ISSUER] is not None,
+            row[VD_ISSUER] or "",
+            row[ID],
+        ),
+    )
+    if [row[ID] for row in expected_order] != [row[ID] for row in rows]:
+        raise _pfda_invalid("items must be sorted by issuer then id")
+    if sorted(row[CP_DIGEST] for row in rows) != sorted(inputs):
+        raise _pfda_invalid(
+            "the bound input digests must equal the per-item digests"
+        )
+
+    # Deep-copy the parsed rows before the tally mutates their
+    # conclusion/reason markings; the signed payload itself is compared
+    # through freshly derived structures only.
+    working_rows = copy.deepcopy(rows)
+    derived_status, derived_declaration = _tally_pfda_rows(
+        working_rows, decision_threshold
+    )
+
+    for expected_row, bound_row in zip(working_rows, rows):
+        if expected_row[ADJ_CONCLUSION] != bound_row[ADJ_CONCLUSION]:
+            raise _pfda_invalid(
+                f"item {bound_row[ID]!r} has the wrong conclusion"
+            )
+        if expected_row[ADJ_REASON] != bound_row[ADJ_REASON]:
+            raise _pfda_invalid(
+                f"item {bound_row[ID]!r} has the wrong reason"
+            )
+
+    if payload[STATUS] != derived_status:
+        raise _pfda_invalid(
+            "the bound status does not match the tallied items"
+        )
+    bound_declaration = payload[PFDA_DECLARATION]
+    if derived_declaration is None:
+        if bound_declaration is not None:
+            raise _pfda_invalid(
+                "the common declaration must be null when no unique "
+                "conflict-free declaration was tallied"
+            )
+    else:
+        if bound_declaration is None:
+            raise _pfda_invalid(
+                "an aggregate over one unique conflict-free declaration "
+                "must carry the common declaration"
+            )
+        if bound_declaration != derived_declaration:
+            raise _pfda_invalid(
+                "the bound common declaration does not match the tallied "
+                "decisions"
+            )
+
+    # Every counted declaration must itself re-tally as the decision it
+    # claims to be, purely from its bound conclusions and proof vector.
+    for row in rows:
+        declaration = row[PFDA_DECLARATION]
+        if declaration is None:
+            continue
+        _reconcile_pfda_declaration(
+            declaration, fork_threshold, f"aggregate item {row[ID]!r}"
+        )
+    if bound_declaration is not None:
+        _reconcile_pfda_declaration(
+            bound_declaration, fork_threshold, "aggregate declaration"
+        )
+
+
+def _verify_pfda_core(
+    aggregate: bytes,
+    validated_prune_policy: dict,
+    validated_site_policy: dict,
+    validated_decision_site_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    verify_moment: int,
+) -> dict:
+    """Verify one fork-decision aggregate from validated shared materials."""
+    payload, signature = _parse_pfda(aggregate)
+    expected_prune_digest = hashlib.sha256(
+        _verdict_policy_bytes(validated_prune_policy)
+    ).hexdigest()
+    if payload[PFDA_PRUNE_POLICY_DIGEST] != expected_prune_digest:
+        raise _pfda_invalid(
+            "prune policy digest does not match the prune policy"
+        )
+    expected_site_digest = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_site_policy)
+    ).hexdigest()
+    if payload[PFDA_SITE_POLICY_DIGEST] != expected_site_digest:
+        raise _pfda_invalid(
+            "site policy digest does not match the site policy"
+        )
+    expected_decision_site_digest = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_decision_site_policy)
+    ).hexdigest()
+    if payload[PFDA_DECISION_SITE_POLICY_DIGEST] != (
+        expected_decision_site_digest
+    ):
+        raise _pfda_invalid(
+            "decision site policy digest does not match the decision "
+            "site policy"
+        )
+
+    _reconcile_pfda_aggregate(
+        payload,
+        validated_site_policy[ADJ_THRESHOLD],
+        validated_decision_site_policy[ADJ_THRESHOLD],
+    )
+
+    entry = _usable_checkpoint_key(
+        validated_keyring,
+        payload[VD_ISSUER],
+        payload[KEY_VERSION],
+        verify_moment,
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "prune fork decision aggregate signature does not match"
+        )
+    return payload
+
+
+def verify_prune_fork_decision_aggregate(
+    aggregate, prune_policy, site_policy, decision_site_policy,
+    keyring, moment,
+):
+    """Verify a signed cross-site fork-decision aggregate entirely offline.
+
+    Only the aggregate bytes, the expected shared ``prune_policy``, the
+    expected fork-proof ``site_policy``, the expected
+    ``decision_site_policy``, the current ``keyring`` and the
+    verification ``moment`` are consulted -- no file is read or written
+    and no argument is modified.  Verification validates the canonical
+    encoding and every key set, recomputes all three policy digests,
+    and re-tallies the bound per-decision rows purely from the signed
+    payload: the original-order input digest bindings, the issuer/id
+    row ordering, same-site duplicate and contradiction markings,
+    cross-site complete declaration agreement (the common fork edge
+    set, the per-item conclusions and the overall status together), the
+    threshold outcome and the claimed common declaration, together with
+    a full re-tally of every counted declaration against the fork-proof
+    site policy threshold.  It then checks the HMAC-SHA256 against the
+    key the *current* keyring binds to the payload's exact issuer and
+    version, usable at the verification moment, so a later revocation
+    or expiry rejects the aggregate with no fallback.
+
+    On success a fresh dict equal to the authenticated payload plus
+    ``aggregateDigest`` (the SHA-256 of the aggregate bytes) is
+    returned with the fixed keys ``aggregateDigest``, ``inputs``,
+    ``issuer``, ``items``, ``keyVersion``, ``prunePolicyDigest``,
+    ``sitePolicyDigest``, ``decisionSitePolicyDigest``, ``declaration``,
+    ``status`` and ``version`` (the integer 1) -- repeated calls return
+    equal but mutually independent objects sharing no mutable
+    structure.  A non-bytes aggregate or a public field of the wrong
+    type raises :class:`TypeError` (a :class:`bool` never poses as an
+    int); an illegal policy, keyring or moment raises
+    :class:`ValueError`; an illegal encoding, key set, digest,
+    ordering, tally or declaration binding raises
+    :class:`InvalidAggregateForkDecisionAggregateError` (a
+    :class:`ValueError` subclass); unknown, revoked, not-yet-valid or
+    expired credentials or a signature mismatch raise
+    :class:`AuthenticationError`.
+    """
+    if not isinstance(aggregate, bytes):
+        raise TypeError("aggregate packet must be bytes")
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
+    validated_decision_site_policy = _validated_prune_batch_site_policy(
+        decision_site_policy
+    )
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    payload = _verify_pfda_core(
+        aggregate,
+        validated_prune_policy,
+        validated_site_policy,
+        validated_decision_site_policy,
+        validated_keyring,
+        verify_moment,
+    )
+    authenticated = copy.deepcopy(payload)
+    return {
+        key: (
+            hashlib.sha256(aggregate).hexdigest()
+            if key == PFDA_AGGREGATE_DIGEST
+            else authenticated[key]
+        )
+        for key in _PFDA_RESULT_KEYS
     }
