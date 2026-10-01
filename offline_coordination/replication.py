@@ -40,6 +40,52 @@ append itself is atomic: when the write, flush or fsync step raises
 :class:`OSError` the error propagates unchanged and the log is left
 byte-identical to its pre-call state (still missing when it was missing).
 
+:func:`export_signed_batch` is the authenticated, byte-budgeted form of
+:func:`export_batch` for moving a contiguous log run over removable media
+or a short-lived link.  It takes the audit ``path``, ``after``,
+``max_bytes``, a non-empty ``session``, a ``keyring`` in the
+:func:`apply_signed_remote` shape, the exact ``issuer``/``version``
+credentials and the signing ``moment``, and returns one canonical compact
+UTF-8 JSON object with non-ASCII preserved and no trailing byte, carrying
+exactly ``payload`` and ``signature``.  The payload binds, in that fixed
+order, ``session``, ``after``, ``next``, ``complete``, ``records`` (each
+keeping the audit record key order), ``issuer``, ``keyVersion``,
+``signedAt`` and ``version`` (the integer 1); ``signature`` is the
+lowercase hex HMAC-SHA256 of the payload bytes under the key the keyring
+binds to the exact issuer and version, usable at the signing moment with
+no fallback.  ``records`` is the maximal contiguous prefix after
+``after`` whose complete packet is no longer than ``max_bytes``; an
+``after`` past the log end, a non-positive ``max_bytes`` or a budget that
+cannot even hold the next required record raises :class:`ValueError`,
+never a partial packet.  Unknown, revoked, not-yet-valid or expired
+credentials raise :class:`AuthenticationError`; a corrupt log raises
+:class:`~offline_coordination.audit.CorruptAuditError` and read faults
+propagate unchanged.
+
+:func:`import_signed_batch` takes the target ``path``, the packet
+:class:`bytes`, the ``keyring`` and the verification ``moment``.  Before
+the target file is ever read it validates types, the canonical encoding
+and key sets, the contiguous seqs and internal record hash chain, that
+``signedAt`` is no later than the verification moment, that the exact
+issuer/version key is usable at *both* the signing and verification
+moments, and the HMAC signature.  Type faults raise :class:`TypeError`;
+structure, encoding or chain-binding faults raise
+:class:`InvalidSignedBatchError`; credential and signature faults raise
+:class:`AuthenticationError`.  After authentication the local log is
+read: when its last seq is below ``after`` nothing is written and the
+result is ``"missing"`` with ``need`` the closed interval
+``[localLast + 1, after]``; an overlapping record that differs gives
+``"fork"`` with ``fork`` carrying ``conflictSeq`` plus ``localHash`` and
+``receivedHash`` (a suffix whose first record does not chain onto the
+local tail is instead a chain-binding
+:class:`InvalidSignedBatchError`); a fully contained batch is
+``"duplicate"``; otherwise the contiguous suffix is appended in one
+durable step and the result is ``"applied"``.  Every result carries
+the fixed keys ``status``, ``session``, ``next``, ``complete``, ``need``
+and ``fork`` (``need``/``fork`` null except above); gaps and forks are
+never written, a failed append restores the pre-call bytes, a repeated
+import has no effect, and no input object is modified.
+
 :func:`apply_remote` persists remote state applications in a version-1
 *ledger*: one UTF-8 compact JSON object (keys sorted lexicographically,
 exactly one trailing ``\\n``) with the top-level keys ``audit``,
@@ -967,6 +1013,479 @@ def import_batch(path: str, batch: bytes) -> dict:
             os.close(dir_fd)
 
     return {NEED: None, NEXT: max(last_seq, data[NEXT]), STATUS: STATUS_APPLIED}
+
+
+# --- Authenticated, byte-budgeted signed audit batches ------------------------
+
+SB_SESSION = "session"
+SB_ISSUER = "issuer"
+SB_SIGNED_AT = "signedAt"
+SB_SIGNATURE = "signature"
+SB_PAYLOAD = "payload"
+SB_KEY_VERSION = "keyVersion"
+SB_LOCAL_HASH = "localHash"
+SB_RECEIVED_HASH = "receivedHash"
+SB_CONFLICT_SEQ = "conflictSeq"
+
+SIGNED_BATCH_VERSION = 1
+
+_SB_PACKET_KEYS = (SB_PAYLOAD, SB_SIGNATURE)
+_SB_PAYLOAD_KEYS = (
+    SB_SESSION,
+    AFTER,
+    NEXT,
+    COMPLETE,
+    RECORDS,
+    SB_ISSUER,
+    SB_KEY_VERSION,
+    SB_SIGNED_AT,
+    VERSION,
+)
+
+
+class InvalidSignedBatchError(ValueError):
+    """A signed audit batch breaks its structural or chain-binding contract."""
+
+
+def _signed_batch_invalid(message: str) -> InvalidSignedBatchError:
+    return InvalidSignedBatchError(f"invalid signed audit batch: {message}")
+
+
+def _sb_compact(obj: object) -> bytes:
+    """Canonical compact UTF-8 JSON: non-ASCII preserved, no whitespace."""
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _sb_normalize_record(record: object, index: int) -> dict:
+    """Return one validated batch record in the audit record key order.
+
+    Only the byte contract is enforced (key set/order, types, the
+    seq/prev/hash chain against the previous record); value-domain rules
+    belong to :func:`audit.append`.  A field of the wrong JSON type
+    raises :class:`TypeError`; every other fault raises
+    :class:`InvalidSignedBatchError`.
+    """
+    where = f"record {index}"
+    if not isinstance(record, dict):
+        raise TypeError(f"{where} must be an object")
+    if tuple(record.keys()) != _RECORD_KEYS:
+        raise _signed_batch_invalid(
+            f"{where} must have exactly the keys "
+            "'detail', 'hash', 'kind', 'prev', 'seq', 'source' in order"
+        )
+    seq = record[audit.SEQ]
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        raise TypeError(f"{where} seq must be an int")
+    for key in (audit.DETAIL, audit.HASH, audit.KIND, audit.PREV, audit.SOURCE):
+        if not isinstance(record[key], str):
+            raise TypeError(f"{where} {key} must be a str")
+    if _HEX64.fullmatch(record[audit.HASH]) is None:
+        raise _signed_batch_invalid(f"{where} hash must be 64 lowercase hex chars")
+    if _HEX64.fullmatch(record[audit.PREV]) is None:
+        raise _signed_batch_invalid(f"{where} prev must be 64 lowercase hex chars")
+    without_hash = {
+        audit.DETAIL: record[audit.DETAIL],
+        audit.KIND: record[audit.KIND],
+        audit.PREV: record[audit.PREV],
+        audit.SEQ: seq,
+        audit.SOURCE: record[audit.SOURCE],
+    }
+    if audit._record_hash(without_hash) != record[audit.HASH]:
+        raise _signed_batch_invalid(f"{where} hash does not match its contents")
+    return {key: record[key] for key in _RECORD_KEYS}
+
+
+def _sb_bound_payload(
+    session: str,
+    after: int,
+    records: list[dict],
+    next_seq: int,
+    complete: bool,
+    issuer: str,
+    key_version: int,
+    signed_at: int,
+) -> dict:
+    return {
+        SB_SESSION: session,
+        AFTER: after,
+        NEXT: next_seq,
+        COMPLETE: complete,
+        RECORDS: records,
+        SB_ISSUER: issuer,
+        KEY_VERSION: key_version,
+        SB_SIGNED_AT: signed_at,
+        VERSION: SIGNED_BATCH_VERSION,
+    }
+
+
+def export_signed_batch(
+    path: str,
+    after: int,
+    max_bytes: int,
+    session: str,
+    keyring: dict,
+    issuer: str,
+    version: int,
+    moment: int,
+) -> bytes:
+    """Export the maximal signed contiguous audit prefix fitting a budget.
+
+    The packet is one canonical compact UTF-8 JSON object (non-ASCII
+    preserved, no trailing byte) carrying exactly ``payload`` and
+    ``signature``; see the module docstring for the payload contract.
+    Records are the maximal contiguous prefix with ``seq`` greater than
+    ``after`` whose complete packet length is at most ``max_bytes``.
+
+    A non-:class:`str` ``path``/``session``/``issuer``, a non-int
+    ``after``/``max_bytes``/``version``/``moment`` (a :class:`bool` never
+    poses as an int) or a malformed keyring field raises
+    :class:`TypeError`; a negative ``after``, a non-positive
+    ``max_bytes``, an empty ``session``/``issuer``, a non-positive
+    ``version``, a negative ``moment``, an ``after`` past the log end or
+    a budget that cannot fit the next required record raises
+    :class:`ValueError`; unknown, revoked, not-yet-valid or expired
+    credentials raise :class:`AuthenticationError`.  A corrupt log
+    raises :class:`~offline_coordination.audit.CorruptAuditError` and
+    other read faults propagate as :class:`OSError`.  No argument is
+    modified.
+    """
+    if not isinstance(path, str):
+        raise TypeError("path must be a str")
+    if isinstance(after, bool) or not isinstance(after, int):
+        raise TypeError("after must be an int")
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+        raise TypeError("max_bytes must be an int")
+    if not isinstance(session, str):
+        raise TypeError("session must be a str")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if after < 0:
+        raise ValueError("after must be >= 0")
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+    if session == "":
+        raise ValueError("session must be non-empty")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if version <= 0:
+        raise ValueError("version must be positive")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+
+    validated_keyring = _validated_keyring(keyring)
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, moment
+    )
+
+    all_records = audit.read(path)
+    last_seq = all_records[-1][audit.SEQ] if all_records else 0
+    if after > last_seq:
+        raise ValueError("after must not exceed the last audit seq")
+    following = [
+        {key: record[key] for key in _RECORD_KEYS}
+        for record in all_records
+        if record[audit.SEQ] > after
+    ]
+    if not following:
+        # A signed batch always carries the next required record; an
+        # empty log has none to bind.
+        raise ValueError("no audit record follows after")
+    # Grow the prefix one record at a time, measuring the complete
+    # packet; stop at the first record that would overflow the budget.
+    candidate_records: list[dict] = []
+    for record in following:
+        trial = list(candidate_records)
+        trial.append(record)
+        next_seq = record[audit.SEQ]
+        complete = next_seq == last_seq
+        payload = _sb_bound_payload(
+            session, after, trial, next_seq, complete, issuer, version, moment
+        )
+        trial_bytes = _sb_compact(
+            {
+                SB_PAYLOAD: payload,
+                SB_SIGNATURE: "0" * 64,
+            }
+        )
+        if len(trial_bytes) > max_bytes:
+            break
+        candidate_records = trial
+    if not candidate_records:
+        raise ValueError("max_bytes cannot fit the next required record")
+
+    chosen = candidate_records
+    next_seq = chosen[-1][audit.SEQ]
+    payload = _sb_bound_payload(
+        session, after, chosen, next_seq, next_seq == last_seq,
+        issuer, version, moment,
+    )
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _sb_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _sb_compact({SB_PAYLOAD: payload, SB_SIGNATURE: signature})
+
+
+def _parse_signed_batch(raw: object) -> tuple[dict, str]:
+    """Validate a signed audit batch packet into ``(payload, signature)``.
+
+    A non-:class:`bytes` argument or a field of the wrong JSON type
+    raises :class:`TypeError` (a :class:`bool` never poses as an int);
+    every encoding, key-set, range, value-format, seq/prev/hash-chain or
+    binding fault raises :class:`InvalidSignedBatchError`.  Credentials,
+    the moment window and the signature are checked by
+    :func:`import_signed_batch`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("signed batch must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _signed_batch_invalid(
+            "packet must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _signed_batch_invalid("packet is not valid UTF-8") from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise _signed_batch_invalid("packet is not valid JSON") from exc
+
+    if not isinstance(data, dict) or tuple(data.keys()) != _SB_PACKET_KEYS:
+        raise _signed_batch_invalid(
+            "packet must contain exactly the keys 'payload' and 'signature' "
+            "in order"
+        )
+    signature = data[SB_SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("signed batch signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
+        raise _signed_batch_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+
+    payload = data[SB_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("signed batch payload must be an object")
+    if tuple(payload.keys()) != _SB_PAYLOAD_KEYS:
+        raise _signed_batch_invalid(
+            "payload must contain exactly the keys 'session', 'after', "
+            "'next', 'complete', 'records', 'issuer', 'keyVersion', "
+            "'signedAt' and 'version' in order"
+        )
+    session = payload[SB_SESSION]
+    if not isinstance(session, str):
+        raise TypeError("signed batch session must be a str")
+    if session == "":
+        raise _signed_batch_invalid("session must be non-empty")
+    issuer = payload[SB_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("signed batch issuer must be a str")
+    if issuer == "":
+        raise _signed_batch_invalid("issuer must be non-empty")
+    for key in (AFTER, NEXT, KEY_VERSION, SB_SIGNED_AT, VERSION):
+        value = payload[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"signed batch {key} must be an int")
+    after = payload[AFTER]
+    next_seq = payload[NEXT]
+    key_version = payload[KEY_VERSION]
+    signed_at = payload[SB_SIGNED_AT]
+    if after < 0:
+        raise _signed_batch_invalid("after must be >= 0")
+    if next_seq < after:
+        raise _signed_batch_invalid("next must be >= after")
+    if key_version <= 0:
+        raise _signed_batch_invalid("keyVersion must be positive")
+    if signed_at < 0:
+        raise _signed_batch_invalid("signedAt must be non-negative")
+    if payload[VERSION] != SIGNED_BATCH_VERSION:
+        raise _signed_batch_invalid("version must be the integer 1")
+    if not isinstance(payload[COMPLETE], bool):
+        raise TypeError("signed batch complete must be a bool")
+
+    records = payload[RECORDS]
+    if not isinstance(records, list):
+        raise TypeError("signed batch records must be a list")
+    normalized: list[dict] = []
+    expected_seq = after
+    expected_prev: str | None = audit._ZERO_HASH if after == 0 else None
+    for index, record in enumerate(records):
+        normalized_record = _sb_normalize_record(record, index)
+        expected_seq += 1
+        if normalized_record[audit.SEQ] != expected_seq:
+            raise _signed_batch_invalid(
+                f"record {index} seq is {normalized_record[audit.SEQ]}, "
+                f"expected {expected_seq}"
+            )
+        if expected_prev is not None:
+            if normalized_record[audit.PREV] != expected_prev:
+                raise _signed_batch_invalid(
+                    f"record {index} prev does not match the previous "
+                    "record hash"
+                )
+        normalized.append(normalized_record)
+        expected_prev = normalized_record[audit.HASH]
+
+    expected_next = expected_seq if records else after
+    if next_seq != expected_next:
+        raise _signed_batch_invalid(
+            "next must be the last record seq, or after when records is empty"
+        )
+    if not records and not payload[COMPLETE]:
+        raise _signed_batch_invalid("empty records require complete to be true")
+
+    normalized_payload = _sb_bound_payload(
+        session, after, normalized, next_seq, payload[COMPLETE],
+        issuer, key_version, signed_at,
+    )
+    if _sb_compact({SB_PAYLOAD: normalized_payload, SB_SIGNATURE: signature}) != raw:
+        raise _signed_batch_invalid(
+            "packet encoding is not the canonical compact form"
+        )
+    return normalized_payload, signature
+
+
+def import_signed_batch(
+    path: str, packet: bytes, keyring: dict, moment: int
+) -> dict:
+    """Authenticate a signed audit batch and append its suffix locally.
+
+    See the module docstring for the full contract.  All packet, chain,
+    moment-window, credential and signature checks run before the target
+    file is read, so an invalid or unauthenticated packet leaves no file
+    touched: type faults raise :class:`TypeError`, structural or
+    chain-binding faults raise :class:`InvalidSignedBatchError`, and an
+    unknown, revoked, not-yet-valid or expired key (at either the
+    signing or verification moment), a future ``signedAt`` or a
+    signature mismatch raises :class:`AuthenticationError`.
+
+    After authentication the target is read solely through
+    :func:`audit.read` (a corrupt log raises
+    :class:`~offline_coordination.audit.CorruptAuditError`); a gap gives
+    ``missing``, an overlap mismatch gives ``fork``, exact containment
+    gives ``duplicate`` and every other case appends the suffix in one
+    durable step and gives ``applied``.  When the first suffix record
+    does not chain onto the local tail (the link at ``after ==
+    localLast``) that is a chain-binding
+    :class:`InvalidSignedBatchError`, not a fork.  No outcome other than
+    ``applied`` writes; a failed append restores the pre-call bytes, and
+    the ``packet``/``keyring`` objects are never modified.
+    """
+    if not isinstance(path, str):
+        raise TypeError("path must be a str")
+    if not isinstance(packet, bytes):
+        raise TypeError("packet must be bytes")
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+
+    payload, signature = _parse_signed_batch(packet)
+    issuer = payload[SB_ISSUER]
+    key_version = payload[KEY_VERSION]
+    signed_at = payload[SB_SIGNED_AT]
+
+    if signed_at > verify_moment:
+        raise AuthenticationError(
+            "signed batch signedAt is later than the verification moment"
+        )
+    # The credentials must be usable at both ends: the key that signed
+    # at signedAt must still be the same live credential at moment.
+    for when in (signed_at, verify_moment):
+        entry = _usable_checkpoint_key(
+            validated_keyring, issuer, key_version, when
+        )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _sb_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError("signed audit batch signature does not match")
+
+    after = payload[AFTER]
+    next_seq = payload[NEXT]
+    complete = payload[COMPLETE]
+    session = payload[SB_SESSION]
+    records = payload[RECORDS]
+
+    local_records = audit.read(path)
+    last_seq = local_records[-1][audit.SEQ] if local_records else 0
+
+    def result(status: str, need, fork) -> dict:
+        return {
+            STATUS: status,
+            SB_SESSION: session,
+            NEXT: next_seq,
+            COMPLETE: complete,
+            NEED: need,
+            "fork": fork,
+        }
+
+    if after > last_seq:
+        return result(STATUS_MISSING, [last_seq + 1, after], None)
+
+    suffix: list[dict] = []
+    for record in records:
+        seq = record[audit.SEQ]
+        if seq <= last_seq:
+            local = local_records[seq - 1]
+            if record[audit.HASH] != local[audit.HASH]:
+                return result(
+                    "fork",
+                    None,
+                    {
+                        SB_CONFLICT_SEQ: seq,
+                        SB_LOCAL_HASH: local[audit.HASH],
+                        SB_RECEIVED_HASH: record[audit.HASH],
+                    },
+                )
+        else:
+            suffix.append(record)
+
+    if not suffix:
+        return result(STATUS_DUPLICATE, None, None)
+
+    # Records are internally contiguous from after + 1; with every
+    # overlapping record equal, an equal hash at the shared tail makes
+    # this binding automatic, and with after == last_seq it is the one
+    # link that joins two independent logs, so a mismatch is a chain
+    # binding fault rather than a fork at a shared seq.
+    local_last_hash = (
+        local_records[-1][audit.HASH] if local_records else audit._ZERO_HASH
+    )
+    if suffix[0][audit.PREV] != local_last_hash:
+        raise _signed_batch_invalid(
+            "first new record prev must match the local last record hash"
+        )
+
+    lines = b"".join(
+        audit._encode_line({key: record[key] for key in _RECORD_KEYS})
+        for record in suffix
+    )
+    existed = os.path.exists(path)
+    original_size = os.path.getsize(path) if existed else 0
+    dir_fd: int | None = None
+    try:
+        with open(path, "ab") as handle:
+            handle.write(lines)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if not existed:
+            dir_fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+            os.fsync(dir_fd)
+    except OSError:
+        _restore_log(path, existed, original_size)
+        raise
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
+
+    return result(STATUS_APPLIED, None, None)
 
 
 
