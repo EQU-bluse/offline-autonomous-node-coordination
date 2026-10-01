@@ -5,7 +5,7 @@ Minimal backend baseline for autonomous nodes that must keep working during long
 Requires Python 3.11 or newer and has no third-party runtime dependencies.
 
 ```bash
-python -m offline_coordination status
+python -m offline_coordination status [--ledger LEDGER [LEDGER ...]] [--max-bytes N]
 python -m offline_coordination recovery check LEDGER [LEDGER ...]
 python -m offline_coordination recovery run LEDGER [LEDGER ...] --keyring KEYRING --ticket TICKET --moment MOMENT --audit AUDIT
 python -m offline_coordination recovery audit AUDIT [--after N] [--limit N]
@@ -13,6 +13,12 @@ python -m unittest discover -s tests -v
 ```
 
 The baseline exposes a local status command plus offline ledger recovery operations. Persistent state is available via `offline_coordination.storage` and an append-only hash-chained audit log via `offline_coordination.audit`. Replication, conflict policies, security boundaries, observability, and network services are intentionally left for subsequent tasks.
+
+## Node status
+
+`offline_coordination.replication.inspect_node(paths, max_bytes=67108864)` reports the node status over an explicit, non-empty list of distinct, non-empty ledger paths, validated in full together with `max_bytes` (a positive, non-bool int) before any file is read (`TypeError` for type faults, `ValueError` for an empty list, empty or duplicate path or non-positive bound). Only the listed ledgers and their recovery intents are read — nothing is created, modified, deleted or scanned. Each item, in input order, carries `path`, `status`, `digest`, `bytes`, `lastSeq`, `requestCount`, `stateDigest`, `phase`, `action` and `error`: a missing ledger is a `healthy` empty ledger (counters 0, the rest null); a stable ledger is validated against the canonical encoding, request bindings, audit chain and state digest — `healthy` when valid, `oversize` when its bytes exceed `max_bytes`, `corrupt`/`corrupt-ledger` when invalid; a valid recovery intent is `pending` (keeping `phase`, `action` and the digest, with the unconfirmed content excluded from the statistics) and an unparsable one `blocked`/`corrupt-recovery`; a read failure is `failed`/`os-error`, isolated per item. The top level carries `connectivity` (`offline`), `health`, `items`, `maxBytes`, `nodeId` (`local-node`), `pendingChanges` (the pending count), `revision` (the largest stable-ledger last seq), `totalBytes` and `version` (integer 1); the health is `healthy` when every item is healthy, `unhealthy` when any item is blocked, corrupt or failed, and `degraded` when only pending or oversize items remain.
+
+The `status` command without arguments keeps its fixed output; with `--ledger LEDGER [LEDGER ...]` and an optional `--max-bytes N` it prints the report as one line of compact UTF-8 JSON with recursively sorted keys, exiting 0 when healthy, 1 otherwise and 2 on argument errors.
 
 ## Ledger recovery
 
