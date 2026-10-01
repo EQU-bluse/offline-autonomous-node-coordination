@@ -37,7 +37,9 @@ def _read_run_materials(args: argparse.Namespace) -> tuple[object, bytes] | None
 def main() -> int:
     parser = argparse.ArgumentParser(prog="offline-coordination")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("status")
+    status_parser = subparsers.add_parser("status")
+    status_parser.add_argument("--ledger", nargs="+")
+    status_parser.add_argument("--max-bytes", type=int)
     recovery = subparsers.add_parser("recovery")
     recovery.add_argument("action", choices=["check", "run", "audit"])
     recovery.add_argument("paths", nargs="+")
@@ -49,8 +51,27 @@ def main() -> int:
     recovery.add_argument("--limit", type=int, default=100)
     args = parser.parse_args()
     if args.command == "status":
-        print(json.dumps(status(), sort_keys=True))
-        return 0
+        if args.ledger is None:
+            if args.max_bytes is not None:
+                print(
+                    "--max-bytes requires --ledger LEDGER [LEDGER ...]",
+                    file=sys.stderr,
+                )
+                return 2
+            print(json.dumps(status(), sort_keys=True))
+            return 0
+        try:
+            report = replication.inspect_node(
+                args.ledger,
+                args.max_bytes
+                if args.max_bytes is not None
+                else replication.DEFAULT_INSPECT_MAX_BYTES,
+            )
+        except (TypeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        _emit_line(report)
+        return 0 if report["health"] == "healthy" else 1
     try:
         if args.action == "check":
             items = replication.inspect_recovery(args.paths)

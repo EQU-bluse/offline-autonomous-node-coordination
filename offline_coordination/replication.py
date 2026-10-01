@@ -2012,6 +2012,270 @@ def recover_many(paths: list[str]) -> list[dict]:
     return items
 
 
+# --- Node-level ledger inspection --------------------------------------------
+
+DEFAULT_INSPECT_MAX_BYTES = 64 * 1024 * 1024
+
+NODE_STATUS_HEALTHY = "healthy"
+NODE_STATUS_OVERSIZE = "oversize"
+NODE_STATUS_PENDING = "pending"
+NODE_STATUS_BLOCKED = "blocked"
+NODE_STATUS_CORRUPT = "corrupt"
+NODE_STATUS_FAILED = "failed"
+
+NODE_HEALTH_HEALTHY = "healthy"
+NODE_HEALTH_DEGRADED = "degraded"
+NODE_HEALTH_UNHEALTHY = "unhealthy"
+
+NODE_ID = "local-node"
+NODE_VERSION = 1
+NODE_CONNECTIVITY = "offline"
+
+NODE_ERROR_CORRUPT_RECOVERY = "corrupt-recovery"
+_NODE_ERROR_CORRUPT_LEDGER = "corrupt-ledger"
+
+
+def _validated_inspect_paths(paths: object) -> list[str]:
+    """Validate an :func:`inspect_node` path list before any file is read.
+
+    The argument must be a non-empty list of non-empty, distinct strings:
+    a non-list container or a non-str element raises :class:`TypeError`,
+    an empty list, an empty path or a duplicate path raises
+    :class:`ValueError`.  Only a fully validated list comes back, so a
+    rejected argument guarantees no file was read.
+    """
+    if not isinstance(paths, list):
+        raise TypeError("paths must be a list")
+    for element in paths:
+        if not isinstance(element, str):
+            raise TypeError("paths elements must be str")
+    if not paths:
+        raise ValueError("paths must be a non-empty list")
+    validated: list[str] = []
+    seen: set[str] = set()
+    for element in paths:
+        if element == "":
+            raise ValueError("paths elements must be non-empty")
+        if element in seen:
+            raise ValueError(f"duplicate path {element!r}")
+        seen.add(element)
+        validated.append(element)
+    return validated
+
+
+def _validated_inspect_max_bytes(max_bytes: object) -> int:
+    """Validate the byte budget; a bool never poses as an int."""
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+        raise TypeError("max_bytes must be an int")
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive integer")
+    return max_bytes
+
+
+def _node_item(
+    path: str,
+    status: str,
+    digest: str | None,
+    size: int | None,
+    last_seq: int | None,
+    request_count: int | None,
+    state_digest: str | None,
+    phase: str | None,
+    action: str | None,
+    error: str | None,
+) -> dict:
+    """One node inspection entry with the fixed public key order."""
+    return {
+        "path": path,
+        STATUS: status,
+        "digest": digest,
+        "bytes": size,
+        "lastSeq": last_seq,
+        "requestCount": request_count,
+        "stateDigest": state_digest,
+        "phase": phase,
+        "action": action,
+        "error": error,
+    }
+
+
+def _inspect_node_one(path: str, max_bytes: int) -> dict:
+    """Inspect one ledger and its recovery intent, read-only and isolated.
+
+    Only the ledger at ``path`` and the recovery intent at ``path +
+    ".txn"`` are read; nothing is scanned, created, modified or deleted.
+    Every failure is caught and reported on the item instead of
+    propagating, so one ledger never stops the remaining paths.
+    """
+    try:
+        raw_intent = _read_bytes_or_none(path + ".txn")
+        raw_ledger = _read_bytes_or_none(path)
+    except OSError:
+        return _node_item(
+            path, NODE_STATUS_FAILED, None, None, None, None, None,
+            None, None, ERROR_OS_ERROR,
+        )
+
+    phase: str | None = None
+    action: str | None = None
+    if raw_intent is not None:
+        try:
+            intent = _parse_intent(raw_intent, os.path.basename(path))
+        except CorruptRecoveryError:
+            # A corrupt intent blocks recovery regardless of the ledger;
+            # the ledger byte facts are still reported.
+            return _node_item(
+                path,
+                NODE_STATUS_BLOCKED,
+                _digest(raw_ledger) if raw_ledger is not None else None,
+                len(raw_ledger) if raw_ledger is not None else None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                NODE_ERROR_CORRUPT_RECOVERY,
+            )
+        phase = intent[INTENT_PHASE]
+        action = (
+            ACTION_ROLLBACK if phase == PHASE_PREPARED else ACTION_COMPLETE
+        )
+
+    if raw_ledger is None:
+        # A missing ledger stands for the empty ledger.  Its seq/request
+        # counts are zero and every other data field null; a valid intent
+        # still names an unconfirmed transaction to settle, so the item is
+        # pending with the intent phase and action preserved.
+        if phase is not None:
+            return _node_item(
+                path, NODE_STATUS_PENDING, None, None, 0, 0,
+                None, phase, action, None,
+            )
+        return _node_item(
+            path, NODE_STATUS_HEALTHY, None, None, 0, 0, None,
+            None, None, None,
+        )
+
+    size = len(raw_ledger)
+    digest = _digest(raw_ledger)
+    try:
+        state, requests, entries = _parse_ledger(raw_ledger)
+    except ValueError:
+        # Any byte, structure, state, binding or chain violation is an
+        # invalid ledger; the unconfirmed transaction cannot be assessed
+        # against it and is not reported as pending.
+        return _node_item(
+            path, NODE_STATUS_CORRUPT, digest, size, None, None, None,
+            None, None, _NODE_ERROR_CORRUPT_LEDGER,
+        )
+
+    last_seq = entries[-1]["seq"] if entries else 0
+    request_count = len(requests)
+    state_digest = _digest(_state_bytes(state))
+    if phase is not None:
+        # Valid intent: the transaction is unconfirmed.  Its summaries
+        # describe the stable ledger on disk; the not-yet-confirmed
+        # content is never folded into lastSeq/requestCount/stateDigest.
+        return _node_item(
+            path, NODE_STATUS_PENDING, digest, size, last_seq,
+            request_count, state_digest, phase, action, None,
+        )
+    if size > max_bytes:
+        node_status = NODE_STATUS_OVERSIZE
+    else:
+        node_status = NODE_STATUS_HEALTHY
+    return _node_item(
+        path, node_status, digest, size, last_seq, request_count,
+        state_digest, None, None, None,
+    )
+
+
+def inspect_node(
+    paths: list[str], max_bytes: int = DEFAULT_INSPECT_MAX_BYTES
+) -> dict:
+    """Read-only node inspection of explicit ledger paths.
+
+    ``paths`` must be a non-empty list of non-empty, distinct strings and
+    ``max_bytes`` must be a positive, non-:class:`bool` integer; the whole
+    argument batch is validated before any file is read, so a
+    :class:`TypeError` (container/element type or a non-int
+    ``max_bytes``) or :class:`ValueError` (empty list, empty/duplicate
+    path, non-positive ``max_bytes``) guarantees nothing was touched.
+    Only each listed ledger and its recovery intent at ``path + ".txn"``
+    are read -- random artifacts are never scanned -- and no file is
+    created, modified or deleted.
+
+    One fresh item per path is returned in input order with the fixed key
+    order ``path``, ``status``, ``digest``, ``bytes``, ``lastSeq``,
+    ``requestCount``, ``stateDigest``, ``phase``, ``action`` and
+    ``error``:
+
+    - A missing ledger is a healthy empty ledger: ``lastSeq`` and
+      ``requestCount`` are 0 and every other data field
+      (``digest``/``bytes``/``stateDigest``) is null.
+    - A stable ledger is verified for canonical encoding, request
+      bindings, the audit chain and the state summary; a valid ledger
+      within ``max_bytes`` is ``healthy``, one strictly larger is
+      ``oversize`` (its summaries still describe the verified bytes).
+    - A valid recovery intent makes the item ``pending``, preserving the
+      intent ``phase`` (``prepared``/``installed``), the suggested
+      ``action`` (``rollback``/``complete``) and the stable ledger
+      summaries; unconfirmed content never enters ``lastSeq``,
+      ``requestCount`` or ``stateDigest``.
+    - A corrupt intent yields ``blocked`` with error ``corrupt-recovery``;
+      an invalid ledger yields ``corrupt`` with error ``corrupt-ledger``;
+      a read failure yields ``failed`` with error ``os-error``.  Failures
+      are isolated per item.
+
+    The result is a fresh dict with the fixed key order ``connectivity``,
+    ``health``, ``items``, ``maxBytes``, ``nodeId``, ``pendingChanges``,
+    ``revision``, ``totalBytes`` and ``version``: connectivity is
+    ``offline``, the node id ``local-node`` and the version the integer
+    1.  ``revision`` is the greatest stable ``lastSeq``,
+    ``pendingChanges`` counts the ``pending`` items and ``totalBytes``
+    sums the ledger byte sizes (missing ledgers count as zero).  The
+    health is ``healthy`` only when every item is healthy, ``degraded``
+    when only ``pending``/``oversize`` items are present, and
+    ``unhealthy`` once any item is ``blocked``, ``corrupt`` or
+    ``failed``.
+    """
+    path_list = _validated_inspect_paths(paths)
+    byte_limit = _validated_inspect_max_bytes(max_bytes)
+
+    items = [_inspect_node_one(path, byte_limit) for path in path_list]
+
+    statuses = {item[STATUS] for item in items}
+    if statuses & {
+        NODE_STATUS_BLOCKED, NODE_STATUS_CORRUPT, NODE_STATUS_FAILED,
+    }:
+        health = NODE_HEALTH_UNHEALTHY
+    elif statuses & {NODE_STATUS_PENDING, NODE_STATUS_OVERSIZE}:
+        health = NODE_HEALTH_DEGRADED
+    else:
+        health = NODE_HEALTH_HEALTHY
+
+    stable_seqs = [
+        item["lastSeq"] for item in items if item["lastSeq"] is not None
+    ]
+    revision = max(stable_seqs) if stable_seqs else 0
+    pending_changes = sum(
+        1 for item in items if item[STATUS] == NODE_STATUS_PENDING
+    )
+    total_bytes = sum(item["bytes"] or 0 for item in items)
+
+    return {
+        "connectivity": NODE_CONNECTIVITY,
+        "health": health,
+        "items": items,
+        "maxBytes": byte_limit,
+        "nodeId": NODE_ID,
+        "pendingChanges": pending_changes,
+        "revision": revision,
+        "totalBytes": total_bytes,
+        "version": NODE_VERSION,
+    }
+
+
 def _atomic_write(path: str, payload: bytes) -> None:
     """Durably replace ``path`` with ``payload`` as a single transaction.
 

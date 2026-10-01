@@ -6,6 +6,7 @@ Requires Python 3.11 or newer and has no third-party runtime dependencies.
 
 ```bash
 python -m offline_coordination status
+python -m offline_coordination status --ledger LEDGER [LEDGER ...] [--max-bytes N]
 python -m offline_coordination recovery check LEDGER [LEDGER ...]
 python -m offline_coordination recovery run LEDGER [LEDGER ...] --keyring KEYRING --ticket TICKET --moment MOMENT --audit AUDIT
 python -m offline_coordination recovery audit AUDIT [--after N] [--limit N]
@@ -24,6 +25,16 @@ Two batch entry points operate on an explicit, non-empty list of distinct, non-e
 - `recover_many(paths)` — controlled batch recovery. Each ledger is recovered via `recover_ledger` in order; one failure never stops or rolls back the others. Successful items keep the `clean`/`rolled-back`/`completed` statuses; a `CorruptRecoveryError` becomes a `blocked`/`corrupt` item and an `OSError` a `failed`/`os-error` item, leaving enough intent and artifacts behind for an independent retry.
 
 The module entry points `recovery check` and `recovery run` wrap these: they print exactly one line of compact UTF-8 JSON with recursively sorted keys, exit 0 when every ledger succeeds, 1 when any ledger is blocked or failed, and 2 on syntax or argument errors.
+
+## Node status inspection
+
+`offline_coordination.replication.inspect_node(paths, max_bytes=67108864)` gives a read-only node-level view over an explicit list of ledgers, reusing the ledger and recovery-material checks. `paths` is a non-empty list of non-empty, distinct strings and `max_bytes` is a positive, non-bool integer; the whole argument batch is validated before any file is read, so a `TypeError` (container/element type or a non-int `max_bytes`) or `ValueError` (empty list, empty/duplicate path, non-positive `max_bytes`) guarantees nothing was touched. Only each listed ledger and its recovery intent (`path + ".txn"`) are read — random artifacts are never scanned — and no file is created, modified or deleted.
+
+`items` keeps the input order; each item carries `path`, `status`, `digest`, `bytes`, `lastSeq`, `requestCount`, `stateDigest`, `phase`, `action` and `error`. A missing ledger is a healthy empty ledger (`lastSeq`/`requestCount` 0, every other data field null). A stable ledger is verified for canonical encoding, request bindings, the audit chain and the state summary; a valid ledger within `max_bytes` is `healthy`, one strictly larger is `oversize` (its summaries still describe the verified bytes). A valid recovery intent makes the item `pending`, preserving the intent `phase` (`prepared`/`installed`) and suggested `action` (`rollback`/`complete`) and the stable ledger summaries; unconfirmed content never enters `lastSeq`, `requestCount` or `stateDigest`. A corrupt intent yields `blocked` with error `corrupt-recovery`, an invalid ledger `corrupt` with error `corrupt-ledger`, and a read failure `failed` with error `os-error`; failures are isolated per item.
+
+The top-level report carries `connectivity`, `health`, `items`, `maxBytes`, `nodeId`, `pendingChanges`, `revision`, `totalBytes` and `version`: connectivity stays `offline`, the node id `local-node` and the version the integer 1. `revision` is the greatest stable ledger `lastSeq`, `pendingChanges` counts the `pending` items and `totalBytes` sums the ledger byte sizes (missing ledgers count as zero). The health is `healthy` only when every item is healthy, `degraded` when only `pending`/`oversize` items are present, and `unhealthy` once any item is `blocked`, `corrupt` or `failed`.
+
+The `status` command is unchanged without arguments. With `--ledger LEDGER [LEDGER ...]` and an optional `--max-bytes N` it prints one line of compact UTF-8 JSON with recursively sorted keys (the `inspect_node` report), exits 0 when the node is healthy, 1 when it is degraded or unhealthy, and 2 on argument errors.
 
 ## Authorized recovery and the recovery audit
 
