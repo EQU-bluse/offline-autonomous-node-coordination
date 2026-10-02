@@ -40566,63 +40566,21 @@ def _parse_adcf_decision(raw: object) -> tuple[dict, str]:
     return payload, signature
 
 
-def verify_aggregate_decision_chain_fork_decision(
-    decision, prune_policy, authorization_policy, site_policy,
-    signer_site_policy, keyring, moment,
-):
-    """Re-verify a signed aggregate decision chain fork decision offline.
+def _verify_adcf_decision_core(
+    decision: bytes,
+    validated_prune_policy: dict,
+    validated_authorization_policy: dict,
+    validated_site_policy: dict,
+    validated_signer_site_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    verify_moment: int,
+) -> dict:
+    """Verify one aggregate decision chain fork decision in isolation.
 
-    Only the decision bytes, the expected shared ``prune_policy``, the
-    invariant site ``authorization_policy``, the invariant fork-proof
-    ``site_policy``, the expected ``signer_site_policy``, the current
-    ``keyring`` and the verification ``moment`` are consulted -- no file
-    is read or written and no argument is modified.  The decision binds
-    four policy digests (the prune policy, the site authorization
-    policy, the fork-proof signer site policy and the adjudication
-    signer site policy).  Verification validates the canonical encoding
-    and every key set, recomputes all four policy digests, re-tallies
-    the bound per-proof rows purely from the signed payload (the
-    term-by-term proof digest bindings over the canonical rows, the
-    stable site/id row ordering, the same-site
-    duplicate/contradiction markings, the cross-site declaration
-    agreement, the signer threshold outcome and the claimed common
-    declaration, which is an empty list when every authenticated proof
-    attests a fork-free batch), and checks the HMAC-SHA256 against the
-    key the current keyring binds to the payload's exact issuer and
-    version, usable at the verification moment, so a later revocation
-    or expiry rejects the decision with no fallback.
-
-    On success a fresh depth-independent mapping is returned with the
-    fixed keys ``common``, ``proofDigest`` (the SHA-256 of the decision
-    bytes), ``issuer``, ``items``, ``keyVersion``,
-    ``prunePolicyDigest``, ``proofs``, ``authorizationPolicyDigest``,
-    ``sitePolicyDigest``, ``signerSitePolicyDigest``, ``status`` and
-    ``version`` (the integer 1); repeated calls return equal but
-    mutually independent objects and unauthenticated identities and
-    boundaries never enter a result.  A non-bytes decision or a wrong
-    public field type raises :class:`TypeError` (a :class:`bool` never
-    poses as an int); an empty value, a duplicate id, a wrong key set
-    or an illegal policy, threshold, moment, identity or version raises
-    :class:`ValueError`; an illegal decision structure, ordering, tally
-    or binding raises
-    :class:`InvalidAggregateDecisionChainForkDecisionError` (a
-    :class:`ValueError` subclass); unknown, revoked, not-yet-valid or
-    expired credentials or a wrong signature raise
-    :class:`AuthenticationError`.
+    Shared core of the batch verifier; the caller owns the
+    argument-type and shared-material validation.  The returned dict is
+    freshly built solely from authenticated decision material.
     """
-    if not isinstance(decision, bytes):
-        raise TypeError("decision must be bytes")
-    validated_prune_policy = _validated_adjudication_policy(prune_policy)
-    validated_authorization_policy = _validated_prune_batch_site_policy(
-        authorization_policy
-    )
-    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
-    validated_signer_site_policy = _validated_prune_batch_site_policy(
-        signer_site_policy
-    )
-    validated_keyring = _validated_keyring(keyring)
-    verify_moment = _fe_moment(moment, "moment")
-
     payload, signature = _parse_adcf_decision(decision)
     expected_prune_digest = hashlib.sha256(
         _verdict_policy_bytes(validated_prune_policy)
@@ -40691,4 +40649,1274 @@ def verify_aggregate_decision_chain_fork_decision(
         _ADCF_SITE_POLICY_DIGEST: expected_site_digest,
         STATUS: status,
         VERSION: AGGREGATE_DECISION_CHAIN_FORK_DECISION_VERSION,
+    }
+
+
+def verify_aggregate_decision_chain_fork_decision(
+    decision, prune_policy, authorization_policy, site_policy,
+    signer_site_policy, keyring, moment,
+):
+    """Re-verify a signed aggregate decision chain fork decision offline.
+
+    Only the decision bytes, the expected shared ``prune_policy``, the
+    invariant site ``authorization_policy``, the invariant fork-proof
+    ``site_policy``, the expected ``signer_site_policy``, the current
+    ``keyring`` and the verification ``moment`` are consulted -- no file
+    is read or written and no argument is modified.  The decision binds
+    four policy digests (the prune policy, the site authorization
+    policy, the fork-proof signer site policy and the adjudication
+    signer site policy).  Verification validates the canonical encoding
+    and every key set, recomputes all four policy digests, re-tallies
+    the bound per-proof rows purely from the signed payload (the
+    term-by-term proof digest bindings over the canonical rows, the
+    stable site/id row ordering, the same-site
+    duplicate/contradiction markings, the cross-site declaration
+    agreement, the signer threshold outcome and the claimed common
+    declaration, which is an empty list when every authenticated proof
+    attests a fork-free batch), and checks the HMAC-SHA256 against the
+    key the current keyring binds to the payload's exact issuer and
+    version, usable at the verification moment, so a later revocation
+    or expiry rejects the decision with no fallback.
+
+    On success a fresh depth-independent mapping is returned with the
+    fixed keys ``common``, ``proofDigest`` (the SHA-256 of the decision
+    bytes), ``issuer``, ``items``, ``keyVersion``,
+    ``prunePolicyDigest``, ``proofs``, ``authorizationPolicyDigest``,
+    ``sitePolicyDigest``, ``signerSitePolicyDigest``, ``status`` and
+    ``version`` (the integer 1); repeated calls return equal but
+    mutually independent objects and unauthenticated identities and
+    boundaries never enter a result.  A non-bytes decision or a wrong
+    public field type raises :class:`TypeError` (a :class:`bool` never
+    poses as an int); an empty value, a duplicate id, a wrong key set
+    or an illegal policy, threshold, moment, identity or version raises
+    :class:`ValueError`; an illegal decision structure, ordering, tally
+    or binding raises
+    :class:`InvalidAggregateDecisionChainForkDecisionError` (a
+    :class:`ValueError` subclass); unknown, revoked, not-yet-valid or
+    expired credentials or a wrong signature raise
+    :class:`AuthenticationError`.
+    """
+    if not isinstance(decision, bytes):
+        raise TypeError("decision must be bytes")
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_authorization_policy = _validated_prune_batch_site_policy(
+        authorization_policy
+    )
+    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
+    validated_signer_site_policy = _validated_prune_batch_site_policy(
+        signer_site_policy
+    )
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    return _verify_adcf_decision_core(
+        decision,
+        validated_prune_policy,
+        validated_authorization_policy,
+        validated_site_policy,
+        validated_signer_site_policy,
+        validated_keyring,
+        verify_moment,
+    )
+
+
+# ===========================================================================
+# Batch verification and cross-site aggregation of aggregate decision chain
+# fork decisions
+# ===========================================================================
+#
+# This layer mirrors the aggregate chain fork decision aggregate (``acfda``)
+# layer but its source packets are
+# :func:`adjudicate_aggregate_decision_chain_forks` decisions: the
+# per-proof summaries are bound term by term to the canonical
+# site/id-sorted rows, each packet carries five policy digests (the
+# prune policy, the site authorization policy, the fork-proof signer
+# site policy, the adjudication signer site policy and the decision
+# site policy), a counted declaration may legitimately bind the empty
+# fork edge set (a fork-free batch), and the error hierarchy is its own.
+# The wire field names otherwise follow the ``acfda`` layer.
+
+AGGREGATE_DECISION_CHAIN_FORK_DECISIONS_VERSION = 1
+AGGREGATE_DECISION_CHAIN_FORK_DECISION_AGGREGATE_VERSION = 1
+
+_ADCFD_PACKET = _CFD_DECISION
+_ADCFD_INPUTS = PFDA_INPUTS
+_ADCFD_DECLARATION = PFDA_DECLARATION
+_ADCFD_PRUNE_POLICY_DIGEST = PAFD_PRUNE_POLICY_DIGEST
+_ADCFD_AUTHORIZATION_POLICY_DIGEST = _ACF_AUTHORIZATION_POLICY_DIGEST
+_ADCFD_SITE_POLICY_DIGEST = _ADCF_SITE_POLICY_DIGEST
+_ADCFD_SIGNER_SITE_POLICY_DIGEST = _ADCF_SIGNER_SITE_POLICY_DIGEST
+_ADCFD_DECISION_SITE_POLICY_DIGEST = PFDA_DECISION_SITE_POLICY_DIGEST
+_ADCFD_AGGREGATE_DIGEST = PFDA_AGGREGATE_DIGEST
+
+_ADCFD_DECISIONS_VERIFIED = _VERIFY_VERIFIED
+_ADCFD_DECISIONS_INVALID = "invalid-decision"
+_ADCFD_DECISIONS_UNAUTHENTICATED = VERIFY_UNAUTHENTICATED
+
+_ADCFD_PAYLOAD_KEYS = frozenset((
+    _ADCFD_INPUTS,
+    VD_ISSUER,
+    ITEMS,
+    KEY_VERSION,
+    _ADCFD_PRUNE_POLICY_DIGEST,
+    _ADCFD_AUTHORIZATION_POLICY_DIGEST,
+    _ADCFD_SITE_POLICY_DIGEST,
+    _ADCFD_SIGNER_SITE_POLICY_DIGEST,
+    _ADCFD_DECISION_SITE_POLICY_DIGEST,
+    _ADCFD_DECLARATION,
+    STATUS,
+    VERSION,
+))
+_ADCFD_RESULT_KEYS = (
+    _ADCFD_AGGREGATE_DIGEST,
+    _ADCFD_INPUTS,
+    VD_ISSUER,
+    ITEMS,
+    KEY_VERSION,
+    _ADCFD_PRUNE_POLICY_DIGEST,
+    _ADCFD_AUTHORIZATION_POLICY_DIGEST,
+    _ADCFD_SITE_POLICY_DIGEST,
+    _ADCFD_SIGNER_SITE_POLICY_DIGEST,
+    _ADCFD_DECISION_SITE_POLICY_DIGEST,
+    _ADCFD_DECLARATION,
+    STATUS,
+    VERSION,
+)
+
+
+class InvalidAggregateDecisionChainForkDecisionAggregateError(ValueError):
+    """An aggregate decision chain fork decision aggregate breaks its
+    contract."""
+
+
+def _adcfda_invalid(
+    message: str,
+) -> InvalidAggregateDecisionChainForkDecisionAggregateError:
+    return InvalidAggregateDecisionChainForkDecisionAggregateError(
+        f"invalid aggregate decision chain fork decision aggregate: "
+        f"{message}"
+    )
+
+
+def _reject_duplicate_adcfda_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate aggregate keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _adcfda_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+# -- Offline batch verification ------------------------------------------------
+
+def _adcfd_decisions_item_report(
+    item_id: str, status: str, error: str | None, result: dict | None
+) -> dict:
+    """One aggregate decision chain fork decision batch report."""
+    return {
+        CHECKPOINT_ITEM_ERROR: error,
+        ID: item_id,
+        VERDICT_ITEM_RESULT: result,
+        STATUS: status,
+    }
+
+
+def _verify_adcfd_decision_item(
+    item: dict,
+    validated_prune_policy: dict,
+    validated_authorization_policy: dict,
+    validated_site_policy: dict,
+    validated_signer_site_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one aggregate decision chain fork decision in isolation.
+
+    Unknown, revoked, not-yet-valid or expired credentials and a wrong
+    signature make the item ``unauthenticated``; every encoding,
+    key-set, digest, ordering, tally or binding fault makes it
+    ``invalid-decision``; a passing decision is ``verified``.
+    """
+    item_id = item[ID]
+    try:
+        result = _verify_adcf_decision_core(
+            item[_ADCFD_PACKET],
+            validated_prune_policy,
+            validated_authorization_policy,
+            validated_site_policy,
+            validated_signer_site_policy,
+            validated_keyring,
+            moment,
+        )
+    except AuthenticationError as exc:
+        return _adcfd_decisions_item_report(
+            item_id, _ADCFD_DECISIONS_UNAUTHENTICATED, str(exc), None
+        )
+    except (InvalidAggregateDecisionChainForkDecisionError, TypeError) as exc:
+        # A TypeError here can only come from a wrong JSON field type
+        # *inside* the decision bytes; the public argument types were all
+        # validated before the batch ran.
+        return _adcfd_decisions_item_report(
+            item_id, _ADCFD_DECISIONS_INVALID, str(exc), None
+        )
+    return _adcfd_decisions_item_report(
+        item_id, _ADCFD_DECISIONS_VERIFIED, None, result
+    )
+
+
+def verify_aggregate_decision_chain_fork_decisions(
+    items, prune_policy, authorization_policy, site_policy, signer_site_policy,
+    keyring, moment,
+):
+    """Verify a batch of aggregate decision chain fork decisions offline.
+
+    ``items`` is a non-empty list; each item is a dict with exactly the
+    keys ``id`` (a non-empty str, unique across the batch) and
+    ``decision`` (the canonical signed decision bytes
+    :func:`adjudicate_aggregate_decision_chain_forks` produced).
+    ``prune_policy`` is the shared invariant original pruning policy,
+    ``authorization_policy`` the invariant site authorization policy,
+    ``site_policy`` the invariant fork-proof signer site policy and
+    ``signer_site_policy`` the adjudication signer site policy the
+    decisions were issued against; ``keyring`` and ``moment`` keep their
+    single-decision meaning.  No file is read or written and no input is
+    modified.
+
+    The whole batch structure and the shared four policies, keyring and
+    moment are validated in full before any decision is parsed, so a
+    batch-level fault never yields a partial report: container, element
+    or field type faults raise :class:`TypeError` (a :class:`bool`
+    never poses as an int) and an empty list, an empty or duplicate id
+    or a wrong item key set raises :class:`ValueError` (the policies,
+    keyring and moment keep their single-decision classification).
+    Only these batch-level faults raise.
+
+    Each decision is then verified independently, in strict input
+    order, through the exact
+    :func:`verify_aggregate_decision_chain_fork_decision` rules: one
+    decision's failure never stops a later decision or alters an
+    earlier report.  Unknown, revoked, not-yet-valid or expired
+    credentials or a wrong signature make the item
+    ``unauthenticated``; an illegal encoding, key set, digest,
+    ordering, tally or binding makes it ``invalid-decision``; a passing
+    decision is ``verified``.
+
+    The top-level result is a fresh dict with the fixed keys ``items``
+    and ``version`` (the integer 1); each item report preserves input
+    order and carries, in this key order, ``error`` (null exactly when
+    verified, otherwise a definite non-empty message), ``id``,
+    ``result`` (a fresh independent copy of the single-decision result
+    when verified, otherwise null) and ``status``.  Repeated calls
+    return equal but mutually independent results.
+    """
+    validated_items = _validated_cfd_decision_items(items)
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_authorization_policy = _validated_prune_batch_site_policy(
+        authorization_policy
+    )
+    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
+    validated_signer_site_policy = _validated_prune_batch_site_policy(
+        signer_site_policy
+    )
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    return {
+        ITEMS: [
+            _verify_adcfd_decision_item(
+                item, validated_prune_policy, validated_authorization_policy,
+                validated_site_policy, validated_signer_site_policy,
+                validated_keyring, verify_moment,
+            )
+            for item in validated_items
+        ],
+        VERSION: AGGREGATE_DECISION_CHAIN_FORK_DECISIONS_VERSION,
+    }
+
+
+# -- Cross-site aggregation ----------------------------------------------------
+
+def _aggregate_adcfda_one(
+    item: dict,
+    prune_policy_digest: str,
+    authorization_policy_digest: str,
+    site_policy_digest: str,
+    signer_site_policy_digest: str,
+    fork_threshold: int,
+    decision_site_policy: dict,
+    keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Re-verify, authenticate and authorize one decision in isolation.
+
+    The decision bytes first pass the exact aggregate decision chain
+    fork decision structural, positional-proof and binding rules, then
+    the HMAC is checked against the current keyring, and finally the
+    exact payload issuer and key version are authorized against the
+    decision site policy with no fallback.  Any failure rejects just
+    this row with one fixed reason (``invalid``, ``unauthenticated`` or
+    ``unauthorized``) and never affects the other items.
+    """
+    item_id = item[ID]
+    raw = item[_ADCFD_PACKET]
+    decision_digest = hashlib.sha256(raw).hexdigest()
+
+    def invalid_row() -> dict:
+        return _pfda_aggregate_row(
+            item_id, decision_digest, None, None, None,
+            PA_CONCLUSION_INVALID, PA_CONCLUSION_INVALID,
+        )
+
+    try:
+        payload, signature = _parse_adcf_decision(raw)
+    except (TypeError, ValueError):
+        return invalid_row()
+
+    site = payload[VD_ISSUER]
+    key_version = payload[KEY_VERSION]
+
+    if payload[PAFD_PRUNE_POLICY_DIGEST] != prune_policy_digest:
+        return invalid_row()
+    if payload[_ACF_DECISION_AUTHORIZATION_POLICY_DIGEST] != \
+            authorization_policy_digest:
+        return invalid_row()
+    if payload[_ADCF_SITE_POLICY_DIGEST] != site_policy_digest:
+        return invalid_row()
+    if payload[_ADCF_SIGNER_SITE_POLICY_DIGEST] != signer_site_policy_digest:
+        return invalid_row()
+    try:
+        _reconcile_pafd(
+            payload, fork_threshold, invalid=_adcf_decision_invalid,
+            positional_proofs=True,
+        )
+    except InvalidAggregateDecisionChainForkDecisionError:
+        return invalid_row()
+
+    def unauthenticated_row() -> dict:
+        return _pfda_aggregate_row(
+            item_id, decision_digest, site, key_version, None,
+            PA_CONCLUSION_INVALID, PA_REASON_UNAUTHENTICATED,
+        )
+
+    key_entry = None
+    for candidate in keyring.get(site, ()):
+        if candidate[VERSION] == key_version:
+            key_entry = candidate
+            break
+    if key_entry is None or key_entry[REVOKED]:
+        return unauthenticated_row()
+    if moment < key_entry[NOT_BEFORE] or moment > key_entry[NOT_AFTER]:
+        return unauthenticated_row()
+
+    expected_signature = hmac.new(
+        bytes.fromhex(key_entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        return unauthenticated_row()
+
+    # The exact-issuer HMAC established the site/version identity, so an
+    # authorized-policy miss may carry that identity.
+    allowed_versions = decision_site_policy[ADJ_SITES].get(site)
+    if allowed_versions is None or key_version not in allowed_versions:
+        return _pfda_aggregate_row(
+            item_id, decision_digest, site, key_version, None,
+            PA_CONCLUSION_INVALID, PA_REASON_UNAUTHORIZED,
+        )
+
+    return _pfda_aggregate_row(
+        item_id, decision_digest, site, key_version,
+        _pfda_declaration(payload), PA_CONCLUSION_VALID, None,
+    )
+
+
+def aggregate_aggregate_decision_chain_fork_decisions(
+    items, prune_policy, authorization_policy, site_policy,
+    signer_site_policy, decision_site_policy, keyring, moment, issuer, version,
+):
+    """Aggregate multi-site aggregate decision chain fork decisions offline.
+
+    ``items`` is a non-empty list; each item contains exactly a unique,
+    non-empty str ``id`` and ``decision`` bytes produced by
+    :func:`adjudicate_aggregate_decision_chain_forks`; the whole batch
+    structure is validated before any decision is parsed.
+    ``prune_policy`` is the shared invariant original pruning policy,
+    ``authorization_policy`` the invariant site authorization policy,
+    ``site_policy`` the fork-proof signer site policy and
+    ``signer_site_policy`` the adjudication signer site policy the
+    decisions were issued against; ``decision_site_policy`` carries
+    exactly ``sites`` (a non-empty mapping of each decision site
+    allowed to hand over decisions to its non-empty set of allowed
+    positive key versions) and ``threshold`` (a positive integer no
+    greater than the site count).  ``keyring`` follows the existing
+    rules, ``moment`` is the current time and ``issuer``/``version``
+    name the aggregate signing credentials.  No file is read or written
+    and no input is modified.
+
+    Every decision is first re-verified on its own through the exact
+    :func:`verify_aggregate_decision_chain_fork_decision` rules --
+    canonical structure, all four decision policy digest bindings, the
+    term-by-term proof digest bindings and a full re-tally of the bound
+    per-proof rows -- then authenticated against the current keyring by
+    its exact payload issuer and key version, and finally authorized
+    precisely against ``decision_site_policy`` with no fallback: a
+    structurally illegal decision or one with a broken binding is
+    recorded ``invalid`` with reason ``invalid`` (and carries no
+    identity), unknown, revoked, not-yet-valid or expired credentials
+    or a wrong signature ``unauthenticated``, and an authenticated but
+    unauthorized site or key version ``unauthorized``, each rejecting
+    only that item while the others continue.  A valid decision counts
+    as the issuing site's complete declaration: the common fork edge
+    set (an empty list for a fork-free one), the per-item conclusions
+    (stably sorted by site then id, each entry carrying its conclusion,
+    proof digest, authenticated fork edges or null, id, reason and
+    site), the term-by-term proof digest vector and the overall status.
+    For one site, an exactly identical complete declaration counts
+    once and repeats are ``duplicate``; any field-level difference is a
+    ``contradiction``.  Distinct sites must agree on that same complete
+    declaration -- any difference makes the aggregate ``conflicted``,
+    the common declaration is bound null and no majority can outvote
+    the disagreement.  One unique declaration backed by at least the
+    threshold of distinct sites is ``accepted``; short of the threshold
+    it stays ``insufficient`` but still carries that common
+    declaration; with no valid vote the declaration is null.
+
+    The result is one canonical compact UTF-8 JSON object with
+    recursively sorted keys, non-ASCII preserved and no trailing byte,
+    carrying exactly ``payload`` and ``signature``.  The payload binds
+    exactly ``inputs`` (each input decision's SHA-256 in the original
+    input order, so a reordering is detectable), ``issuer``, ``items``
+    (the per-decision rows sorted stably by site then id, each carrying
+    ``conclusion``, the decision ``digest``, ``id``, ``issuer``,
+    ``keyVersion``, ``reason`` and the authenticated ``declaration`` or
+    null), ``keyVersion`` and the five policy digests
+    (``prunePolicyDigest``, ``authorizationPolicyDigest``,
+    ``sitePolicyDigest``, ``signerSitePolicyDigest`` and
+    ``decisionSitePolicyDigest``), plus ``declaration`` (the one common
+    complete declaration, or null), ``status`` and ``version`` (the
+    integer 1).  The signature is the lowercase hex HMAC-SHA256 of the
+    canonical compact payload bytes under the exact issuer/version key.
+
+    A parameter, container or public field type fault raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); an
+    empty list, an empty or duplicate id or an illegal policy,
+    threshold, moment, issuer or version raises :class:`ValueError`;
+    unknown, revoked, not-yet-valid or expired aggregate credentials
+    raise :class:`AuthenticationError`.
+    """
+    validated_items = _validated_cfd_decision_items(items)
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_authorization_policy = _validated_prune_batch_site_policy(
+        authorization_policy
+    )
+    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
+    validated_signer_site_policy = _validated_prune_batch_site_policy(
+        signer_site_policy
+    )
+    validated_decision_site_policy = _validated_prune_batch_site_policy(
+        decision_site_policy
+    )
+    validated_keyring = _validated_keyring(keyring)
+    aggregate_moment = _fe_moment(moment, "moment")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+
+    prune_policy_digest = hashlib.sha256(
+        _verdict_policy_bytes(validated_prune_policy)
+    ).hexdigest()
+    authorization_policy_digest = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_authorization_policy)
+    ).hexdigest()
+    site_policy_digest = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_site_policy)
+    ).hexdigest()
+    signer_site_policy_digest = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_signer_site_policy)
+    ).hexdigest()
+    rows = [
+        _aggregate_adcfda_one(
+            item,
+            prune_policy_digest,
+            authorization_policy_digest,
+            site_policy_digest,
+            signer_site_policy_digest,
+            validated_signer_site_policy[ADJ_THRESHOLD],
+            validated_decision_site_policy,
+            validated_keyring,
+            aggregate_moment,
+        )
+        for item in validated_items
+    ]
+    input_digests = [row[CP_DIGEST] for row in rows]
+    status, common_declaration = _tally_pfda_rows(
+        rows, validated_decision_site_policy[ADJ_THRESHOLD]
+    )
+    rows.sort(
+        key=lambda row: (
+            row[VD_ISSUER] is not None,
+            row[VD_ISSUER] or "",
+            row[ID],
+        )
+    )
+
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, aggregate_moment
+    )
+    payload = {
+        _ADCFD_INPUTS: input_digests,
+        VD_ISSUER: issuer,
+        ITEMS: rows,
+        KEY_VERSION: version,
+        _ADCFD_PRUNE_POLICY_DIGEST: prune_policy_digest,
+        _ADCFD_AUTHORIZATION_POLICY_DIGEST: authorization_policy_digest,
+        _ADCFD_SITE_POLICY_DIGEST: site_policy_digest,
+        _ADCFD_SIGNER_SITE_POLICY_DIGEST: signer_site_policy_digest,
+        _ADCFD_DECISION_SITE_POLICY_DIGEST: hashlib.sha256(
+            _prune_batch_site_policy_bytes(validated_decision_site_policy)
+        ).hexdigest(),
+        _ADCFD_DECLARATION: common_declaration,
+        STATUS: status,
+        VERSION: AGGREGATE_DECISION_CHAIN_FORK_DECISION_AGGREGATE_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+# -- Structural validation of the signed aggregate packet ---------------------
+
+def _validated_adcfd_declaration_entry(
+    value: object, where: str, invalid=_adcfda_invalid
+) -> dict:
+    """Validate one per-item conclusion entry inside a declaration.
+
+    Unlike the earlier layers, an authenticated entry may legitimately
+    carry the empty fork edge set: a fork-free batch is still a
+    declaration.
+    """
+    if not isinstance(value, dict):
+        raise TypeError(f"{where} entry must be an object")
+    if set(value.keys()) != _PFDA_DECLARATION_ENTRY_KEYS:
+        raise invalid(
+            f"{where} entry must contain exactly the keys 'conclusion', "
+            "'digest', 'edges', 'id', 'reason' and 'site'"
+        )
+    entry_id = value[ID]
+    if not isinstance(entry_id, str):
+        raise TypeError(f"{where} entry id must be a str")
+    if entry_id == "":
+        raise invalid(f"{where} entry id must be non-empty")
+    digest = value[CP_DIGEST]
+    if not isinstance(digest, str):
+        raise TypeError(f"{where} entry digest must be a str")
+    if not _prune_is_digest(digest):
+        raise invalid(
+            f"{where} entry digest must be 64 lowercase hex characters"
+        )
+    site = value[VD_ISSUER]
+    if site is not None:
+        if not isinstance(site, str):
+            raise TypeError(f"{where} entry site must be a str or null")
+        if site == "":
+            raise invalid(f"{where} entry site must be non-empty")
+    conclusion = value[ADJ_CONCLUSION]
+    if not isinstance(conclusion, str):
+        raise TypeError(f"{where} entry conclusion must be a str")
+    if conclusion not in _PAFD_CONCLUSIONS:
+        raise invalid(f"{where} entry conclusion is not known")
+    reason = value[ADJ_REASON]
+    if conclusion == _PAFD_CONCLUSION_VALID:
+        if reason is not None:
+            raise invalid(
+                f"{where} entry reason must be null for a valid item"
+            )
+    else:
+        if not isinstance(reason, str):
+            raise TypeError(f"{where} entry reason must be a str")
+        if reason not in _PAFD_REASONS:
+            raise invalid(f"{where} entry reason is not known")
+    if conclusion == _PAFD_CONCLUSION_INVALID:
+        if reason not in _PAFD_INVALID_REASONS:
+            raise invalid(
+                f"{where} entry reason does not match an invalid item"
+            )
+    elif conclusion != _PAFD_CONCLUSION_VALID:
+        if reason != conclusion:
+            raise invalid(
+                f"{where} entry reason must match its conclusion"
+            )
+    raw_edges = value[PAFD_EDGES]
+    if raw_edges is not None:
+        if not isinstance(raw_edges, list):
+            raise TypeError(f"{where} entry edges must be a list or null")
+        edges = [
+            _validated_pafd_edge(edge_value, where, invalid)
+            for edge_value in raw_edges
+        ]
+        triples = _pac_fork_edge_triples(edges)
+        if len(set(triples)) != len(triples):
+            raise invalid(f"{where} entry edges must be unique")
+        if list(triples) != sorted(triples):
+            raise invalid(
+                f"{where} entry edges must be sorted ascending"
+            )
+    else:
+        edges = None
+    identity_expected = reason != _PAFD_REASON_INVALID_PROOF
+    if identity_expected:
+        if site is None or edges is None:
+            raise invalid(
+                f"{where} an authenticated entry must carry its site and "
+                "fork edges"
+            )
+    elif site is not None or edges is not None:
+        raise invalid(
+            f"{where} an invalid-proof entry must carry no site or fork "
+            "edges"
+        )
+    return {
+        ADJ_CONCLUSION: conclusion,
+        CP_DIGEST: digest,
+        PAFD_EDGES: edges,
+        ID: entry_id,
+        ADJ_REASON: reason,
+        VD_ISSUER: site,
+    }
+
+
+def _validated_adcfd_declaration(
+    value: object, where: str, invalid=_adcfda_invalid
+) -> dict | None:
+    """Structurally validate one complete declaration into a fresh dict.
+
+    The declaration carries exactly ``common`` (the common fork edge
+    set, or null -- an empty list is legal for a fork-free accepted or
+    insufficient declaration), ``conclusions`` (the per-item conclusion
+    entries, sorted by site then id), ``proofs`` (the proof digest
+    vector, term by term over the sorted entries) and ``status``.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise TypeError(f"{where} must be an object or null")
+    if set(value.keys()) != _PFDA_DECLARATION_KEYS:
+        raise invalid(
+            f"{where} must contain exactly the keys 'common', "
+            "'conclusions', 'proofs' and 'status'"
+        )
+    status = value[STATUS]
+    if not isinstance(status, str):
+        raise TypeError(f"{where} status must be a str")
+    if status not in _PAFD_STATUSES:
+        raise invalid(f"{where} status is not a known status")
+
+    common = value[PAFD_COMMON]
+    if common is not None:
+        if not isinstance(common, list):
+            raise TypeError(f"{where} common must be a list or null")
+        common_edges = [
+            _validated_pafd_edge(edge_value, f"{where} common", invalid)
+            for edge_value in common
+        ]
+        common_triples = _pac_fork_edge_triples(common_edges)
+        if len(set(common_triples)) != len(common_triples) or list(
+            common_triples
+        ) != sorted(common_triples):
+            raise invalid(
+                f"{where} common edges must be unique and sorted ascending"
+            )
+    else:
+        common_edges = None
+    if status == _PAFD_STATUS_CONFLICTED and common is not None:
+        raise invalid(
+            f"{where} a conflicted declaration must bind no common set"
+        )
+    if status == _PAFD_STATUS_ACCEPTED and common is None:
+        raise invalid(
+            f"{where} an accepted declaration must bind its common set"
+        )
+
+    raw_entries = value[PFDA_CONCLUSIONS]
+    if not isinstance(raw_entries, list):
+        raise TypeError(f"{where} conclusions must be a list")
+    if not raw_entries:
+        raise invalid(f"{where} conclusions must be non-empty")
+    entries = [
+        _validated_adcfd_declaration_entry(entry_value, where, invalid)
+        for entry_value in raw_entries
+    ]
+    entry_ids = [entry[ID] for entry in entries]
+    if len(set(entry_ids)) != len(entry_ids):
+        raise invalid(f"{where} conclusions must not repeat an id")
+    expected_order = sorted(
+        entries,
+        key=lambda entry: (
+            entry[VD_ISSUER] is not None,
+            entry[VD_ISSUER] or "",
+            entry[ID],
+        ),
+    )
+    if [entry[ID] for entry in expected_order] != entry_ids:
+        raise invalid(
+            f"{where} conclusions must be sorted by site then id"
+        )
+
+    proofs = value[PFDA_PROOFS]
+    if not isinstance(proofs, list):
+        raise TypeError(f"{where} proofs must be a list")
+    if not proofs:
+        raise invalid(f"{where} proofs must be non-empty")
+    for position, digest in enumerate(proofs):
+        if not isinstance(digest, str):
+            raise TypeError(f"{where} proof {position} digest must be a str")
+        if not _prune_is_digest(digest):
+            raise invalid(
+                f"{where} proof {position} digest must be 64 lowercase hex "
+                "characters"
+            )
+    if len(proofs) != len(entries):
+        raise invalid(
+            f"{where} the conclusions must cover every proof and vice versa"
+        )
+    if proofs != [entry[CP_DIGEST] for entry in entries]:
+        raise invalid(
+            f"{where} the bound proof digests must correspond term by term "
+            "to the sorted conclusions"
+        )
+
+    return {
+        PAFD_COMMON: common_edges,
+        PFDA_CONCLUSIONS: entries,
+        PFDA_PROOFS: list(proofs),
+        STATUS: status,
+    }
+
+
+def _parse_adcfda(raw: object) -> tuple[dict, str]:
+    """Validate aggregate decision chain fork decision aggregate bytes.
+
+    A non-bytes argument or a public field of the wrong JSON type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, digest, ordering, row-shape or
+    declaration-shape fault raises
+    :class:`InvalidAggregateDecisionChainForkDecisionAggregateError`.
+    The policy digests, tally and credential bindings are checked by
+    :func:`verify_aggregate_decision_chain_fork_decision_aggregate`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("aggregate packet must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _adcfda_invalid(
+            "aggregate packet must end with the closing brace, no "
+            "trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _adcfda_invalid("aggregate packet is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_adcfda_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _adcfda_invalid("aggregate packet is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("aggregate packet must be a JSON object")
+    if set(data.keys()) != _PFDA_TOP_KEYS:
+        raise _adcfda_invalid(
+            "aggregate packet must contain exactly the keys 'payload' and "
+            "'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("aggregate packet signature must be a str")
+    if not _prune_is_digest(signature):
+        raise _adcfda_invalid(
+            "aggregate packet signature must be 64 lowercase hex characters"
+        )
+
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("aggregate packet payload must be an object")
+    if set(payload.keys()) != _ADCFD_PAYLOAD_KEYS:
+        raise _adcfda_invalid(
+            "aggregate packet payload must contain exactly the keys "
+            "'inputs', 'issuer', 'items', 'keyVersion', "
+            "'prunePolicyDigest', 'authorizationPolicyDigest', "
+            "'sitePolicyDigest', 'signerSitePolicyDigest', "
+            "'decisionSitePolicyDigest', 'declaration', 'status' and "
+            "'version'"
+        )
+
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("aggregate payload issuer must be a str")
+    if issuer == "":
+        raise _adcfda_invalid(
+            "aggregate payload issuer must be a non-empty str"
+        )
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("aggregate payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _adcfda_invalid("aggregate payload keyVersion must be positive")
+    for field in (
+        _ADCFD_PRUNE_POLICY_DIGEST,
+        _ADCFD_AUTHORIZATION_POLICY_DIGEST,
+        _ADCFD_SITE_POLICY_DIGEST,
+        _ADCFD_SIGNER_SITE_POLICY_DIGEST,
+        _ADCFD_DECISION_SITE_POLICY_DIGEST,
+    ):
+        digest = payload[field]
+        if not isinstance(digest, str):
+            raise TypeError(f"aggregate payload {field} must be a str")
+        if not _prune_is_digest(digest):
+            raise _adcfda_invalid(
+                f"aggregate payload {field} must be 64 lowercase hex "
+                "characters"
+            )
+    status = payload[STATUS]
+    if not isinstance(status, str):
+        raise TypeError("aggregate status must be a str")
+    if status not in _PA_STATUSES:
+        raise _adcfda_invalid("aggregate status is not a known status")
+    version = payload[VERSION]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("aggregate payload version must be an int")
+    if version != AGGREGATE_DECISION_CHAIN_FORK_DECISION_AGGREGATE_VERSION:
+        raise _adcfda_invalid(
+            "aggregate payload version must be the integer 1"
+        )
+
+    inputs = payload[_ADCFD_INPUTS]
+    if not isinstance(inputs, list):
+        raise TypeError("aggregate inputs must be a list")
+    if not inputs:
+        raise _adcfda_invalid("aggregate inputs must be a non-empty list")
+    for position, digest in enumerate(inputs):
+        if not isinstance(digest, str):
+            raise TypeError(f"aggregate input {position} digest must be a str")
+        if not _prune_is_digest(digest):
+            raise _adcfda_invalid(
+                f"aggregate input {position} digest must be 64 lowercase "
+                "hex characters"
+            )
+
+    rows = payload[ITEMS]
+    if not isinstance(rows, list):
+        raise TypeError("aggregate items must be a list")
+    if not rows:
+        raise _adcfda_invalid("aggregate items must be a non-empty list")
+    if len(rows) != len(inputs):
+        raise _adcfda_invalid(
+            "the items must cover every input and vice versa"
+        )
+    seen_row_ids: set[str] = set()
+    parsed_rows: list[dict] = []
+    for position, row in enumerate(rows):
+        where = f"aggregate item {position}"
+        if not isinstance(row, dict):
+            raise TypeError(f"{where} must be an object")
+        if set(row.keys()) != _PFDA_ROW_KEYS:
+            raise _adcfda_invalid(
+                f"{where} must contain exactly the keys 'conclusion', "
+                "'digest', 'id', 'issuer', 'keyVersion', 'reason' and "
+                "'declaration'"
+            )
+        row_id = row[ID]
+        if not isinstance(row_id, str):
+            raise TypeError(f"{where} id must be a str")
+        if row_id == "":
+            raise _adcfda_invalid(f"{where} id must be non-empty")
+        if row_id in seen_row_ids:
+            raise _adcfda_invalid(f"{where} repeats an id")
+        seen_row_ids.add(row_id)
+        digest = row[CP_DIGEST]
+        if not isinstance(digest, str):
+            raise TypeError(f"{where} digest must be a str")
+        if not _prune_is_digest(digest):
+            raise _adcfda_invalid(
+                f"{where} digest must be 64 lowercase hex characters"
+            )
+        row_site = row[VD_ISSUER]
+        if row_site is not None and not isinstance(row_site, str):
+            raise TypeError(f"{where} issuer must be a str or null")
+        if row_site == "":
+            raise _adcfda_invalid(f"{where} issuer must be non-empty")
+        row_key_version = row[KEY_VERSION]
+        if isinstance(row_key_version, bool) or not isinstance(
+            row_key_version, int
+        ):
+            if row_key_version is not None:
+                raise TypeError(f"{where} keyVersion must be an int or null")
+        elif row_key_version <= 0:
+            raise _adcfda_invalid(f"{where} keyVersion must be positive")
+        if (row_site is None) != (row_key_version is None):
+            raise _adcfda_invalid(
+                f"{where} issuer and keyVersion must be null together"
+            )
+        conclusion = row[ADJ_CONCLUSION]
+        if not isinstance(conclusion, str):
+            raise TypeError(f"{where} conclusion must be a str")
+        reason = row[ADJ_REASON]
+        if conclusion == PA_CONCLUSION_VALID:
+            if reason is not None:
+                raise _adcfda_invalid(
+                    f"{where} reason must be null for a valid row"
+                )
+        elif conclusion == PA_CONCLUSION_INVALID:
+            if reason not in _PFDA_INVALID_REASONS:
+                raise _adcfda_invalid(
+                    f"{where} reason must be one of 'invalid', "
+                    "'unauthenticated' or 'unauthorized'"
+                )
+        elif conclusion in (
+            PA_CONCLUSION_DUPLICATE, PA_CONCLUSION_CONTRADICTION
+        ):
+            expected = (
+                REASON_DUPLICATE
+                if conclusion == PA_CONCLUSION_DUPLICATE
+                else REASON_CONTRADICTION
+            )
+            if reason != expected:
+                raise _adcfda_invalid(
+                    f"{where} reason must match its conclusion"
+                )
+        else:
+            raise _adcfda_invalid(f"{where} conclusion is not known")
+        identity_present = reason != PA_CONCLUSION_INVALID
+        if identity_present:
+            if row_site is None:
+                raise _adcfda_invalid(
+                    f"{where} an authenticated or authorized row must carry "
+                    "its issuer"
+                )
+        elif row_site is not None:
+            raise _adcfda_invalid(
+                f"{where} an invalid row must carry no issuer"
+            )
+        raw_declaration = row[_ADCFD_DECLARATION]
+        if conclusion == PA_CONCLUSION_INVALID:
+            if raw_declaration is not None:
+                raise _adcfda_invalid(
+                    f"{where} an invalid row must carry no declaration"
+                )
+            parsed_declaration = None
+        else:
+            parsed_declaration = _validated_adcfd_declaration(
+                raw_declaration, f"{where} declaration", invalid=_adcfda_invalid
+            )
+            if parsed_declaration is None:
+                raise _adcfda_invalid(
+                    f"{where} a counted row must carry its declaration"
+                )
+        parsed_rows.append({
+            ADJ_CONCLUSION: conclusion,
+            CP_DIGEST: digest,
+            ID: row_id,
+            VD_ISSUER: row_site,
+            KEY_VERSION: row_key_version,
+            ADJ_REASON: reason,
+            _ADCFD_DECLARATION: parsed_declaration,
+        })
+
+    common_declaration = _validated_adcfd_declaration(
+        payload[_ADCFD_DECLARATION], "aggregate declaration",
+        invalid=_adcfda_invalid,
+    )
+
+    normalized_payload = {
+        _ADCFD_INPUTS: list(inputs),
+        VD_ISSUER: issuer,
+        ITEMS: parsed_rows,
+        KEY_VERSION: key_version,
+        _ADCFD_PRUNE_POLICY_DIGEST: payload[_ADCFD_PRUNE_POLICY_DIGEST],
+        _ADCFD_AUTHORIZATION_POLICY_DIGEST: payload[
+            _ADCFD_AUTHORIZATION_POLICY_DIGEST
+        ],
+        _ADCFD_SITE_POLICY_DIGEST: payload[_ADCFD_SITE_POLICY_DIGEST],
+        _ADCFD_SIGNER_SITE_POLICY_DIGEST: payload[
+            _ADCFD_SIGNER_SITE_POLICY_DIGEST
+        ],
+        _ADCFD_DECISION_SITE_POLICY_DIGEST: payload[
+            _ADCFD_DECISION_SITE_POLICY_DIGEST
+        ],
+        _ADCFD_DECLARATION: common_declaration,
+        STATUS: status,
+        VERSION: AGGREGATE_DECISION_CHAIN_FORK_DECISION_AGGREGATE_VERSION,
+    }
+    if _prune_compact({TICKET_PAYLOAD: normalized_payload,
+                       SIGNATURE: signature}) != raw:
+        raise _adcfda_invalid(
+            "aggregate packet encoding is not the canonical compact form"
+        )
+    return normalized_payload, signature
+
+
+# -- Offline aggregate verification --------------------------------------------
+
+def _reconcile_adcfda_declaration(
+    declaration: dict, fork_threshold: int, where: str
+) -> None:
+    """Re-tally one bound declaration as the decision it claims to be.
+
+    The declaration's per-item conclusion entries and term-by-term proof
+    digest vector are re-tallied through the exact aggregate decision
+    chain fork decision rules against the adjudication signer site
+    policy threshold, so a reordered entry, a reordered proof summary, a
+    wrong duplicate or contradiction marking, a tampered common set
+    (including hiding a fork-free empty edge set) or a mis-stated status
+    cannot hide inside a counted declaration.  Any mismatch raises
+    :class:`InvalidAggregateDecisionChainForkDecisionAggregateError`.
+    """
+    synthetic_payload = {
+        PAFD_COMMON: declaration[PAFD_COMMON],
+        ITEMS: [
+            {
+                ADJ_CONCLUSION: entry[ADJ_CONCLUSION],
+                PAFD_EDGES: entry[PAFD_EDGES],
+                ID: entry[ID],
+                KEY_VERSION: None,
+                PAFD_FORK_PROOF_DIGEST: entry[CP_DIGEST],
+                ADJ_REASON: entry[ADJ_REASON],
+                VD_ISSUER: entry[VD_ISSUER],
+            }
+            for entry in declaration[PFDA_CONCLUSIONS]
+        ],
+        PAFD_PROOFS: declaration[PFDA_PROOFS],
+        STATUS: declaration[STATUS],
+    }
+    try:
+        _reconcile_pafd(
+            synthetic_payload, fork_threshold,
+            invalid=_adcf_decision_invalid, positional_proofs=True,
+        )
+    except InvalidAggregateDecisionChainForkDecisionError as exc:
+        raise _adcfda_invalid(f"{where}: {exc}") from exc
+
+
+def _reconcile_adcfda_aggregate(
+    payload: dict, fork_threshold: int, decision_threshold: int
+) -> None:
+    """Re-derive every binding of a parsed decision aggregate payload.
+
+    Re-tallies the per-decision rows the signature covers -- the
+    original-order input digest bindings, row ordering, same-site
+    duplicate and contradiction markings, cross-site complete
+    declaration agreement, the threshold acceptance and the claimed
+    common declaration and status -- and re-tallies every counted
+    declaration against the adjudication signer site policy threshold,
+    without seeing any decision bytes.  Any mismatch raises
+    :class:`InvalidAggregateDecisionChainForkDecisionAggregateError`.
+    """
+    rows = payload[ITEMS]
+    inputs = payload[_ADCFD_INPUTS]
+
+    expected_order = sorted(
+        rows,
+        key=lambda row: (
+            row[VD_ISSUER] is not None,
+            row[VD_ISSUER] or "",
+            row[ID],
+        ),
+    )
+    if [row[ID] for row in expected_order] != [row[ID] for row in rows]:
+        raise _adcfda_invalid("items must be sorted by issuer then id")
+    if sorted(row[CP_DIGEST] for row in rows) != sorted(inputs):
+        raise _adcfda_invalid(
+            "the bound input digests must equal the per-item digests"
+        )
+
+    # Deep-copy the parsed rows before the tally mutates their
+    # conclusion/reason markings; the signed payload itself is compared
+    # through freshly derived structures only.
+    working_rows = copy.deepcopy(rows)
+    derived_status, derived_declaration = _tally_pfda_rows(
+        working_rows, decision_threshold
+    )
+
+    for expected_row, bound_row in zip(working_rows, rows):
+        if expected_row[ADJ_CONCLUSION] != bound_row[ADJ_CONCLUSION]:
+            raise _adcfda_invalid(
+                f"item {bound_row[ID]!r} has the wrong conclusion"
+            )
+        if expected_row[ADJ_REASON] != bound_row[ADJ_REASON]:
+            raise _adcfda_invalid(
+                f"item {bound_row[ID]!r} has the wrong reason"
+            )
+
+    if payload[STATUS] != derived_status:
+        raise _adcfda_invalid(
+            "the bound status does not match the tallied items"
+        )
+    bound_declaration = payload[_ADCFD_DECLARATION]
+    if derived_declaration is None:
+        if bound_declaration is not None:
+            raise _adcfda_invalid(
+                "the common declaration must be null when no unique "
+                "conflict-free declaration was tallied"
+            )
+    else:
+        if bound_declaration is None:
+            raise _adcfda_invalid(
+                "an aggregate over one unique conflict-free declaration "
+                "must carry the common declaration"
+            )
+        if bound_declaration != derived_declaration:
+            raise _adcfda_invalid(
+                "the bound common declaration does not match the tallied "
+                "decisions"
+            )
+
+    for row in rows:
+        declaration = row[_ADCFD_DECLARATION]
+        if declaration is None:
+            continue
+        _reconcile_adcfda_declaration(
+            declaration, fork_threshold, f"aggregate item {row[ID]!r}"
+        )
+    if bound_declaration is not None:
+        _reconcile_adcfda_declaration(
+            bound_declaration, fork_threshold, "aggregate declaration"
+        )
+
+
+def verify_aggregate_decision_chain_fork_decision_aggregate(
+    aggregate, prune_policy, authorization_policy, site_policy,
+    signer_site_policy, decision_site_policy, keyring, moment,
+):
+    """Verify a signed aggregate decision chain fork decision aggregate.
+
+    Only the aggregate bytes, the five expected policies (the prune
+    policy, the site authorization policy, the fork-proof signer site
+    policy, the adjudication signer site policy and the decision site
+    policy), the current ``keyring`` and the verification ``moment`` are
+    consulted -- no file is read or written and no argument is modified.
+    Verification validates the canonical encoding and every key set,
+    recomputes all five policy digests, and re-tallies the bound
+    per-decision rows purely from the signed payload: the
+    original-order input digest bindings, the issuer/id row ordering,
+    same-site duplicate and contradiction markings, cross-site complete
+    declaration agreement (the common fork edge set, including an empty
+    fork-free one, the per-item conclusions, the term-by-term proof
+    digest vector and the overall status together), the threshold
+    outcome and the claimed common declaration, together with a full
+    re-tally of every counted declaration against the adjudication
+    signer site policy threshold.  It then checks the HMAC-SHA256
+    against the key the *current* keyring binds to the payload's exact
+    issuer and version, usable at the verification moment, so a later
+    revocation or expiry rejects the aggregate with no fallback.
+
+    On success a fresh dict equal to the authenticated payload plus
+    ``aggregateDigest`` (the SHA-256 of the aggregate bytes) is
+    returned with the fixed keys ``aggregateDigest``, ``inputs``,
+    ``issuer``, ``items``, ``keyVersion``, ``prunePolicyDigest``,
+    ``authorizationPolicyDigest``, ``sitePolicyDigest``,
+    ``signerSitePolicyDigest``, ``decisionSitePolicyDigest``,
+    ``declaration``, ``status`` and ``version`` (the integer 1) --
+    repeated calls return equal but mutually independent objects
+    sharing no mutable structure, and unauthenticated identities or
+    boundaries never enter a result.  A non-bytes aggregate or a field
+    of the wrong type raises :class:`TypeError` (a :class:`bool` never
+    poses as an int); a null value, a duplicate id, a wrong key set or
+    an illegal policy, threshold, moment or other value raises
+    :class:`ValueError`; an illegal encoding, key set, digest,
+    ordering, tally or declaration binding raises
+    :class:`InvalidAggregateDecisionChainForkDecisionAggregateError`
+    (a :class:`ValueError` subclass, distinct from the proof,
+    single-decision and other aggregate error classes); unknown,
+    revoked, not-yet-valid or expired credentials or a signature
+    mismatch raise :class:`AuthenticationError`.
+    """
+    if not isinstance(aggregate, bytes):
+        raise TypeError("aggregate packet must be bytes")
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_authorization_policy = _validated_prune_batch_site_policy(
+        authorization_policy
+    )
+    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
+    validated_signer_site_policy = _validated_prune_batch_site_policy(
+        signer_site_policy
+    )
+    validated_decision_site_policy = _validated_prune_batch_site_policy(
+        decision_site_policy
+    )
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+
+    payload, signature = _parse_adcfda(aggregate)
+    if payload[_ADCFD_PRUNE_POLICY_DIGEST] != hashlib.sha256(
+        _verdict_policy_bytes(validated_prune_policy)
+    ).hexdigest():
+        raise _adcfda_invalid(
+            "prune policy digest does not match the prune policy"
+        )
+    if payload[_ADCFD_AUTHORIZATION_POLICY_DIGEST] != hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_authorization_policy)
+    ).hexdigest():
+        raise _adcfda_invalid(
+            "authorization policy digest does not match the authorization "
+            "policy"
+        )
+    if payload[_ADCFD_SITE_POLICY_DIGEST] != hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_site_policy)
+    ).hexdigest():
+        raise _adcfda_invalid(
+            "site policy digest does not match the fork-proof signer site "
+            "policy"
+        )
+    if payload[_ADCFD_SIGNER_SITE_POLICY_DIGEST] != hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_signer_site_policy)
+    ).hexdigest():
+        raise _adcfda_invalid(
+            "signer site policy digest does not match the adjudication "
+            "signer site policy"
+        )
+    if payload[_ADCFD_DECISION_SITE_POLICY_DIGEST] != hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_decision_site_policy)
+    ).hexdigest():
+        raise _adcfda_invalid(
+            "decision site policy digest does not match the decision "
+            "site policy"
+        )
+
+    _reconcile_adcfda_aggregate(
+        payload,
+        validated_signer_site_policy[ADJ_THRESHOLD],
+        validated_decision_site_policy[ADJ_THRESHOLD],
+    )
+
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION],
+        verify_moment,
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "aggregate decision chain fork decision aggregate signature "
+            "does not match"
+        )
+
+    authenticated = copy.deepcopy(payload)
+    return {
+        key: (
+            hashlib.sha256(aggregate).hexdigest()
+            if key == _ADCFD_AGGREGATE_DIGEST
+            else authenticated[key]
+        )
+        for key in _ADCFD_RESULT_KEYS
     }
