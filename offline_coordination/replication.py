@@ -41782,3 +41782,1293 @@ def verify_aggregate_decision_chain_fork_decision_aggregate(
         )
         for key in _ADCFDA_RESULT_KEYS
     }
+
+
+# -- Final aggregate supersession chains ---------------------------------------
+#
+# A final aggregate chain grows one aggregate decision chain fork
+# decision aggregate (the cross-site aggregate package sealed by
+# ``aggregate_aggregate_decision_chain_fork_decisions``) with signed
+# successor packets, so decisions can be appended and the decision site
+# policy rotated without discarding the sealed history.  Every successor
+# re-seals the complete decision history plus an increment of newly
+# signed decisions under a versioned decision site policy; the prune
+# policy, the site authorization policy, the fork-proof signer site
+# policy and the adjudication signer site policy stay invariant along
+# the whole chain.
+
+FINAL_AGGREGATE_CHAIN_VERSION = 1
+
+_FAG_PACKET = _CFD_DECISION
+_FAG_DECISIONS = FAC_DECISIONS
+_FAG_ROOT_DIGEST = DS_ROOT_DIGEST
+_FAG_PREDECESSOR_DIGEST = DS_PREDECESSOR_DIGEST
+_FAG_HEIGHT = DS_HEIGHT
+_FAG_OLD_POLICY_DIGEST = DS_OLD_POLICY_DIGEST
+_FAG_NEW_POLICY_DIGEST = DS_NEW_POLICY_DIGEST
+_FAG_POLICY_VERSION = DS_POLICY_VERSION
+_FAG_EFFECTIVE_AT = DS_EFFECTIVE_AT
+_FAG_DECLARATION_DIGEST = "declarationDigest"
+
+_FAG_TOP_KEYS = _PFDA_TOP_KEYS
+_FAG_SUCCESSOR_PAYLOAD_KEYS = frozenset((
+    _FAG_ROOT_DIGEST,
+    _FAG_PREDECESSOR_DIGEST,
+    _FAG_HEIGHT,
+    _ADCFDA_INPUTS,
+    ITEMS,
+    _ADCFDA_DECLARATION,
+    STATUS,
+    _ADCFDA_PRUNE_POLICY_DIGEST,
+    _ADCFDA_AUTHORIZATION_POLICY_DIGEST,
+    _ADCFDA_SITE_POLICY_DIGEST,
+    _ADCFDA_SIGNER_SITE_POLICY_DIGEST,
+    _FAG_OLD_POLICY_DIGEST,
+    _FAG_NEW_POLICY_DIGEST,
+    _FAG_POLICY_VERSION,
+    _FAG_EFFECTIVE_AT,
+    _FAG_DECISIONS,
+    VD_ISSUER,
+    KEY_VERSION,
+    VERSION,
+))
+_FAG_DECISION_ITEM_KEYS = frozenset((ID, _FAG_PACKET))
+_FAG_RESULT_KEYS = (
+    _FAG_ROOT_DIGEST,
+    FAC_HEAD_DIGEST,
+    _FAG_HEIGHT,
+    FAC_POLICY_VERSION,
+    STATUS,
+    _FAG_DECLARATION_DIGEST,
+)
+
+
+class InvalidFinalAggregateChainError(ValueError):
+    """A final aggregate chain successor breaks its contract."""
+
+
+def _fag_chain_invalid(message: str) -> InvalidFinalAggregateChainError:
+    return InvalidFinalAggregateChainError(
+        f"invalid final aggregate chain: {message}"
+    )
+
+
+def _reject_duplicate_fag_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate successor keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _fag_chain_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+# -- Stage views over a root final aggregate or a successor packet --------------
+
+def _fag_root_view(raw: bytes) -> dict:
+    """Structurally parse a root final aggregate predecessor."""
+    payload, _signature = _parse_adcfda(raw)
+    return {
+        "kind": "root",
+        _FAG_ROOT_DIGEST: hashlib.sha256(raw).hexdigest(),
+        _FAG_HEIGHT: 0,
+        STATUS: payload[STATUS],
+        _ADCFDA_DECLARATION: payload[_ADCFDA_DECLARATION],
+        _ADCFDA_INPUTS: list(payload[_ADCFDA_INPUTS]),
+        PA_ITEMS: copy.deepcopy(payload[ITEMS]),
+        "prune_policy_digest": payload[_ADCFDA_PRUNE_POLICY_DIGEST],
+        "authorization_policy_digest": payload[
+            _ADCFDA_AUTHORIZATION_POLICY_DIGEST
+        ],
+        "site_policy_digest": payload[_ADCFDA_SITE_POLICY_DIGEST],
+        "signer_site_policy_digest": payload[
+            _ADCFDA_SIGNER_SITE_POLICY_DIGEST
+        ],
+        "policy_digest": payload[_ADCFDA_DECISION_SITE_POLICY_DIGEST],
+        _FAG_POLICY_VERSION:
+            AGGREGATE_DECISION_CHAIN_FORK_DECISION_AGGREGATE_VERSION,
+        _FAG_EFFECTIVE_AT: None,
+    }
+
+
+def _fag_successor_view(raw: bytes) -> dict:
+    """Structurally parse a final aggregate successor predecessor."""
+    payload, _signature, _increment = _fag_parse_successor(raw)
+    return {
+        "kind": "successor",
+        _FAG_ROOT_DIGEST: payload[_FAG_ROOT_DIGEST],
+        _FAG_HEIGHT: payload[_FAG_HEIGHT],
+        STATUS: payload[STATUS],
+        _ADCFDA_DECLARATION: copy.deepcopy(payload[_ADCFDA_DECLARATION]),
+        _ADCFDA_INPUTS: list(payload[_ADCFDA_INPUTS]),
+        PA_ITEMS: copy.deepcopy(payload[ITEMS]),
+        "prune_policy_digest": payload[_ADCFDA_PRUNE_POLICY_DIGEST],
+        "authorization_policy_digest": payload[
+            _ADCFDA_AUTHORIZATION_POLICY_DIGEST
+        ],
+        "site_policy_digest": payload[_ADCFDA_SITE_POLICY_DIGEST],
+        "signer_site_policy_digest": payload[
+            _ADCFDA_SIGNER_SITE_POLICY_DIGEST
+        ],
+        "policy_digest": payload[_FAG_NEW_POLICY_DIGEST],
+        _FAG_POLICY_VERSION: payload[_FAG_POLICY_VERSION],
+        _FAG_EFFECTIVE_AT: payload[_FAG_EFFECTIVE_AT],
+    }
+
+
+def _fag_predecessor_view(raw: object) -> dict:
+    """Parse predecessor bytes (root aggregate or successor packet).
+
+    The packet kind is chosen from the payload key set so a malformed
+    root raises
+    :class:`InvalidAggregateDecisionChainForkDecisionAggregateError`
+    while a malformed successor raises
+    :class:`InvalidFinalAggregateChainError`.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("predecessor must be bytes")
+    keys = _packet_payload_keys(raw)
+    if keys is not None and _FAG_ROOT_DIGEST in keys:
+        return _fag_successor_view(raw)
+    return _fag_root_view(raw)
+
+
+# -- Recomputing one stage verdict from prefix plus decision increment ---------
+
+def _fag_recompute(
+    prefix_inputs: list[str],
+    prefix_rows: list[dict],
+    increment: list[dict],
+    prune_policy_digest: str,
+    authorization_policy_digest: str,
+    site_policy_digest: str,
+    signer_site_policy_digest: str,
+    fork_threshold: int,
+    decision_site_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Recompute the complete stage conclusion from prefix plus increment.
+
+    The prefix statements are the already-verified statements of the
+    predecessor; each new decision is authenticated and authorized
+    through the existing aggregate decision chain fork decision
+    aggregate rules under the new decision site policy, and the complete
+    statement set is re-tallied with the prefix statements always
+    winning over a newly appended repeat.
+    """
+    increment_rows: list[dict] = []
+    increment_digests: list[str] = []
+    for item in increment:
+        raw = item[_FAG_PACKET]
+        increment_digests.append(hashlib.sha256(raw).hexdigest())
+        increment_rows.append(
+            _aggregate_adcfda_one(
+                item,
+                prune_policy_digest,
+                authorization_policy_digest,
+                site_policy_digest,
+                signer_site_policy_digest,
+                fork_threshold,
+                decision_site_policy,
+                validated_keyring,
+                moment,
+            )
+        )
+
+    full_inputs = list(prefix_inputs) + increment_digests
+    working_rows = copy.deepcopy(prefix_rows)
+    working_rows.extend(copy.deepcopy(increment_rows))
+    status, declaration = _cfca_tally_chain_rows(
+        working_rows, len(prefix_rows), decision_site_policy[ADJ_THRESHOLD]
+    )
+    return {
+        _ADCFDA_INPUTS: full_inputs,
+        PA_ITEMS: _pac_sort_rows(working_rows),
+        STATUS: status,
+        _ADCFDA_DECLARATION: declaration,
+    }
+
+
+def _fag_assert_extends(
+    previous: dict, full_inputs: list[str], increment: list[dict],
+    unchanged: bool,
+) -> None:
+    """Enforce the append-only decision prefix and disjoint identities.
+
+    The predecessor's decision digests must remain the ordered prefix of
+    the stage -- nothing is deleted, changed or reordered -- and a
+    non-empty increment adds only new packet digests and new item ids.
+    An unchanged policy must add at least one decision; a rotation may
+    re-seal the identical sequence with an empty increment.
+    """
+    prefix_inputs = previous[_ADCFDA_INPUTS]
+    if unchanged and not increment:
+        raise _fag_chain_invalid("an unchanged policy requires new decisions")
+    if len(full_inputs) < len(prefix_inputs):
+        raise _fag_chain_invalid(
+            "the decision sequence must extend the predecessor"
+        )
+    if full_inputs[:len(prefix_inputs)] != prefix_inputs:
+        raise _fag_chain_invalid(
+            "the decision sequence must keep the predecessor as an ordered "
+            "prefix; history must not be deleted, changed or reordered"
+        )
+    prefix_digests = set(prefix_inputs)
+    prefix_ids = {row[ID] for row in previous[PA_ITEMS]}
+    seen_digests: set[str] = set()
+    seen_ids: set[str] = set()
+    for item in increment:
+        digest = hashlib.sha256(item[_FAG_PACKET]).hexdigest()
+        if digest in prefix_digests or digest in seen_digests:
+            raise _fag_chain_invalid(
+                "a decision packet already in the prefix must not be "
+                "appended again"
+            )
+        seen_digests.add(digest)
+        item_id = item[ID]
+        if item_id in prefix_ids or item_id in seen_ids:
+            raise _fag_chain_invalid(
+                f"decision item id {item_id!r} is already part of the chain"
+            )
+        seen_ids.add(item_id)
+
+
+def _fag_assert_transition(previous: dict, verdict: dict) -> None:
+    """Enforce the per-hop verdict state machine for a final aggregate.
+
+    ``insufficient`` may gain supplemental decisions and become
+    ``accepted`` or ``conflicted``; an ``accepted`` head only keeps the
+    identical common declaration or advances to ``conflicted`` (it
+    never falls back to insufficient or swaps declarations); a
+    ``conflicted`` verdict can never be masked by a later majority.
+    """
+    prev_status = previous[STATUS]
+    new_status = verdict[STATUS]
+    if prev_status == PA_STATUS_CONFLICTED:
+        if new_status != PA_STATUS_CONFLICTED:
+            raise _fag_chain_invalid(
+                "a conflicted aggregate can never be outvoted or fall back"
+            )
+    elif prev_status == PA_STATUS_ACCEPTED:
+        if new_status == PA_STATUS_INSUFFICIENT:
+            raise _fag_chain_invalid(
+                "an accepted aggregate must not fall back to insufficient"
+            )
+        if new_status == PA_STATUS_ACCEPTED:
+            if verdict[_ADCFDA_DECLARATION] != previous[_ADCFDA_DECLARATION]:
+                raise _fag_chain_invalid(
+                    "an accepted aggregate may only keep the same common "
+                    "declaration"
+                )
+
+
+def _fag_assert_sealer_authorized(
+    old_policy: dict, new_policy: dict, issuer: str, key_version: int
+) -> None:
+    """The successor sealer must be authorized under both site policies."""
+    if key_version not in old_policy[ADJ_SITES].get(issuer, frozenset()):
+        raise _fag_chain_invalid(
+            f"sealer {issuer!r} version {key_version} is not authorized by "
+            "the previous site policy"
+        )
+    if key_version not in new_policy[ADJ_SITES].get(issuer, frozenset()):
+        raise _fag_chain_invalid(
+            f"sealer {issuer!r} version {key_version} is not authorized by "
+            "the rotated site policy"
+        )
+
+
+# -- Successor packet shape ----------------------------------------------------
+
+def _fag_bound_decisions(raw_items: object, where: str) -> list[dict]:
+    """Parse the raw decision increment bound inside a successor packet."""
+    if not isinstance(raw_items, list):
+        raise TypeError(f"{where} decisions must be a list")
+    validated: list[dict] = []
+    for position, item in enumerate(raw_items):
+        item_where = f"{where} decision {position}"
+        if not isinstance(item, dict):
+            raise TypeError(f"{item_where} must be an object")
+        if set(item.keys()) != _FAG_DECISION_ITEM_KEYS:
+            raise _fag_chain_invalid(
+                f"{item_where} must contain exactly the keys 'decision' and "
+                "'id'"
+            )
+        item_id = item[ID]
+        if not isinstance(item_id, str):
+            raise TypeError(f"{item_where} id must be a str")
+        if item_id == "":
+            raise _fag_chain_invalid(f"{item_where} id must be non-empty")
+        packet_hex = item[_FAG_PACKET]
+        if not isinstance(packet_hex, str):
+            raise TypeError(f"{item_where} decision must be a str")
+        try:
+            packet = _hex_bytes(packet_hex)
+        except ValueError as exc:
+            raise _fag_chain_invalid(
+                f"{item_where} decision must be non-empty even-length "
+                "lowercase hex"
+            ) from exc
+        validated.append({ID: item_id, _FAG_PACKET: packet})
+    return validated
+
+
+def _fag_validated_rows(raw_rows: object, where: str) -> list[dict]:
+    """Validate the bound aggregate rows of a chain successor payload.
+
+    The row contract is the one
+    :func:`aggregate_aggregate_decision_chain_fork_decisions` binds; a
+    counted row's complete declaration keeps the term-by-term proof
+    digest vector of a legal aggregate decision chain fork decision and
+    may carry the empty common fork edge set.  A wrong JSON type raises
+    :class:`TypeError` and every other structural fault raises
+    :class:`InvalidFinalAggregateChainError`.
+    """
+    if not isinstance(raw_rows, list):
+        raise TypeError(f"{where} items must be a list")
+    if not raw_rows:
+        raise _fag_chain_invalid(f"{where} items must be a non-empty list")
+    parsed_rows: list[dict] = []
+    seen_ids: set[str] = set()
+    for position, row in enumerate(raw_rows):
+        row_where = f"{where} item {position}"
+        if not isinstance(row, dict):
+            raise TypeError(f"{row_where} must be an object")
+        if set(row.keys()) != _PFDA_ROW_KEYS:
+            raise _fag_chain_invalid(
+                f"{row_where} must contain exactly the keys 'conclusion', "
+                "'digest', 'id', 'issuer', 'keyVersion', 'reason' and "
+                "'declaration'"
+            )
+        row_id = row[ID]
+        if not isinstance(row_id, str):
+            raise TypeError(f"{row_where} id must be a str")
+        if row_id == "":
+            raise _fag_chain_invalid(f"{row_where} id must be non-empty")
+        if row_id in seen_ids:
+            raise _fag_chain_invalid(f"{row_where} repeats an id")
+        seen_ids.add(row_id)
+        digest = row[CP_DIGEST]
+        if not isinstance(digest, str):
+            raise TypeError(f"{row_where} digest must be a str")
+        if not _prune_is_digest(digest):
+            raise _fag_chain_invalid(
+                f"{row_where} digest must be 64 lowercase hex characters"
+            )
+        site = row[VD_ISSUER]
+        if site is not None and not isinstance(site, str):
+            raise TypeError(f"{row_where} issuer must be a str or null")
+        if site == "":
+            raise _fag_chain_invalid(f"{row_where} issuer must be non-empty")
+        key_version = row[KEY_VERSION]
+        if isinstance(key_version, bool) or not isinstance(key_version, int):
+            if key_version is not None:
+                raise TypeError(
+                    f"{row_where} keyVersion must be an int or null"
+                )
+        elif key_version <= 0:
+            raise _fag_chain_invalid(
+                f"{row_where} keyVersion must be positive"
+            )
+        if (site is None) != (key_version is None):
+            raise _fag_chain_invalid(
+                f"{row_where} issuer and keyVersion must be null together"
+            )
+        conclusion = row[ADJ_CONCLUSION]
+        if not isinstance(conclusion, str):
+            raise TypeError(f"{row_where} conclusion must be a str")
+        reason = row[ADJ_REASON]
+        if conclusion == PA_CONCLUSION_VALID:
+            if reason is not None:
+                raise _fag_chain_invalid(
+                    f"{row_where} reason must be null for a valid row"
+                )
+        elif conclusion == PA_CONCLUSION_INVALID:
+            if reason not in _PFDA_INVALID_REASONS:
+                raise _fag_chain_invalid(
+                    f"{row_where} reason must be one of 'invalid', "
+                    "'unauthenticated' or 'unauthorized'"
+                )
+        elif conclusion in (
+            PA_CONCLUSION_DUPLICATE, PA_CONCLUSION_CONTRADICTION
+        ):
+            expected = (
+                REASON_DUPLICATE
+                if conclusion == PA_CONCLUSION_DUPLICATE
+                else REASON_CONTRADICTION
+            )
+            if reason != expected:
+                raise _fag_chain_invalid(
+                    f"{row_where} reason must match its conclusion"
+                )
+        else:
+            raise _fag_chain_invalid(f"{row_where} conclusion is not known")
+        identity_present = reason != PA_CONCLUSION_INVALID
+        if identity_present:
+            if site is None:
+                raise _fag_chain_invalid(
+                    f"{row_where} an authenticated or authorized row must "
+                    "carry its issuer"
+                )
+        elif site is not None:
+            raise _fag_chain_invalid(
+                f"{row_where} an invalid row must carry no issuer"
+            )
+        if conclusion == PA_CONCLUSION_INVALID:
+            if row[_ADCFDA_DECLARATION] is not None:
+                raise _fag_chain_invalid(
+                    f"{row_where} an invalid row must carry no declaration"
+                )
+            declaration = None
+        else:
+            try:
+                declaration = _validated_pfda_declaration(
+                    row[_ADCFDA_DECLARATION], f"{row_where} declaration",
+                    invalid=_adcfda_invalid, positional_proofs=True,
+                    allow_empty_edges=True,
+                )
+            except InvalidAggregateDecisionChainForkDecisionAggregateError \
+                    as exc:
+                raise _fag_chain_invalid(str(exc)) from exc
+            if declaration is None:
+                raise _fag_chain_invalid(
+                    f"{row_where} a counted row must carry its declaration"
+                )
+        parsed_rows.append({
+            ADJ_CONCLUSION: conclusion,
+            CP_DIGEST: digest,
+            ID: row_id,
+            VD_ISSUER: site,
+            KEY_VERSION: key_version,
+            ADJ_REASON: reason,
+            _ADCFDA_DECLARATION: declaration,
+        })
+    return parsed_rows
+
+
+def _fag_parse_successor(raw: object) -> tuple[dict, str, list[dict]]:
+    """Validate successor bytes into ``(payload, signature, increment)``.
+
+    A non-bytes argument or a public field of the wrong type raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); every
+    encoding, key-set, version, digest, row or increment fault raises
+    :class:`InvalidFinalAggregateChainError`.  The predecessor, policy,
+    moment, tally and signature bindings are checked by the chain
+    verifier.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("successor must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _fag_chain_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _fag_chain_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_fag_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _fag_chain_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("successor must be a JSON object")
+    if set(data.keys()) != _FAG_TOP_KEYS:
+        raise _fag_chain_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("successor signature must be a str")
+    if not _prune_is_digest(signature):
+        raise _fag_chain_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("successor payload must be an object")
+    if set(payload.keys()) != _FAG_SUCCESSOR_PAYLOAD_KEYS:
+        raise _fag_chain_invalid("payload must contain exactly the bound keys")
+
+    for key in (
+        _FAG_ROOT_DIGEST, _FAG_PREDECESSOR_DIGEST,
+        _ADCFDA_PRUNE_POLICY_DIGEST, _ADCFDA_AUTHORIZATION_POLICY_DIGEST,
+        _ADCFDA_SITE_POLICY_DIGEST, _ADCFDA_SIGNER_SITE_POLICY_DIGEST,
+        _FAG_OLD_POLICY_DIGEST, _FAG_NEW_POLICY_DIGEST,
+    ):
+        value = payload[key]
+        if not isinstance(value, str):
+            raise TypeError(f"payload {key} must be a str")
+        if not _prune_is_digest(value):
+            raise _fag_chain_invalid(
+                f"payload {key} must be 64 lowercase hex characters"
+            )
+    height = payload[_FAG_HEIGHT]
+    if isinstance(height, bool) or not isinstance(height, int):
+        raise TypeError("payload height must be an int")
+    if height < 1:
+        raise _fag_chain_invalid("payload height must be a positive integer")
+    policy_version = payload[_FAG_POLICY_VERSION]
+    if isinstance(policy_version, bool) or not isinstance(policy_version, int):
+        raise TypeError("payload policyVersion must be an int")
+    if policy_version <= 0:
+        raise _fag_chain_invalid("payload policyVersion must be positive")
+    effective = payload[_FAG_EFFECTIVE_AT]
+    if isinstance(effective, bool) or not isinstance(effective, int):
+        raise TypeError("payload effectiveAt must be an int")
+    if effective < 0:
+        raise _fag_chain_invalid("payload effectiveAt must be non-negative")
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("payload issuer must be a str")
+    if issuer == "":
+        raise _fag_chain_invalid("payload issuer must be a non-empty str")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _fag_chain_invalid("payload keyVersion must be positive")
+    packet_version = payload[VERSION]
+    if isinstance(packet_version, bool) or not isinstance(
+        packet_version, int
+    ):
+        raise TypeError("payload version must be an int")
+    if packet_version != FINAL_AGGREGATE_CHAIN_VERSION:
+        raise _fag_chain_invalid("payload version must be the integer 1")
+
+    status = payload[STATUS]
+    if not isinstance(status, str):
+        raise TypeError("payload status must be a str")
+    if status not in _PA_STATUSES:
+        raise _fag_chain_invalid("payload status is not known")
+
+    inputs = payload[_ADCFDA_INPUTS]
+    if not isinstance(inputs, list):
+        raise TypeError("payload inputs must be a list")
+    if not inputs:
+        raise _fag_chain_invalid("payload inputs must be a non-empty list")
+    for position, digest in enumerate(inputs):
+        if not isinstance(digest, str):
+            raise TypeError(f"payload input {position} digest must be a str")
+        if not _prune_is_digest(digest):
+            raise _fag_chain_invalid(
+                f"payload input {position} digest must be 64 lowercase hex "
+                "characters"
+            )
+
+    rows = _fag_validated_rows(payload[ITEMS], "payload")
+    if len(rows) != len(inputs):
+        raise _fag_chain_invalid(
+            "the items must cover every decision and vice versa"
+        )
+    raw_declaration = payload[_ADCFDA_DECLARATION]
+    if raw_declaration is None:
+        declaration = None
+    else:
+        try:
+            declaration = _validated_pfda_declaration(
+                raw_declaration, "payload declaration",
+                invalid=_adcfda_invalid, positional_proofs=True,
+                allow_empty_edges=True,
+            )
+        except InvalidAggregateDecisionChainForkDecisionAggregateError as exc:
+            raise _fag_chain_invalid(str(exc)) from exc
+    if status == PA_STATUS_ACCEPTED and declaration is None:
+        raise _fag_chain_invalid(
+            "an accepted verdict must keep the common declaration"
+        )
+    if status == PA_STATUS_CONFLICTED and declaration is not None:
+        raise _fag_chain_invalid(
+            "a conflicted verdict must bind a null common declaration"
+        )
+
+    increment = _fag_bound_decisions(payload[_FAG_DECISIONS], "payload")
+
+    normalized_payload = {
+        _FAG_ROOT_DIGEST: payload[_FAG_ROOT_DIGEST],
+        _FAG_PREDECESSOR_DIGEST: payload[_FAG_PREDECESSOR_DIGEST],
+        _FAG_HEIGHT: height,
+        _ADCFDA_INPUTS: list(inputs),
+        ITEMS: rows,
+        _ADCFDA_DECLARATION: declaration,
+        STATUS: status,
+        _ADCFDA_PRUNE_POLICY_DIGEST: payload[_ADCFDA_PRUNE_POLICY_DIGEST],
+        _ADCFDA_AUTHORIZATION_POLICY_DIGEST: payload[
+            _ADCFDA_AUTHORIZATION_POLICY_DIGEST
+        ],
+        _ADCFDA_SITE_POLICY_DIGEST: payload[_ADCFDA_SITE_POLICY_DIGEST],
+        _ADCFDA_SIGNER_SITE_POLICY_DIGEST: payload[
+            _ADCFDA_SIGNER_SITE_POLICY_DIGEST
+        ],
+        _FAG_OLD_POLICY_DIGEST: payload[_FAG_OLD_POLICY_DIGEST],
+        _FAG_NEW_POLICY_DIGEST: payload[_FAG_NEW_POLICY_DIGEST],
+        _FAG_POLICY_VERSION: policy_version,
+        _FAG_EFFECTIVE_AT: effective,
+        _FAG_DECISIONS: [
+            {ID: item[ID], _FAG_PACKET: item[_FAG_PACKET].hex()}
+            for item in increment
+        ],
+        VD_ISSUER: issuer,
+        KEY_VERSION: key_version,
+        VERSION: FINAL_AGGREGATE_CHAIN_VERSION,
+    }
+    if _prune_compact({TICKET_PAYLOAD: normalized_payload,
+                       SIGNATURE: signature}) != raw:
+        raise _fag_chain_invalid(
+            "encoding is not the canonical compact form"
+        )
+    return normalized_payload, signature, increment
+
+
+# -- Sealing a successor -------------------------------------------------------
+
+def supersede_final_aggregate(
+    root, predecessor, increment, prune_policy, authorization_policy,
+    site_policy, signer_site_policy, old_policy, new_policy, keyring,
+    moment, effective_at, issuer, version,
+):
+    """Issue one signed supersession successor over a final aggregate.
+
+    ``root`` is the chain's aggregate decision chain fork decision
+    aggregate packet
+    (:func:`aggregate_aggregate_decision_chain_fork_decisions`); for the
+    first hop ``predecessor`` is that same root packet, and afterwards
+    it is the previous successor packet, whose bound root digest must
+    equal the SHA-256 of ``root``.  ``increment`` is the stage's
+    decision list in the exact shape of that aggregate's items -- each
+    exactly a unique non-empty ``id`` and ``decision`` bytes (an
+    :func:`adjudicate_aggregate_decision_chain_forks` packet) -- and may
+    be empty only for a policy rotation.  The stage keeps every
+    predecessor decision verbatim as an ordered digest prefix and only
+    appends the increment; the original prune policy, the site
+    authorization policy, the fork-proof signer site policy, the
+    adjudication signer site policy, the root and the existing
+    statements are never deleted, changed or reordered.  Only the
+    **decision** site policy may rotate: ``old_policy``/``new_policy``
+    carry exactly ``sites``, ``threshold`` and a positive
+    ``policyVersion`` -- unchanged sites and threshold keep the version
+    and require a non-empty increment, any content change increments the
+    version by exactly one, and the first versioned policy over a root
+    carries version 1 and must equal the root's decision site policy.
+    ``effective_at`` is the hop's non-negative effective moment and
+    never moves backwards; ``moment`` is the issuance moment and
+    ``issuer``/``version`` name the successor sealing key, which must be
+    authorized under both decision policies and usable at both moments.
+
+    The successor verdict is recomputed in full from the full history:
+    supplemental decisions may move ``insufficient`` to ``accepted`` or
+    ``conflicted``; an ``accepted`` head only keeps the identical common
+    declaration or advances to ``conflicted``; and a ``conflicted``
+    verdict can never be masked by a later majority.
+
+    Returns canonical compact UTF-8 JSON with exactly ``payload`` and
+    ``signature``; the payload binds the root digest, predecessor
+    digest, height, the complete recomputed conclusion, the invariant
+    prune, site authorization, fork-proof signer and adjudication signer
+    site policy digests, the old/new decision policy digests, the policy
+    version, the effective moment, the raw decision increment (bytes as
+    lowercase hex), the issuer and key version and ``version`` (the
+    integer 1), signed with HMAC-SHA256 under the exact issuer/version
+    key.  A parameter or public field type fault raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); an empty
+    value, a duplicate increment id, an illegal version, a wrong policy
+    count or a backwards moment raises :class:`ValueError`; a malformed
+    root raises
+    :class:`InvalidAggregateDecisionChainForkDecisionAggregateError`; a
+    malformed successor or broken chain rule raises
+    :class:`InvalidFinalAggregateChainError`; a credential fault raises
+    :class:`AuthenticationError`.  No file is read or written and no
+    input is modified.
+    """
+    validated_increment = _cfca_validated_increment(increment)
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_authorization_policy = _validated_prune_batch_site_policy(
+        authorization_policy
+    )
+    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
+    validated_signer_site_policy = _validated_prune_batch_site_policy(
+        signer_site_policy
+    )
+    validated_old = _validated_pac_site_policy(old_policy)
+    validated_new = _validated_pac_site_policy(new_policy)
+    validated_keyring = _validated_keyring(keyring)
+    sign_moment = _fe_moment(moment, "moment")
+    effective = _fe_moment(effective_at, "effectiveAt")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+    if not isinstance(root, bytes):
+        raise TypeError("root must be bytes")
+    if not isinstance(predecessor, bytes):
+        raise TypeError("predecessor must be bytes")
+
+    root_view = _fag_root_view(root)
+    previous = _fag_predecessor_view(predecessor)
+    if previous[_FAG_ROOT_DIGEST] != root_view[_FAG_ROOT_DIGEST]:
+        raise _fag_chain_invalid(
+            "the predecessor must extend the given chain root"
+        )
+
+    old_digest = _pac_policy_digest(validated_old)
+    new_digest = _pac_policy_digest(validated_new)
+    if previous["kind"] == "root":
+        if not _pac_policy_matches_root(validated_old, previous):
+            raise _fag_chain_invalid(
+                "oldPolicy sites and threshold must match the root "
+                "aggregate decision site policy"
+            )
+        prior_version = \
+            AGGREGATE_DECISION_CHAIN_FORK_DECISION_AGGREGATE_VERSION
+    else:
+        if old_digest != previous["policy_digest"]:
+            raise _fag_chain_invalid(
+                "oldPolicy must equal the policy bound by the predecessor"
+            )
+        prior_version = previous[_FAG_POLICY_VERSION]
+    old_version = validated_old[DS_POLICY_VERSION]
+    if old_version != prior_version:
+        raise _fag_chain_invalid(
+            "oldPolicy policyVersion must match the predecessor policy "
+            "version"
+        )
+    new_version = validated_new[DS_POLICY_VERSION]
+    unchanged = (
+        validated_old[ADJ_SITES] == validated_new[ADJ_SITES]
+        and validated_old[ADJ_THRESHOLD] == validated_new[ADJ_THRESHOLD]
+    )
+    if unchanged:
+        if new_version != old_version:
+            raise _fag_chain_invalid(
+                "an unchanged policy must keep its policy version"
+            )
+    elif new_version != old_version + 1:
+        raise _fag_chain_invalid(
+            "a changed policy must increment policyVersion by exactly one"
+        )
+
+    if previous[_FAG_EFFECTIVE_AT] is not None and effective < previous[
+        _FAG_EFFECTIVE_AT
+    ]:
+        raise ValueError("effectiveAt must not move backwards")
+
+    prune_policy_digest = hashlib.sha256(
+        _verdict_policy_bytes(validated_prune_policy)
+    ).hexdigest()
+    if prune_policy_digest != previous["prune_policy_digest"]:
+        raise _fag_chain_invalid(
+            "the original prune policy must stay invariant along the chain"
+        )
+    authorization_policy_digest = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_authorization_policy)
+    ).hexdigest()
+    if authorization_policy_digest != previous["authorization_policy_digest"]:
+        raise _fag_chain_invalid(
+            "the site authorization policy must stay invariant along the "
+            "chain"
+        )
+    site_policy_digest = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_site_policy)
+    ).hexdigest()
+    if site_policy_digest != previous["site_policy_digest"]:
+        raise _fag_chain_invalid(
+            "the fork-proof signer site policy must stay invariant along "
+            "the chain"
+        )
+    signer_site_policy_digest = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_signer_site_policy)
+    ).hexdigest()
+    if signer_site_policy_digest != previous["signer_site_policy_digest"]:
+        raise _fag_chain_invalid(
+            "the adjudication signer site policy must stay invariant along "
+            "the chain"
+        )
+
+    verdict = _fag_recompute(
+        previous[_ADCFDA_INPUTS], previous[PA_ITEMS], validated_increment,
+        prune_policy_digest, authorization_policy_digest, site_policy_digest,
+        signer_site_policy_digest,
+        validated_signer_site_policy[ADJ_THRESHOLD],
+        _pac_plain_site_policy(validated_new), validated_keyring, effective,
+    )
+    _fag_assert_extends(
+        previous, verdict[_ADCFDA_INPUTS], validated_increment, unchanged
+    )
+    _fag_assert_transition(previous, verdict)
+    _fag_assert_sealer_authorized(
+        validated_old, validated_new, issuer, version
+    )
+
+    # The newly added decisions must authenticate identically at the
+    # issuance moment, and the settled verdict must still hold then.
+    verdict_now = _fag_recompute(
+        previous[_ADCFDA_INPUTS], previous[PA_ITEMS], validated_increment,
+        prune_policy_digest, authorization_policy_digest, site_policy_digest,
+        signer_site_policy_digest,
+        validated_signer_site_policy[ADJ_THRESHOLD],
+        _pac_plain_site_policy(validated_new), validated_keyring, sign_moment,
+    )
+    if (
+        verdict_now[STATUS] != verdict[STATUS]
+        or verdict_now[PA_ITEMS] != verdict[PA_ITEMS]
+        or verdict_now[_ADCFDA_DECLARATION] != verdict[_ADCFDA_DECLARATION]
+    ):
+        raise AuthenticationError(
+            "new decision credentials are not all usable at the issuance "
+            "moment"
+        )
+
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, effective
+    )
+    _usable_checkpoint_key(
+        validated_keyring, issuer, version, sign_moment
+    )
+
+    payload = {
+        _FAG_ROOT_DIGEST: root_view[_FAG_ROOT_DIGEST],
+        _FAG_PREDECESSOR_DIGEST: hashlib.sha256(predecessor).hexdigest(),
+        _FAG_HEIGHT: previous[_FAG_HEIGHT] + 1,
+        _ADCFDA_INPUTS: verdict[_ADCFDA_INPUTS],
+        ITEMS: verdict[PA_ITEMS],
+        _ADCFDA_DECLARATION: verdict[_ADCFDA_DECLARATION],
+        STATUS: verdict[STATUS],
+        _ADCFDA_PRUNE_POLICY_DIGEST: prune_policy_digest,
+        _ADCFDA_AUTHORIZATION_POLICY_DIGEST: authorization_policy_digest,
+        _ADCFDA_SITE_POLICY_DIGEST: site_policy_digest,
+        _ADCFDA_SIGNER_SITE_POLICY_DIGEST: signer_site_policy_digest,
+        _FAG_OLD_POLICY_DIGEST: old_digest,
+        _FAG_NEW_POLICY_DIGEST: new_digest,
+        _FAG_POLICY_VERSION: new_version,
+        _FAG_EFFECTIVE_AT: effective,
+        _FAG_DECISIONS: [
+            {ID: item[ID], _FAG_PACKET: item[_FAG_PACKET].hex()}
+            for item in validated_increment
+        ],
+        VD_ISSUER: issuer,
+        KEY_VERSION: version,
+        VERSION: FINAL_AGGREGATE_CHAIN_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+# -- Offline chain verification ------------------------------------------------
+
+def _verify_fag_chain_root(
+    root: bytes,
+    validated_prune_policy: dict,
+    validated_authorization_policy: dict,
+    validated_site_policy: dict,
+    validated_signer_site_policy: dict,
+    validated_decision_site_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    verify_moment: int,
+) -> dict:
+    """Verify one chain root final aggregate from validated materials."""
+    payload, signature = _parse_adcfda(root)
+    if payload[_ADCFDA_PRUNE_POLICY_DIGEST] != hashlib.sha256(
+        _verdict_policy_bytes(validated_prune_policy)
+    ).hexdigest():
+        raise _adcfda_invalid(
+            "prune policy digest does not match the prune policy"
+        )
+    if payload[_ADCFDA_AUTHORIZATION_POLICY_DIGEST] != hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_authorization_policy)
+    ).hexdigest():
+        raise _adcfda_invalid(
+            "authorization policy digest does not match the authorization "
+            "policy"
+        )
+    if payload[_ADCFDA_SITE_POLICY_DIGEST] != hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_site_policy)
+    ).hexdigest():
+        raise _adcfda_invalid(
+            "site policy digest does not match the fork-proof signer site "
+            "policy"
+        )
+    if payload[_ADCFDA_SIGNER_SITE_POLICY_DIGEST] != hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_signer_site_policy)
+    ).hexdigest():
+        raise _adcfda_invalid(
+            "signer site policy digest does not match the adjudication "
+            "signer site policy"
+        )
+    if payload[_ADCFDA_DECISION_SITE_POLICY_DIGEST] != hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_decision_site_policy)
+    ).hexdigest():
+        raise _adcfda_invalid(
+            "decision site policy digest does not match the decision "
+            "site policy"
+        )
+    _reconcile_adcfda_aggregate(
+        payload,
+        validated_signer_site_policy[ADJ_THRESHOLD],
+        validated_decision_site_policy[ADJ_THRESHOLD],
+    )
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION],
+        verify_moment,
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "aggregate decision chain fork decision aggregate signature "
+            "does not match"
+        )
+    return payload
+
+
+def _verify_fag_hop(
+    successor: bytes,
+    previous: dict,
+    previous_digest: str,
+    old_policy: dict,
+    new_policy: dict,
+    validated_prune_policy: dict,
+    validated_authorization_policy: dict,
+    validated_site_policy: dict,
+    validated_signer_site_policy: dict,
+    validated_keyring: dict[str, list[dict]],
+    moment: int,
+) -> dict:
+    """Verify one successor against its predecessor and both policies."""
+    payload, signature, increment = _fag_parse_successor(successor)
+
+    if payload[_FAG_ROOT_DIGEST] != previous[_FAG_ROOT_DIGEST]:
+        raise _fag_chain_invalid("root digest does not match the chain root")
+    if payload[_FAG_PREDECESSOR_DIGEST] != previous_digest:
+        raise _fag_chain_invalid(
+            "predecessor digest does not match the previous packet"
+        )
+    if payload[_FAG_HEIGHT] != previous[_FAG_HEIGHT] + 1:
+        raise _fag_chain_invalid("height must increase by exactly one")
+
+    old_digest = _pac_policy_digest(old_policy)
+    new_digest = _pac_policy_digest(new_policy)
+    if previous["kind"] == "root":
+        if not _pac_policy_matches_root(old_policy, previous):
+            raise _fag_chain_invalid(
+                "oldPolicy sites and threshold must match the root decision "
+                "site policy"
+            )
+        prior_version = \
+            AGGREGATE_DECISION_CHAIN_FORK_DECISION_AGGREGATE_VERSION
+    else:
+        if old_digest != previous["policy_digest"]:
+            raise _fag_chain_invalid(
+                "oldPolicy must equal the policy bound by the predecessor"
+            )
+        prior_version = previous[_FAG_POLICY_VERSION]
+    if old_policy[DS_POLICY_VERSION] != prior_version:
+        raise _fag_chain_invalid(
+            "oldPolicy policyVersion must match the predecessor version"
+        )
+    if payload[_FAG_OLD_POLICY_DIGEST] != old_digest:
+        raise _fag_chain_invalid("bound oldPolicyDigest does not match")
+    if payload[_FAG_NEW_POLICY_DIGEST] != new_digest:
+        raise _fag_chain_invalid("bound newPolicyDigest does not match")
+    unchanged = (
+        old_policy[ADJ_SITES] == new_policy[ADJ_SITES]
+        and old_policy[ADJ_THRESHOLD] == new_policy[ADJ_THRESHOLD]
+    )
+    new_version = new_policy[DS_POLICY_VERSION]
+    if unchanged:
+        if new_version != old_policy[DS_POLICY_VERSION]:
+            raise _fag_chain_invalid(
+                "an unchanged policy must keep its policy version"
+            )
+    elif new_version != old_policy[DS_POLICY_VERSION] + 1:
+        raise _fag_chain_invalid(
+            "a changed policy must increment policyVersion by exactly one"
+        )
+    if payload[_FAG_POLICY_VERSION] != new_version:
+        raise _fag_chain_invalid(
+            "bound policyVersion does not match the policy"
+        )
+
+    effective = payload[_FAG_EFFECTIVE_AT]
+    if previous[_FAG_EFFECTIVE_AT] is not None and effective < previous[
+        _FAG_EFFECTIVE_AT
+    ]:
+        raise _fag_chain_invalid("effectiveAt must not move backwards")
+
+    prune_policy_digest = hashlib.sha256(
+        _verdict_policy_bytes(validated_prune_policy)
+    ).hexdigest()
+    if payload[_ADCFDA_PRUNE_POLICY_DIGEST] != prune_policy_digest:
+        raise _fag_chain_invalid(
+            "bound prunePolicyDigest does not match the original prune "
+            "policy"
+        )
+    if prune_policy_digest != previous["prune_policy_digest"]:
+        raise _fag_chain_invalid(
+            "the original prune policy must stay invariant along the chain"
+        )
+    authorization_policy_digest = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_authorization_policy)
+    ).hexdigest()
+    if payload[_ADCFDA_AUTHORIZATION_POLICY_DIGEST] != \
+            authorization_policy_digest:
+        raise _fag_chain_invalid(
+            "bound authorizationPolicyDigest does not match the invariant "
+            "site authorization policy"
+        )
+    if authorization_policy_digest != previous["authorization_policy_digest"]:
+        raise _fag_chain_invalid(
+            "the site authorization policy must stay invariant along the "
+            "chain"
+        )
+    site_policy_digest = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_site_policy)
+    ).hexdigest()
+    if payload[_ADCFDA_SITE_POLICY_DIGEST] != site_policy_digest:
+        raise _fag_chain_invalid(
+            "bound sitePolicyDigest does not match the invariant fork-proof "
+            "signer site policy"
+        )
+    if site_policy_digest != previous["site_policy_digest"]:
+        raise _fag_chain_invalid(
+            "the fork-proof signer site policy must stay invariant along "
+            "the chain"
+        )
+    signer_site_policy_digest = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_signer_site_policy)
+    ).hexdigest()
+    if payload[_ADCFDA_SIGNER_SITE_POLICY_DIGEST] != \
+            signer_site_policy_digest:
+        raise _fag_chain_invalid(
+            "bound signerSitePolicyDigest does not match the invariant "
+            "adjudication signer site policy"
+        )
+    if signer_site_policy_digest != previous["signer_site_policy_digest"]:
+        raise _fag_chain_invalid(
+            "the adjudication signer site policy must stay invariant along "
+            "the chain"
+        )
+
+    prefix_inputs = previous[_ADCFDA_INPUTS]
+    increment_digests = [
+        hashlib.sha256(item[_FAG_PACKET]).hexdigest() for item in increment
+    ]
+    expected_inputs = list(prefix_inputs) + increment_digests
+    if payload[_ADCFDA_INPUTS] != expected_inputs:
+        raise _fag_chain_invalid(
+            "bound inputs must be the predecessor prefix plus the increment"
+        )
+    _fag_assert_extends(previous, expected_inputs, increment, unchanged)
+
+    verdict = _fag_recompute(
+        prefix_inputs, previous[PA_ITEMS], increment,
+        prune_policy_digest, authorization_policy_digest, site_policy_digest,
+        signer_site_policy_digest,
+        validated_signer_site_policy[ADJ_THRESHOLD],
+        _pac_plain_site_policy(new_policy), validated_keyring, effective,
+    )
+    verdict_now = _fag_recompute(
+        prefix_inputs, previous[PA_ITEMS], increment,
+        prune_policy_digest, authorization_policy_digest, site_policy_digest,
+        signer_site_policy_digest,
+        validated_signer_site_policy[ADJ_THRESHOLD],
+        _pac_plain_site_policy(new_policy), validated_keyring, moment,
+    )
+    _fag_assert_transition(previous, verdict)
+    _fag_assert_sealer_authorized(
+        old_policy, new_policy, payload[VD_ISSUER], payload[KEY_VERSION]
+    )
+
+    if payload[ITEMS] != verdict[PA_ITEMS]:
+        raise _fag_chain_invalid(
+            "bound items do not match the recomputed stage conclusion"
+        )
+    if payload[STATUS] != verdict[STATUS]:
+        raise _fag_chain_invalid(
+            "bound status does not match the recomputed stage conclusion"
+        )
+    if payload[_ADCFDA_DECLARATION] != verdict[_ADCFDA_DECLARATION]:
+        raise _fag_chain_invalid(
+            "bound common declaration does not match the recomputed "
+            "conclusion"
+        )
+    if (
+        verdict_now[STATUS] != verdict[STATUS]
+        or verdict_now[PA_ITEMS] != verdict[PA_ITEMS]
+        or verdict_now[_ADCFDA_DECLARATION] != verdict[_ADCFDA_DECLARATION]
+    ):
+        raise AuthenticationError(
+            "new decision credentials are not all usable at the "
+            "verification moment"
+        )
+
+    _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION], effective
+    )
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION], moment
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "final aggregate successor signature does not match"
+        )
+
+    return {
+        "packet": successor,
+        "view": _fag_successor_view(successor),
+    }
+
+
+def _verify_fag_chain(
+    root: bytes,
+    successors: list,
+    validated_prune_policy: dict,
+    validated_authorization_policy: dict,
+    validated_site_policy: dict,
+    validated_signer_site_policy: dict,
+    validated_policies: list[dict],
+    validated_keyring: dict[str, list[dict]],
+    verify_moment: int,
+) -> dict:
+    """Verify one final aggregate chain hop by hop."""
+    _verify_fag_chain_root(
+        root, validated_prune_policy, validated_authorization_policy,
+        validated_site_policy, validated_signer_site_policy,
+        _pac_plain_site_policy(validated_policies[0]),
+        validated_keyring, verify_moment,
+    )
+    root_digest = hashlib.sha256(root).hexdigest()
+    view = _fag_root_view(root)
+    head_packet = root
+    head_status = view[STATUS]
+    head_declaration = view[_ADCFDA_DECLARATION]
+    head_policy_version = validated_policies[0][DS_POLICY_VERSION]
+
+    previous_packet = root
+    for index, successor in enumerate(successors):
+        hop = _verify_fag_hop(
+            successor, view, hashlib.sha256(previous_packet).hexdigest(),
+            validated_policies[index], validated_policies[index + 1],
+            validated_prune_policy, validated_authorization_policy,
+            validated_site_policy, validated_signer_site_policy,
+            validated_keyring, verify_moment,
+        )
+        view = hop["view"]
+        previous_packet = successor
+        head_packet = successor
+        head_status = view[STATUS]
+        head_declaration = view[_ADCFDA_DECLARATION]
+        head_policy_version = view[_FAG_POLICY_VERSION]
+
+    declaration_digest = None
+    if head_declaration is not None:
+        declaration_digest = hashlib.sha256(
+            _prune_compact(head_declaration)
+        ).hexdigest()
+    return {
+        _FAG_ROOT_DIGEST: root_digest,
+        FAC_HEAD_DIGEST: hashlib.sha256(head_packet).hexdigest(),
+        _FAG_HEIGHT: view[_FAG_HEIGHT],
+        FAC_POLICY_VERSION: head_policy_version,
+        STATUS: head_status,
+        _FAG_DECLARATION_DIGEST: declaration_digest,
+    }
+
+
+def verify_final_aggregate_chain(
+    root, successors, prune_policy, authorization_policy, site_policy,
+    signer_site_policy, policies, keyring, moment,
+):
+    """Verify one final aggregate supersession chain hop by hop.
+
+    ``root`` is the chain's aggregate decision chain fork decision
+    aggregate packet
+    (:func:`aggregate_aggregate_decision_chain_fork_decisions`) and
+    ``successors`` the ordered successor packets (possibly empty for a
+    height-zero chain).  ``prune_policy`` is the invariant original
+    ``{"batch", "sites", "threshold"}`` pruning policy,
+    ``authorization_policy`` the invariant site authorization policy,
+    ``site_policy`` the invariant fork-proof signer site policy and
+    ``signer_site_policy`` the invariant adjudication signer site
+    policy; ``policies`` is the complete versioned **decision** site
+    policy history -- one entry per stage (the root policy plus one per
+    successor), so its length is ``len(successors) + 1`` and the first
+    carries ``policyVersion`` 1.  Only the root, the ordered successors,
+    the four invariant policies, the policy history, the current keyring
+    and the verification moment are consulted; no file is read or
+    written and no input is modified.
+
+    An empty successor list still verifies the root in full.  For a
+    non-empty chain every hop is re-checked: the root, predecessor and
+    height links, the append-only decision prefix, the old/new policy
+    digests and single-step version rule, the non-decreasing effective
+    moment, the four invariant policies, the per-new-decision
+    re-authentication and the full stage re-tally, the verdict state
+    machine and dual-policy sealer authorization, and the
+    exact-issuer/version HMAC with a credential usable at both the hop's
+    effective moment and the verification moment.
+
+    On success returns a fresh mapping with the fixed keys
+    ``rootDigest``, ``headDigest``, ``height`` (0 for a bare root),
+    ``policyVersion`` (the head policy's version), ``status`` and
+    ``declarationDigest`` (the SHA-256 of the canonical common
+    declaration when one is bound, otherwise null).  A non-bytes
+    argument or a public field of the wrong type raises
+    :class:`TypeError`; an empty value, an illegal version, a wrong
+    policy count or a backwards moment raises :class:`ValueError`; a bad
+    root raises
+    :class:`InvalidAggregateDecisionChainForkDecisionAggregateError`; a
+    bad successor or chain binding raises
+    :class:`InvalidFinalAggregateChainError`; a credential or signature
+    fault raises :class:`AuthenticationError`.
+    """
+    if not isinstance(root, bytes):
+        raise TypeError("root must be bytes")
+    if not isinstance(successors, list):
+        raise TypeError("successors must be a list")
+    for index, successor in enumerate(successors):
+        if not isinstance(successor, bytes):
+            raise TypeError(f"successor {index} must be bytes")
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_authorization_policy = _validated_prune_batch_site_policy(
+        authorization_policy
+    )
+    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
+    validated_signer_site_policy = _validated_prune_batch_site_policy(
+        signer_site_policy
+    )
+    validated_policies = _pac_validated_policy_sequence(policies)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+    if len(validated_policies) != len(successors) + 1:
+        raise ValueError(
+            "policies must provide one entry per chain stage (one more than "
+            "the number of successors)"
+        )
+    if validated_policies[0][DS_POLICY_VERSION] != 1:
+        raise ValueError("the root stage policy must carry policyVersion 1")
+
+    return _verify_fag_chain(
+        root, successors, validated_prune_policy,
+        validated_authorization_policy, validated_site_policy,
+        validated_signer_site_policy, validated_policies, validated_keyring,
+        verify_moment,
+    )
