@@ -43072,3 +43072,552 @@ def verify_final_aggregate_chain(
         validated_signer_site_policy, validated_policies, validated_keyring,
         verify_moment,
     )
+
+
+# -- Offline batch verification and cross-chain fork detection -----------------
+
+FINAL_AGGREGATE_CHAINS_VERSION = 1
+
+_FAG_CHAIN_ITEM_ERROR = "forked-final-aggregate-chain"
+
+
+def _verify_fag_chain_item(
+    item: dict, prune_policy: object, authorization_policy: object,
+    site_policy: object, signer_site_policy: object, keyring: object,
+    verify_moment: int
+) -> dict:
+    """Verify one batch chain in isolation and report its outcome.
+
+    The root aggregate is verified on its own first, so a root fault is
+    reported ``invalid-root`` while a successor or chain-binding fault
+    is ``invalid-chain``; credential and signature faults are
+    ``unauthenticated`` and a passing chain is ``verified``.
+    """
+    item_id = item[ID]
+    successors = item[PAC_BATCH_SUCCESSORS]
+    policies = item[PAC_BATCH_POLICIES]
+    try:
+        verify_final_aggregate_chain(
+            item[PAC_BATCH_ROOT], [], prune_policy, authorization_policy,
+            site_policy, signer_site_policy, policies[:1], keyring,
+            verify_moment
+        )
+    except AuthenticationError as exc:
+        return _fac_chain_item_report(
+            item_id, PAC_CHAINS_UNAUTHENTICATED, str(exc), None
+        )
+    except (InvalidAggregateDecisionChainForkDecisionAggregateError,
+            TypeError, ValueError) as exc:
+        return _fac_chain_item_report(
+            item_id, PAC_CHAINS_INVALID_ROOT, str(exc), None
+        )
+    try:
+        result = verify_final_aggregate_chain(
+            item[PAC_BATCH_ROOT], successors, prune_policy,
+            authorization_policy, site_policy, signer_site_policy, policies,
+            keyring, verify_moment
+        )
+    except AuthenticationError as exc:
+        return _fac_chain_item_report(
+            item_id, PAC_CHAINS_UNAUTHENTICATED, str(exc), None
+        )
+    except (InvalidAggregateDecisionChainForkDecisionAggregateError,
+            InvalidFinalAggregateChainError, TypeError, ValueError) as exc:
+        return _fac_chain_item_report(
+            item_id, PAC_CHAINS_INVALID_CHAIN, str(exc), None
+        )
+    return _fac_chain_item_report(
+        item_id, PAC_CHAINS_VERIFIED, None, result
+    )
+
+
+def verify_final_aggregate_chains(
+    items, prune_policy, authorization_policy, site_policy,
+    signer_site_policy, keyring, moment,
+):
+    """Verify a batch of final aggregate chains and spot successor forks.
+
+    Each item holds exactly a unique non-empty ``id``, its ``root``
+    final aggregate packet, its ordered ``successors`` packets and its
+    per-stage ``policies`` history; ``prune_policy`` is the invariant
+    original pruning policy, ``authorization_policy`` the invariant
+    site authorization policy, ``site_policy`` the invariant fork-proof
+    signer site policy and ``signer_site_policy`` the invariant
+    adjudication signer site policy shared by every chain, and
+    ``keyring`` and ``moment`` keep their single-chain meaning.  The
+    whole batch structure -- every key set, element type, policy count
+    and the shared materials -- is validated before any chain is
+    verified, so only batch-level faults raise (container, element or
+    field type faults :class:`TypeError`, a :class:`bool` never posing
+    as an int; an empty list, an empty or duplicate id, a wrong key
+    set, a wrong policy count or an illegal moment :class:`ValueError`).
+
+    Each chain is then verified independently, in strict input order,
+    through the exact :func:`verify_final_aggregate_chain` rules: one
+    chain's failure never stops a later chain or changes an earlier
+    report.  A root fault reports ``invalid-root``, a successor or
+    chain-binding fault ``invalid-chain`` and a credential or signature
+    fault ``unauthenticated``, each with a null ``result``; a passing
+    chain reports ``verified``.
+
+    The verified chains are grouped by their ``rootDigest`` and only
+    successor trajectories under the same root are compared: the same
+    predecessor digest pointing at two distinct successor digests is a
+    fork, while a plain prefix extension (one chain growing longer along
+    the same packets) is not.  Every verified chain crossing a forking
+    edge is reclassified ``conflicted`` with its verified result kept
+    and its ``error`` fixed to
+    ``"forked-final-aggregate-chain"``; invalid and unauthenticated
+    chains are never reclassified.
+
+    Returns a fresh dict with the fixed keys ``forks``, ``items`` and
+    ``version`` (the integer 1).  ``forks`` is sorted stably by
+    ``rootDigest`` then ``predecessorDigest``; each entry carries
+    exactly ``rootDigest``, ``predecessorDigest``, ``successors`` (the
+    forking successor digests, ascending) and ``ids`` (the ascending
+    ids of the chains crossing the edge).  Each item report preserves
+    the input order and carries, in this key order, ``error``, ``id``,
+    ``result`` and ``status``.  No file is read or written and no input
+    is modified.
+    """
+    validated_items = _validated_fac_chain_batch(items)
+    _validated_adjudication_policy(prune_policy)
+    _validated_prune_batch_site_policy(authorization_policy)
+    _validated_prune_batch_site_policy(site_policy)
+    _validated_prune_batch_site_policy(signer_site_policy)
+    _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+
+    reports: list[dict] = []
+    results: list[dict | None] = []
+    for item in validated_items:
+        report = _verify_fag_chain_item(
+            item, prune_policy, authorization_policy, site_policy,
+            signer_site_policy, keyring, verify_moment
+        )
+        reports.append(report)
+        results.append(report[VERDICT_ITEM_RESULT])
+
+    # Fork detection within one root group: one predecessor digest
+    # pointing at two distinct successor digests, ignoring chains that
+    # did not verify.
+    groups: dict[str, dict[str, set[str]]] = {}
+    for item, result in zip(validated_items, results):
+        if result is None:
+            continue
+        nodes = _pac_chain_edge_nodes(item)
+        edges = groups.setdefault(nodes[0], {})
+        for upstream, downstream in zip(nodes, nodes[1:]):
+            edges.setdefault(upstream, set()).add(downstream)
+    fork_edges: dict[tuple[str, str], list[str]] = {}
+    for root_digest, edges in groups.items():
+        for upstream, digests in edges.items():
+            if len(digests) > 1:
+                fork_edges[(root_digest, upstream)] = sorted(digests)
+    edge_ids: dict[tuple[str, str], set[str]] = {
+        edge: set() for edge in fork_edges
+    }
+    if fork_edges:
+        for item, report, result in zip(validated_items, reports, results):
+            if result is None:
+                continue
+            nodes = _pac_chain_edge_nodes(item)
+            crosses_fork = False
+            for upstream in nodes[:-1]:
+                edge = (nodes[0], upstream)
+                if edge in fork_edges:
+                    edge_ids[edge].add(item[ID])
+                    crosses_fork = True
+            if crosses_fork:
+                report[STATUS] = PAC_CHAINS_CONFLICTED
+                report[CHECKPOINT_ITEM_ERROR] = _FAG_CHAIN_ITEM_ERROR
+
+    forks = [
+        {
+            PAC_ROOT_DIGEST: root_digest,
+            PAC_PREDECESSOR_DIGEST: predecessor,
+            PAC_BATCH_SUCCESSORS: fork_edges[(root_digest, predecessor)],
+            _FORK_IDS: sorted(edge_ids[(root_digest, predecessor)]),
+        }
+        for root_digest, predecessor in sorted(fork_edges)
+    ]
+    return {
+        CHAINS_FORKS: forks,
+        ITEMS: reports,
+        VERSION: FINAL_AGGREGATE_CHAINS_VERSION,
+    }
+
+
+# -- Stable head anchors for verified, accepted, unforked chains ---------------
+
+_FAG_ANCHOR_TOP_KEYS = _ADC_ANCHOR_TOP_KEYS
+_FAG_ANCHOR_PAYLOAD_KEYS = frozenset((
+    _FAG_ROOT_DIGEST,
+    FAC_HEAD_DIGEST,
+    _FAG_HEIGHT,
+    _ADC_POLICY_DIGEST,
+    _FAG_POLICY_VERSION,
+    _FAG_DECLARATION_DIGEST,
+    CP_MOMENT,
+    VD_ISSUER,
+    KEY_VERSION,
+    VERSION,
+))
+_FAG_ANCHOR_DIGEST = _ADC_ANCHOR_DIGEST
+
+
+class InvalidFinalAggregateAnchorError(ValueError):
+    """A final aggregate head anchor breaks its contract."""
+
+
+def _fag_anchor_invalid(message: str) -> InvalidFinalAggregateAnchorError:
+    return InvalidFinalAggregateAnchorError(
+        f"invalid final aggregate anchor: {message}"
+    )
+
+
+def _reject_duplicate_fag_anchor_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate anchor keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _fag_anchor_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _fag_parse_anchor(raw: object) -> tuple[dict, str]:
+    """Validate anchor bytes structurally into ``(payload, signature)``."""
+    if not isinstance(raw, bytes):
+        raise TypeError("anchor must be bytes")
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _fag_anchor_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _fag_anchor_invalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_fag_anchor_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _fag_anchor_invalid("is not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise TypeError("anchor must be a JSON object")
+    if set(data.keys()) != _FAG_ANCHOR_TOP_KEYS:
+        raise _fag_anchor_invalid(
+            "must contain exactly the keys 'payload' and 'signature'"
+        )
+    signature = data[SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("anchor signature must be a str")
+    if not _prune_is_digest(signature):
+        raise _fag_anchor_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[TICKET_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("anchor payload must be an object")
+    if set(payload.keys()) != _FAG_ANCHOR_PAYLOAD_KEYS:
+        raise _fag_anchor_invalid(
+            "payload must contain exactly the keys 'rootDigest', "
+            "'headDigest', 'height', 'policyDigest', 'policyVersion', "
+            "'declarationDigest', 'moment', 'issuer', 'keyVersion' and "
+            "'version'"
+        )
+    for key in (_FAG_ROOT_DIGEST, FAC_HEAD_DIGEST, _ADC_POLICY_DIGEST):
+        value = payload[key]
+        if not isinstance(value, str):
+            raise TypeError(f"payload {key} must be a str")
+        if not _prune_is_digest(value):
+            raise _fag_anchor_invalid(
+                f"payload {key} must be 64 lowercase hex characters"
+            )
+    declaration_digest = payload[_FAG_DECLARATION_DIGEST]
+    if declaration_digest is not None:
+        if not isinstance(declaration_digest, str):
+            raise TypeError("payload declarationDigest must be a str or null")
+        if not _prune_is_digest(declaration_digest):
+            raise _fag_anchor_invalid(
+                "payload declarationDigest must be 64 lowercase hex "
+                "characters"
+            )
+    height = payload[_FAG_HEIGHT]
+    if isinstance(height, bool) or not isinstance(height, int):
+        raise TypeError("payload height must be an int")
+    if height < 0:
+        raise _fag_anchor_invalid("payload height must be non-negative")
+    policy_version = payload[_FAG_POLICY_VERSION]
+    if isinstance(policy_version, bool) or not isinstance(policy_version, int):
+        raise TypeError("payload policyVersion must be an int")
+    if policy_version <= 0:
+        raise _fag_anchor_invalid("payload policyVersion must be positive")
+    anchor_moment = payload[CP_MOMENT]
+    if isinstance(anchor_moment, bool) or not isinstance(anchor_moment, int):
+        raise TypeError("payload moment must be an int")
+    if anchor_moment < 0:
+        raise _fag_anchor_invalid("payload moment must be non-negative")
+    issuer = payload[VD_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("payload issuer must be a str")
+    if issuer == "":
+        raise _fag_anchor_invalid("payload issuer must be a non-empty str")
+    key_version = payload[KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("payload keyVersion must be an int")
+    if key_version <= 0:
+        raise _fag_anchor_invalid("payload keyVersion must be positive")
+    anchor_version = payload[VERSION]
+    if isinstance(anchor_version, bool) or not isinstance(
+        anchor_version, int
+    ):
+        raise TypeError("payload version must be an int")
+    if anchor_version != FINAL_AGGREGATE_CHAIN_VERSION:
+        raise _fag_anchor_invalid("payload version must be the integer 1")
+    if _prune_compact(data) != raw:
+        raise _fag_anchor_invalid(
+            "encoding is not the canonical compact form"
+        )
+    return payload, signature
+
+
+def seal_final_aggregate_head(
+    items, target, prune_policy, authorization_policy, site_policy,
+    signer_site_policy, keyring, moment, issuer, version,
+):
+    """Seal a stable anchor over one target head within the batch.
+
+    The batch is first run through the exact
+    :func:`verify_final_aggregate_chains` rules.  An anchor is sealed
+    only for the ``target`` chain when it is ``verified`` -- never
+    conflicted by a fork in this batch, invalid or unauthenticated --
+    and its head is ``accepted``; otherwise sealing raises
+    :class:`ValueError`.  Other chains' failures never stop the
+    target's anchor, though a fork it shares still reclassifies it.  The
+    anchor binds that chain's root digest, head digest and height
+    together with the head decision policy digest, the head policy
+    version, the head declaration digest and the sealing moment, and is
+    signed with HMAC-SHA256 under the exact ``issuer``/``version`` key
+    usable at ``moment``.
+
+    Returns canonical compact UTF-8 JSON with exactly ``payload`` and
+    ``signature``.  A parameter or public field type fault raises
+    :class:`TypeError` (a :class:`bool` never poses as an int); an
+    empty value, an unknown or duplicate target id, an illegal version
+    or a wrong policy count raises :class:`ValueError`; a chain fault
+    raises the underlying
+    :class:`InvalidAggregateDecisionChainForkDecisionAggregateError` or
+    :class:`InvalidFinalAggregateChainError`; a signing credential
+    fault raises :class:`AuthenticationError`.  No file is read or
+    written and no input is modified.
+    """
+    validated_items = _validated_fac_chain_batch(items)
+    if not isinstance(target, str):
+        raise TypeError("target must be a str")
+    if target == "":
+        raise ValueError("target must be non-empty")
+    target_index = None
+    for position, item in enumerate(validated_items):
+        if item[ID] == target:
+            target_index = position
+            break
+    if target_index is None:
+        raise ValueError(f"unknown target id {target!r}")
+    _validated_adjudication_policy(prune_policy)
+    _validated_prune_batch_site_policy(authorization_policy)
+    _validated_prune_batch_site_policy(site_policy)
+    _validated_prune_batch_site_policy(signer_site_policy)
+    validated_keyring = _validated_keyring(keyring)
+    seal_moment = _fe_moment(moment, "moment")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if version <= 0:
+        raise ValueError("version must be positive")
+
+    report = verify_final_aggregate_chains(
+        items, prune_policy, authorization_policy, site_policy,
+        signer_site_policy, keyring, seal_moment
+    )
+    target_report = report[ITEMS][target_index]
+    target_status = target_report[STATUS]
+    if target_status == PAC_CHAINS_INVALID_ROOT:
+        raise InvalidAggregateDecisionChainForkDecisionAggregateError(
+            target_report[CHECKPOINT_ITEM_ERROR]
+        )
+    if target_status == PAC_CHAINS_INVALID_CHAIN:
+        # The report message already carries the chain-error prefix.
+        raise InvalidFinalAggregateChainError(
+            target_report[CHECKPOINT_ITEM_ERROR]
+        )
+    if target_status == PAC_CHAINS_UNAUTHENTICATED:
+        raise AuthenticationError(target_report[CHECKPOINT_ITEM_ERROR])
+    if target_status != PAC_CHAINS_VERIFIED:
+        raise ValueError(
+            "an anchor seals only a verified target with no fork"
+        )
+    result = target_report[VERDICT_ITEM_RESULT]
+    if result[STATUS] != PA_STATUS_ACCEPTED:
+        raise ValueError("an anchor seals only an accepted head")
+    target_item = validated_items[target_index]
+    head_packet = (
+        target_item[PAC_BATCH_SUCCESSORS][-1]
+        if target_item[PAC_BATCH_SUCCESSORS] else target_item[PAC_BATCH_ROOT]
+    )
+    head_policy = _validated_pac_site_policy(
+        target_item[PAC_BATCH_POLICIES][-1]
+    )
+    if result[FAC_HEAD_DIGEST] != hashlib.sha256(head_packet).hexdigest():
+        raise ValueError("the sealed head digest does not match its packet")
+    signing_entry = _usable_checkpoint_key(
+        validated_keyring, issuer, version, seal_moment
+    )
+    payload = {
+        _FAG_ROOT_DIGEST: result[_FAG_ROOT_DIGEST],
+        FAC_HEAD_DIGEST: result[FAC_HEAD_DIGEST],
+        _FAG_HEIGHT: result[_FAG_HEIGHT],
+        _ADC_POLICY_DIGEST: _pac_policy_digest(head_policy),
+        _FAG_POLICY_VERSION: result[FAC_POLICY_VERSION],
+        _FAG_DECLARATION_DIGEST: result[_FAG_DECLARATION_DIGEST],
+        CP_MOMENT: seal_moment,
+        VD_ISSUER: issuer,
+        KEY_VERSION: version,
+        VERSION: FINAL_AGGREGATE_CHAIN_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(signing_entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+def verify_final_aggregate_head(
+    anchor, items, target, prune_policy, authorization_policy, site_policy,
+    signer_site_policy, keyring, moment,
+):
+    """Re-verify a sealed final aggregate anchor entirely offline.
+
+    The anchor is checked structurally and its HMAC verified against the
+    current keyring key bound to its exact issuer and version, usable at
+    the verification ``moment``; its sealing moment must not be later
+    than the verification moment.  The original batch (with ``target``
+    naming the anchored chain) is then re-run through
+    :func:`verify_final_aggregate_chains`; the target must again
+    verify with no fork and an accepted head, and its root digest, head
+    digest, height, policy digest, policy version, declaration digest
+    and sealing moment must still match.
+
+    Returns a fresh mapping with fixed keys ``rootDigest``,
+    ``headDigest``, ``height``, ``policyDigest``, ``policyVersion``,
+    ``declarationDigest`` and ``anchorDigest`` (the SHA-256 of the
+    anchor bytes).  A non-bytes or wrong-type argument raises
+    :class:`TypeError`; an empty value, a duplicate or unknown target
+    id, an illegal version or a wrong policy count raises
+    :class:`ValueError`; a malformed root raises
+    :class:`InvalidAggregateDecisionChainForkDecisionAggregateError`; a
+    bad anchor, successor or chain binding raises
+    :class:`InvalidFinalAggregateAnchorError` or
+    :class:`InvalidFinalAggregateChainError`; a signature or
+    credential fault raises :class:`AuthenticationError`.  No file is
+    read or written and no input is modified.
+    """
+    if not isinstance(anchor, bytes):
+        raise TypeError("anchor must be bytes")
+    payload, signature = _fag_parse_anchor(anchor)
+    validated_items = _validated_fac_chain_batch(items)
+    if not isinstance(target, str):
+        raise TypeError("target must be a str")
+    if target == "":
+        raise ValueError("target must be non-empty")
+    target_index = None
+    for position, item in enumerate(validated_items):
+        if item[ID] == target:
+            target_index = position
+            break
+    if target_index is None:
+        raise ValueError(f"unknown target id {target!r}")
+    _validated_adjudication_policy(prune_policy)
+    _validated_prune_batch_site_policy(authorization_policy)
+    _validated_prune_batch_site_policy(site_policy)
+    _validated_prune_batch_site_policy(signer_site_policy)
+    validated_keyring = _validated_keyring(keyring)
+    verify_moment = _fe_moment(moment, "moment")
+
+    entry = _usable_checkpoint_key(
+        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION],
+        verify_moment,
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(
+            "final aggregate anchor signature does not match"
+        )
+    if payload[CP_MOMENT] > verify_moment:
+        raise _fag_anchor_invalid(
+            "the anchor sealing moment is later than the verification moment"
+        )
+
+    report = verify_final_aggregate_chains(
+        items, prune_policy, authorization_policy, site_policy,
+        signer_site_policy, keyring, verify_moment
+    )
+    target_report = report[ITEMS][target_index]
+    target_status = target_report[STATUS]
+    if target_status == PAC_CHAINS_INVALID_ROOT:
+        raise InvalidAggregateDecisionChainForkDecisionAggregateError(
+            target_report[CHECKPOINT_ITEM_ERROR]
+        )
+    if target_status == PAC_CHAINS_INVALID_CHAIN:
+        # The report message already carries the chain-error prefix.
+        raise InvalidFinalAggregateChainError(
+            target_report[CHECKPOINT_ITEM_ERROR]
+        )
+    if target_status == PAC_CHAINS_UNAUTHENTICATED:
+        raise AuthenticationError(target_report[CHECKPOINT_ITEM_ERROR])
+    if target_status != PAC_CHAINS_VERIFIED:
+        raise _fag_anchor_invalid(
+            "the anchored target no longer verifies without a fork"
+        )
+    result = target_report[VERDICT_ITEM_RESULT]
+    if result[STATUS] != PA_STATUS_ACCEPTED:
+        raise _fag_anchor_invalid("the anchored head is no longer accepted")
+    target_item = validated_items[target_index]
+    head_policy = _validated_pac_site_policy(
+        target_item[PAC_BATCH_POLICIES][-1]
+    )
+    head_policy_digest = _pac_policy_digest(head_policy)
+    if result[_FAG_ROOT_DIGEST] != payload[_FAG_ROOT_DIGEST]:
+        raise _fag_anchor_invalid("root digest does not match the anchor")
+    if result[FAC_HEAD_DIGEST] != payload[FAC_HEAD_DIGEST]:
+        raise _fag_anchor_invalid("head digest does not match the anchor")
+    if result[_FAG_HEIGHT] != payload[_FAG_HEIGHT]:
+        raise _fag_anchor_invalid("height does not match the anchor")
+    if result[FAC_POLICY_VERSION] != payload[_FAG_POLICY_VERSION]:
+        raise _fag_anchor_invalid(
+            "policy version does not match the anchor"
+        )
+    if head_policy_digest != payload[_ADC_POLICY_DIGEST]:
+        raise _fag_anchor_invalid("policy digest does not match the anchor")
+    if result[_FAG_DECLARATION_DIGEST] != payload[_FAG_DECLARATION_DIGEST]:
+        raise _fag_anchor_invalid(
+            "declaration digest does not match the anchor"
+        )
+    return {
+        _FAG_ROOT_DIGEST: payload[_FAG_ROOT_DIGEST],
+        FAC_HEAD_DIGEST: payload[FAC_HEAD_DIGEST],
+        _FAG_HEIGHT: payload[_FAG_HEIGHT],
+        _ADC_POLICY_DIGEST: head_policy_digest,
+        _FAG_POLICY_VERSION: payload[_FAG_POLICY_VERSION],
+        _FAG_DECLARATION_DIGEST: payload[_FAG_DECLARATION_DIGEST],
+        _FAG_ANCHOR_DIGEST: hashlib.sha256(anchor).hexdigest(),
+    }
