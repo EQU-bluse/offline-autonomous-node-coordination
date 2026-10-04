@@ -46126,18 +46126,218 @@ def _ffdac_predecessor_view(raw: object) -> dict:
     return _ffdac_root_view(raw)
 
 
+# -- Shared chain materials and hop rules --------------------------------------
+#
+# Issuance, single-chain verification, batch verification and the head
+# anchors all validate the same materials through the helpers below, so
+# the five invariant policy digests, the policy-history link, the
+# version step, the effective-moment rule and the dual-moment verdict
+# comparison keep exactly one semantics across every path.
+
+# payload key, materials digest key, root fault, bound-digest fault and
+# broken-invariant fault for each of the five invariant policies.
+_FFDAC_INVARIANT_POLICY_FIELDS = (
+    (
+        _FACFDA_PRUNE_POLICY_DIGEST,
+        "prune_policy_digest",
+        "prune policy digest does not match the prune policy",
+        "bound prunePolicyDigest does not match the original prune policy",
+        "the original prune policy must stay invariant along the chain",
+    ),
+    (
+        _FACFDA_AUTHORIZATION_POLICY_DIGEST,
+        "authorization_policy_digest",
+        "authorization policy digest does not match the authorization "
+        "policy",
+        "bound authorizationPolicyDigest does not match the invariant "
+        "site authorization policy",
+        "the site authorization policy must stay invariant along the "
+        "chain",
+    ),
+    (
+        _FACFDA_SITE_POLICY_DIGEST,
+        "site_policy_digest",
+        "site policy digest does not match the fork-proof signer site "
+        "policy",
+        "bound sitePolicyDigest does not match the invariant fork-proof "
+        "signer site policy",
+        "the fork-proof signer site policy must stay invariant along "
+        "the chain",
+    ),
+    (
+        _FACFDA_SIGNER_SITE_POLICY_DIGEST,
+        "signer_site_policy_digest",
+        "signer site policy digest does not match the adjudication "
+        "signer site policy",
+        "bound signerSitePolicyDigest does not match the invariant "
+        "adjudication signer site policy",
+        "the adjudication signer site policy must stay invariant along "
+        "the chain",
+    ),
+    (
+        _FACFDA_ADJUDICATION_SITE_POLICY_DIGEST,
+        "adjudication_site_policy_digest",
+        "adjudication site policy digest does not match the issuing "
+        "site policy",
+        "bound adjudicationSitePolicyDigest does not match the invariant "
+        "issuing adjudication site policy",
+        "the issuing adjudication site policy must stay invariant "
+        "along the chain",
+    ),
+)
+
+
+def _ffdac_validated_shared_materials(
+    prune_policy: object,
+    authorization_policy: object,
+    site_policy: object,
+    signer_site_policy: object,
+    adjudication_site_policy: object,
+) -> dict:
+    """Validate the five invariant chain policies once and digest them.
+
+    Every public entry point of this layer -- issuance, single-chain
+    verification, batch verification and the head anchors -- validates
+    the shared original prune policy, site authorization policy,
+    fork-proof signer site policy, adjudication signer site policy and
+    issuing adjudication site policy through this one helper, so the
+    digest each path compares against a packet payload or a predecessor
+    view can never drift between paths.
+    """
+    validated_prune_policy = _validated_adjudication_policy(prune_policy)
+    validated_authorization_policy = _validated_prune_batch_site_policy(
+        authorization_policy
+    )
+    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
+    validated_signer_site_policy = _validated_prune_batch_site_policy(
+        signer_site_policy
+    )
+    validated_adjudication_site_policy = _validated_prune_batch_site_policy(
+        adjudication_site_policy
+    )
+    return {
+        "prune_policy": validated_prune_policy,
+        "authorization_policy": validated_authorization_policy,
+        "site_policy": validated_site_policy,
+        "signer_site_policy": validated_signer_site_policy,
+        "adjudication_site_policy": validated_adjudication_site_policy,
+        "prune_policy_digest": hashlib.sha256(
+            _verdict_policy_bytes(validated_prune_policy)
+        ).hexdigest(),
+        "authorization_policy_digest": hashlib.sha256(
+            _prune_batch_site_policy_bytes(validated_authorization_policy)
+        ).hexdigest(),
+        "site_policy_digest": hashlib.sha256(
+            _prune_batch_site_policy_bytes(validated_site_policy)
+        ).hexdigest(),
+        "signer_site_policy_digest": hashlib.sha256(
+            _prune_batch_site_policy_bytes(validated_signer_site_policy)
+        ).hexdigest(),
+        "adjudication_site_policy_digest": hashlib.sha256(
+            _prune_batch_site_policy_bytes(
+                validated_adjudication_site_policy
+            )
+        ).hexdigest(),
+    }
+
+
+def _ffdac_assert_invariant_digests(
+    previous: dict, materials: dict, payload: dict | None = None
+) -> None:
+    """The five invariant policy digests must match the chain materials.
+
+    When ``payload`` is given (successor verification) the digests bound
+    in the packet are checked against the materials first; in every path
+    the materials must then equal what the predecessor bound, so the
+    five policies stay invariant along the chain.
+    """
+    for payload_key, digest_key, _root_fault, bound_fault, invariant_fault \
+            in _FFDAC_INVARIANT_POLICY_FIELDS:
+        digest = materials[digest_key]
+        if payload is not None and payload[payload_key] != digest:
+            raise _ffdac_invalid(bound_fault)
+        if digest != previous[digest_key]:
+            raise _ffdac_invalid(invariant_fault)
+
+
+def _ffdac_assert_policy_link(
+    previous: dict, old_policy: dict, old_digest: str
+) -> None:
+    """The old decision policy must be exactly what the predecessor bound."""
+    if previous["kind"] == "root":
+        if not _pac_policy_matches_root(old_policy, previous):
+            raise _ffdac_invalid(
+                "oldPolicy sites and threshold must match the root "
+                "decision site policy"
+            )
+        prior_version = \
+            FINAL_AGGREGATE_CHAIN_FORK_DECISION_AGGREGATE_VERSION
+    else:
+        if old_digest != previous["policy_digest"]:
+            raise _ffdac_invalid(
+                "oldPolicy must equal the policy bound by the predecessor"
+            )
+        prior_version = previous[_FFDAC_POLICY_VERSION]
+    if old_policy[DS_POLICY_VERSION] != prior_version:
+        raise _ffdac_invalid(
+            "oldPolicy policyVersion must match the predecessor version"
+        )
+
+
+def _ffdac_policy_step(old_policy: dict, new_policy: dict) -> tuple[bool, int]:
+    """The single-step policy version rule shared by issuance and
+    verification.
+
+    Returns ``(unchanged, new_version)``: unchanged sites and threshold
+    keep the policy version, any content change increments it by exactly
+    one.
+    """
+    unchanged = (
+        old_policy[ADJ_SITES] == new_policy[ADJ_SITES]
+        and old_policy[ADJ_THRESHOLD] == new_policy[ADJ_THRESHOLD]
+    )
+    new_version = new_policy[DS_POLICY_VERSION]
+    if unchanged:
+        if new_version != old_policy[DS_POLICY_VERSION]:
+            raise _ffdac_invalid(
+                "an unchanged policy must keep its policy version"
+            )
+    elif new_version != old_policy[DS_POLICY_VERSION] + 1:
+        raise _ffdac_invalid(
+            "a changed policy must increment policyVersion by exactly one"
+        )
+    return unchanged, new_version
+
+
+def _ffdac_assert_effective_monotonic(
+    previous: dict, effective: int, invalid
+) -> None:
+    """The effective moment never moves backwards along the chain."""
+    if previous[_FFDAC_EFFECTIVE_AT] is not None and effective < previous[
+        _FFDAC_EFFECTIVE_AT
+    ]:
+        raise invalid("effectiveAt must not move backwards")
+
+
+def _ffdac_assert_verdicts_agree(
+    verdict: dict, verdict_now: dict, message: str
+) -> None:
+    """The stage conclusion must authenticate identically at both moments."""
+    if (
+        verdict_now[STATUS] != verdict[STATUS]
+        or verdict_now[PA_ITEMS] != verdict[PA_ITEMS]
+        or verdict_now[_FACFDA_DECLARATION] != verdict[_FACFDA_DECLARATION]
+    ):
+        raise AuthenticationError(message)
+
+
 # -- Recomputing one stage verdict from prefix plus decision increment ---------
 
 def _ffdac_recompute(
     prefix_inputs: list[str],
     prefix_rows: list[dict],
     increment: list[dict],
-    prune_policy_digest: str,
-    authorization_policy_digest: str,
-    site_policy_digest: str,
-    signer_site_policy_digest: str,
-    adjudication_site_policy_digest: str,
-    fork_threshold: int,
+    materials: dict,
     decision_site_policy: dict,
     validated_keyring: dict[str, list[dict]],
     moment: int,
@@ -46159,12 +46359,12 @@ def _ffdac_recompute(
         increment_rows.append(
             _aggregate_facfda_one(
                 item,
-                prune_policy_digest,
-                authorization_policy_digest,
-                site_policy_digest,
-                signer_site_policy_digest,
-                adjudication_site_policy_digest,
-                fork_threshold,
+                materials["prune_policy_digest"],
+                materials["authorization_policy_digest"],
+                materials["site_policy_digest"],
+                materials["signer_site_policy_digest"],
+                materials["adjudication_site_policy_digest"],
+                materials["adjudication_site_policy"][ADJ_THRESHOLD],
                 decision_site_policy,
                 validated_keyring,
                 moment,
@@ -46176,7 +46376,7 @@ def _ffdac_recompute(
     # identity/version authorization and the declaration's own tally).
     prefix_rows_verified = _ffdac_reverify_rows(
         prefix_rows,
-        fork_threshold,
+        materials["adjudication_site_policy"][ADJ_THRESHOLD],
         decision_site_policy,
         validated_keyring,
         moment,
@@ -46760,16 +46960,9 @@ def supersede_final_fork_decision_aggregate(
     or written and no input is modified.
     """
     validated_increment = _cfca_validated_increment(increment)
-    validated_prune_policy = _validated_adjudication_policy(prune_policy)
-    validated_authorization_policy = _validated_prune_batch_site_policy(
-        authorization_policy
-    )
-    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
-    validated_signer_site_policy = _validated_prune_batch_site_policy(
-        signer_site_policy
-    )
-    validated_adjudication_site_policy = _validated_prune_batch_site_policy(
-        adjudication_site_policy
+    materials = _ffdac_validated_shared_materials(
+        prune_policy, authorization_policy, site_policy,
+        signer_site_policy, adjudication_site_policy,
     )
     validated_old = _validated_pac_site_policy(old_policy)
     validated_new = _validated_pac_site_policy(new_policy)
@@ -46798,94 +46991,16 @@ def supersede_final_fork_decision_aggregate(
 
     old_digest = _pac_policy_digest(validated_old)
     new_digest = _pac_policy_digest(validated_new)
-    if previous["kind"] == "root":
-        if not _pac_policy_matches_root(validated_old, previous):
-            raise _ffdac_invalid(
-                "oldPolicy sites and threshold must match the root "
-                "aggregate decision site policy"
-            )
-        prior_version = \
-            FINAL_AGGREGATE_CHAIN_FORK_DECISION_AGGREGATE_VERSION
-    else:
-        if old_digest != previous["policy_digest"]:
-            raise _ffdac_invalid(
-                "oldPolicy must equal the policy bound by the predecessor"
-            )
-        prior_version = previous[_FFDAC_POLICY_VERSION]
-    old_version = validated_old[DS_POLICY_VERSION]
-    if old_version != prior_version:
-        raise _ffdac_invalid(
-            "oldPolicy policyVersion must match the predecessor policy "
-            "version"
-        )
-    new_version = validated_new[DS_POLICY_VERSION]
-    unchanged = (
-        validated_old[ADJ_SITES] == validated_new[ADJ_SITES]
-        and validated_old[ADJ_THRESHOLD] == validated_new[ADJ_THRESHOLD]
-    )
-    if unchanged:
-        if new_version != old_version:
-            raise _ffdac_invalid(
-                "an unchanged policy must keep its policy version"
-            )
-    elif new_version != old_version + 1:
-        raise _ffdac_invalid(
-            "a changed policy must increment policyVersion by exactly one"
-        )
+    _ffdac_assert_policy_link(previous, validated_old, old_digest)
+    unchanged, new_version = _ffdac_policy_step(validated_old, validated_new)
 
-    if previous[_FFDAC_EFFECTIVE_AT] is not None and effective < previous[
-        _FFDAC_EFFECTIVE_AT
-    ]:
-        raise ValueError("effectiveAt must not move backwards")
-
-    prune_policy_digest = hashlib.sha256(
-        _verdict_policy_bytes(validated_prune_policy)
-    ).hexdigest()
-    if prune_policy_digest != previous["prune_policy_digest"]:
-        raise _ffdac_invalid(
-            "the original prune policy must stay invariant along the chain"
-        )
-    authorization_policy_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_authorization_policy)
-    ).hexdigest()
-    if authorization_policy_digest != previous["authorization_policy_digest"]:
-        raise _ffdac_invalid(
-            "the site authorization policy must stay invariant along the "
-            "chain"
-        )
-    site_policy_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_site_policy)
-    ).hexdigest()
-    if site_policy_digest != previous["site_policy_digest"]:
-        raise _ffdac_invalid(
-            "the fork-proof signer site policy must stay invariant along "
-            "the chain"
-        )
-    signer_site_policy_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_signer_site_policy)
-    ).hexdigest()
-    if signer_site_policy_digest != previous["signer_site_policy_digest"]:
-        raise _ffdac_invalid(
-            "the adjudication signer site policy must stay invariant along "
-            "the chain"
-        )
-    adjudication_site_policy_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_adjudication_site_policy)
-    ).hexdigest()
-    if adjudication_site_policy_digest != previous[
-        "adjudication_site_policy_digest"
-    ]:
-        raise _ffdac_invalid(
-            "the issuing adjudication site policy must stay invariant "
-            "along the chain"
-        )
+    _ffdac_assert_effective_monotonic(previous, effective, ValueError)
+    _ffdac_assert_invariant_digests(previous, materials)
 
     verdict = _ffdac_recompute(
         previous[_FACFDA_INPUTS], previous[PA_ITEMS], validated_increment,
-        prune_policy_digest, authorization_policy_digest, site_policy_digest,
-        signer_site_policy_digest, adjudication_site_policy_digest,
-        validated_adjudication_site_policy[ADJ_THRESHOLD],
-        _pac_plain_site_policy(validated_new), validated_keyring, effective,
+        materials, _pac_plain_site_policy(validated_new), validated_keyring,
+        effective,
     )
     _ffdac_assert_extends(
         previous, verdict[_FACFDA_INPUTS], validated_increment, unchanged
@@ -46899,19 +47014,13 @@ def supersede_final_fork_decision_aggregate(
     # authenticate identically at the issuance moment.
     verdict_now = _ffdac_recompute(
         previous[_FACFDA_INPUTS], previous[PA_ITEMS], validated_increment,
-        prune_policy_digest, authorization_policy_digest, site_policy_digest,
-        signer_site_policy_digest, adjudication_site_policy_digest,
-        validated_adjudication_site_policy[ADJ_THRESHOLD],
-        _pac_plain_site_policy(validated_new), validated_keyring, sign_moment,
+        materials, _pac_plain_site_policy(validated_new), validated_keyring,
+        sign_moment,
     )
-    if (
-        verdict_now[STATUS] != verdict[STATUS]
-        or verdict_now[PA_ITEMS] != verdict[PA_ITEMS]
-        or verdict_now[_FACFDA_DECLARATION] != verdict[_FACFDA_DECLARATION]
-    ):
-        raise AuthenticationError(
-            "decision credentials are not all usable at the issuance moment"
-        )
+    _ffdac_assert_verdicts_agree(
+        verdict, verdict_now,
+        "decision credentials are not all usable at the issuance moment",
+    )
 
     signing_entry = _usable_checkpoint_key(
         validated_keyring, issuer, version, effective
@@ -46928,12 +47037,14 @@ def supersede_final_fork_decision_aggregate(
         ITEMS: verdict[PA_ITEMS],
         _FACFDA_DECLARATION: verdict[_FACFDA_DECLARATION],
         STATUS: verdict[STATUS],
-        _FACFDA_PRUNE_POLICY_DIGEST: prune_policy_digest,
-        _FACFDA_AUTHORIZATION_POLICY_DIGEST: authorization_policy_digest,
-        _FACFDA_SITE_POLICY_DIGEST: site_policy_digest,
-        _FACFDA_SIGNER_SITE_POLICY_DIGEST: signer_site_policy_digest,
+        _FACFDA_PRUNE_POLICY_DIGEST: materials["prune_policy_digest"],
+        _FACFDA_AUTHORIZATION_POLICY_DIGEST:
+            materials["authorization_policy_digest"],
+        _FACFDA_SITE_POLICY_DIGEST: materials["site_policy_digest"],
+        _FACFDA_SIGNER_SITE_POLICY_DIGEST:
+            materials["signer_site_policy_digest"],
         _FACFDA_ADJUDICATION_SITE_POLICY_DIGEST:
-            adjudication_site_policy_digest,
+            materials["adjudication_site_policy_digest"],
         _FFDAC_OLD_POLICY_DIGEST: old_digest,
         _FFDAC_NEW_POLICY_DIGEST: new_digest,
         _FFDAC_POLICY_VERSION: new_version,
@@ -46958,51 +47069,18 @@ def supersede_final_fork_decision_aggregate(
 
 def _verify_ffdac_chain_root(
     root: bytes,
-    validated_prune_policy: dict,
-    validated_authorization_policy: dict,
-    validated_site_policy: dict,
-    validated_signer_site_policy: dict,
-    validated_adjudication_site_policy: dict,
+    materials: dict,
     validated_decision_site_policy: dict,
     validated_keyring: dict[str, list[dict]],
     verify_moment: int,
 ) -> dict:
     """Verify one chain root final decision aggregate from materials."""
     payload, signature = _parse_facfda(root)
-    if payload[_FACFDA_PRUNE_POLICY_DIGEST] != hashlib.sha256(
-        _verdict_policy_bytes(validated_prune_policy)
-    ).hexdigest():
-        raise _facfda_invalid(
-            "prune policy digest does not match the prune policy"
-        )
-    if payload[_FACFDA_AUTHORIZATION_POLICY_DIGEST] != hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_authorization_policy)
-    ).hexdigest():
-        raise _facfda_invalid(
-            "authorization policy digest does not match the authorization "
-            "policy"
-        )
-    if payload[_FACFDA_SITE_POLICY_DIGEST] != hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_site_policy)
-    ).hexdigest():
-        raise _facfda_invalid(
-            "site policy digest does not match the fork-proof signer site "
-            "policy"
-        )
-    if payload[_FACFDA_SIGNER_SITE_POLICY_DIGEST] != hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_signer_site_policy)
-    ).hexdigest():
-        raise _facfda_invalid(
-            "signer site policy digest does not match the adjudication "
-            "signer site policy"
-        )
-    if payload[_FACFDA_ADJUDICATION_SITE_POLICY_DIGEST] != hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_adjudication_site_policy)
-    ).hexdigest():
-        raise _facfda_invalid(
-            "adjudication site policy digest does not match the issuing "
-            "site policy"
-        )
+    for payload_key, digest_key, root_fault, _bound, _invariant in (
+        _FFDAC_INVARIANT_POLICY_FIELDS
+    ):
+        if payload[payload_key] != materials[digest_key]:
+            raise _facfda_invalid(root_fault)
     if payload[_FACFDA_DECISION_SITE_POLICY_DIGEST] != hashlib.sha256(
         _prune_batch_site_policy_bytes(validated_decision_site_policy)
     ).hexdigest():
@@ -47012,7 +47090,7 @@ def _verify_ffdac_chain_root(
         )
     _reconcile_facfda_aggregate(
         payload,
-        validated_adjudication_site_policy[ADJ_THRESHOLD],
+        materials["adjudication_site_policy"][ADJ_THRESHOLD],
         validated_decision_site_policy[ADJ_THRESHOLD],
     )
     entry = _usable_checkpoint_key(
@@ -47038,11 +47116,7 @@ def _verify_ffdac_hop(
     previous_digest: str,
     old_policy: dict,
     new_policy: dict,
-    validated_prune_policy: dict,
-    validated_authorization_policy: dict,
-    validated_site_policy: dict,
-    validated_signer_site_policy: dict,
-    validated_adjudication_site_policy: dict,
+    materials: dict,
     validated_keyring: dict[str, list[dict]],
     moment: int,
 ) -> dict:
@@ -47060,121 +47134,20 @@ def _verify_ffdac_hop(
 
     old_digest = _pac_policy_digest(old_policy)
     new_digest = _pac_policy_digest(new_policy)
-    if previous["kind"] == "root":
-        if not _pac_policy_matches_root(old_policy, previous):
-            raise _ffdac_invalid(
-                "oldPolicy sites and threshold must match the root decision "
-                "site policy"
-            )
-        prior_version = \
-            FINAL_AGGREGATE_CHAIN_FORK_DECISION_AGGREGATE_VERSION
-    else:
-        if old_digest != previous["policy_digest"]:
-            raise _ffdac_invalid(
-                "oldPolicy must equal the policy bound by the predecessor"
-            )
-        prior_version = previous[_FFDAC_POLICY_VERSION]
-    if old_policy[DS_POLICY_VERSION] != prior_version:
-        raise _ffdac_invalid(
-            "oldPolicy policyVersion must match the predecessor version"
-        )
+    _ffdac_assert_policy_link(previous, old_policy, old_digest)
     if payload[_FFDAC_OLD_POLICY_DIGEST] != old_digest:
         raise _ffdac_invalid("bound oldPolicyDigest does not match")
     if payload[_FFDAC_NEW_POLICY_DIGEST] != new_digest:
         raise _ffdac_invalid("bound newPolicyDigest does not match")
-    unchanged = (
-        old_policy[ADJ_SITES] == new_policy[ADJ_SITES]
-        and old_policy[ADJ_THRESHOLD] == new_policy[ADJ_THRESHOLD]
-    )
-    new_version = new_policy[DS_POLICY_VERSION]
-    if unchanged:
-        if new_version != old_policy[DS_POLICY_VERSION]:
-            raise _ffdac_invalid(
-                "an unchanged policy must keep its policy version"
-            )
-    elif new_version != old_policy[DS_POLICY_VERSION] + 1:
-        raise _ffdac_invalid(
-            "a changed policy must increment policyVersion by exactly one"
-        )
+    unchanged, new_version = _ffdac_policy_step(old_policy, new_policy)
     if payload[_FFDAC_POLICY_VERSION] != new_version:
         raise _ffdac_invalid(
             "bound policyVersion does not match the policy"
         )
 
     effective = payload[_FFDAC_EFFECTIVE_AT]
-    if previous[_FFDAC_EFFECTIVE_AT] is not None and effective < previous[
-        _FFDAC_EFFECTIVE_AT
-    ]:
-        raise _ffdac_invalid("effectiveAt must not move backwards")
-
-    prune_policy_digest = hashlib.sha256(
-        _verdict_policy_bytes(validated_prune_policy)
-    ).hexdigest()
-    if payload[_FACFDA_PRUNE_POLICY_DIGEST] != prune_policy_digest:
-        raise _ffdac_invalid(
-            "bound prunePolicyDigest does not match the original prune policy"
-        )
-    if prune_policy_digest != previous["prune_policy_digest"]:
-        raise _ffdac_invalid(
-            "the original prune policy must stay invariant along the chain"
-        )
-    authorization_policy_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_authorization_policy)
-    ).hexdigest()
-    if payload[_FACFDA_AUTHORIZATION_POLICY_DIGEST] != \
-            authorization_policy_digest:
-        raise _ffdac_invalid(
-            "bound authorizationPolicyDigest does not match the invariant "
-            "site authorization policy"
-        )
-    if authorization_policy_digest != previous["authorization_policy_digest"]:
-        raise _ffdac_invalid(
-            "the site authorization policy must stay invariant along the "
-            "chain"
-        )
-    site_policy_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_site_policy)
-    ).hexdigest()
-    if payload[_FACFDA_SITE_POLICY_DIGEST] != site_policy_digest:
-        raise _ffdac_invalid(
-            "bound sitePolicyDigest does not match the invariant fork-proof "
-            "signer site policy"
-        )
-    if site_policy_digest != previous["site_policy_digest"]:
-        raise _ffdac_invalid(
-            "the fork-proof signer site policy must stay invariant along "
-            "the chain"
-        )
-    signer_site_policy_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_signer_site_policy)
-    ).hexdigest()
-    if payload[_FACFDA_SIGNER_SITE_POLICY_DIGEST] != \
-            signer_site_policy_digest:
-        raise _ffdac_invalid(
-            "bound signerSitePolicyDigest does not match the invariant "
-            "adjudication signer site policy"
-        )
-    if signer_site_policy_digest != previous["signer_site_policy_digest"]:
-        raise _ffdac_invalid(
-            "the adjudication signer site policy must stay invariant along "
-            "the chain"
-        )
-    adjudication_site_policy_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_adjudication_site_policy)
-    ).hexdigest()
-    if payload[_FACFDA_ADJUDICATION_SITE_POLICY_DIGEST] != \
-            adjudication_site_policy_digest:
-        raise _ffdac_invalid(
-            "bound adjudicationSitePolicyDigest does not match the invariant "
-            "issuing adjudication site policy"
-        )
-    if adjudication_site_policy_digest != previous[
-        "adjudication_site_policy_digest"
-    ]:
-        raise _ffdac_invalid(
-            "the issuing adjudication site policy must stay invariant "
-            "along the chain"
-        )
+    _ffdac_assert_effective_monotonic(previous, effective, _ffdac_invalid)
+    _ffdac_assert_invariant_digests(previous, materials, payload)
 
     prefix_inputs = previous[_FACFDA_INPUTS]
     increment_digests = [
@@ -47188,17 +47161,11 @@ def _verify_ffdac_hop(
     _ffdac_assert_extends(previous, expected_inputs, increment, unchanged)
 
     verdict = _ffdac_recompute(
-        prefix_inputs, previous[PA_ITEMS], increment,
-        prune_policy_digest, authorization_policy_digest, site_policy_digest,
-        signer_site_policy_digest, adjudication_site_policy_digest,
-        validated_adjudication_site_policy[ADJ_THRESHOLD],
+        prefix_inputs, previous[PA_ITEMS], increment, materials,
         _pac_plain_site_policy(new_policy), validated_keyring, effective,
     )
     verdict_now = _ffdac_recompute(
-        prefix_inputs, previous[PA_ITEMS], increment,
-        prune_policy_digest, authorization_policy_digest, site_policy_digest,
-        signer_site_policy_digest, adjudication_site_policy_digest,
-        validated_adjudication_site_policy[ADJ_THRESHOLD],
+        prefix_inputs, previous[PA_ITEMS], increment, materials,
         _pac_plain_site_policy(new_policy), validated_keyring, moment,
     )
     _ffdac_assert_transition(previous, verdict)
@@ -47219,15 +47186,11 @@ def _verify_ffdac_hop(
             "bound common declaration does not match the recomputed "
             "conclusion"
         )
-    if (
-        verdict_now[STATUS] != verdict[STATUS]
-        or verdict_now[PA_ITEMS] != verdict[PA_ITEMS]
-        or verdict_now[_FACFDA_DECLARATION] != verdict[_FACFDA_DECLARATION]
-    ):
-        raise AuthenticationError(
-            "decision credentials are not all usable at the verification "
-            "moment"
-        )
+    _ffdac_assert_verdicts_agree(
+        verdict, verdict_now,
+        "decision credentials are not all usable at the verification "
+        "moment",
+    )
 
     _usable_checkpoint_key(
         validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION], effective
@@ -47254,21 +47217,14 @@ def _verify_ffdac_hop(
 def _verify_ffdac_chain(
     root: bytes,
     successors: list,
-    validated_prune_policy: dict,
-    validated_authorization_policy: dict,
-    validated_site_policy: dict,
-    validated_signer_site_policy: dict,
-    validated_adjudication_site_policy: dict,
+    materials: dict,
     validated_policies: list[dict],
     validated_keyring: dict[str, list[dict]],
     verify_moment: int,
 ) -> dict:
     """Verify one final decision aggregate chain hop by hop."""
     _verify_ffdac_chain_root(
-        root, validated_prune_policy, validated_authorization_policy,
-        validated_site_policy, validated_signer_site_policy,
-        validated_adjudication_site_policy,
-        _pac_plain_site_policy(validated_policies[0]),
+        root, materials, _pac_plain_site_policy(validated_policies[0]),
         validated_keyring, verify_moment,
     )
     root_digest = hashlib.sha256(root).hexdigest()
@@ -47283,10 +47239,7 @@ def _verify_ffdac_chain(
         hop = _verify_ffdac_hop(
             successor, view, hashlib.sha256(previous_packet).hexdigest(),
             validated_policies[index], validated_policies[index + 1],
-            validated_prune_policy, validated_authorization_policy,
-            validated_site_policy, validated_signer_site_policy,
-            validated_adjudication_site_policy,
-            validated_keyring, verify_moment,
+            materials, validated_keyring, verify_moment,
         )
         view = hop["view"]
         previous_packet = successor
@@ -47368,16 +47321,9 @@ def verify_final_fork_decision_aggregate_chain(
     for index, successor in enumerate(successors):
         if not isinstance(successor, bytes):
             raise TypeError(f"successor {index} must be bytes")
-    validated_prune_policy = _validated_adjudication_policy(prune_policy)
-    validated_authorization_policy = _validated_prune_batch_site_policy(
-        authorization_policy
-    )
-    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
-    validated_signer_site_policy = _validated_prune_batch_site_policy(
-        signer_site_policy
-    )
-    validated_adjudication_site_policy = _validated_prune_batch_site_policy(
-        adjudication_site_policy
+    materials = _ffdac_validated_shared_materials(
+        prune_policy, authorization_policy, site_policy,
+        signer_site_policy, adjudication_site_policy,
     )
     validated_policies = _pac_validated_policy_sequence(policies)
     validated_keyring = _validated_keyring(keyring)
@@ -47391,10 +47337,8 @@ def verify_final_fork_decision_aggregate_chain(
         raise ValueError("the root stage policy must carry policyVersion 1")
 
     return _verify_ffdac_chain(
-        root, successors, validated_prune_policy,
-        validated_authorization_policy, validated_site_policy,
-        validated_signer_site_policy, validated_adjudication_site_policy,
-        validated_policies, validated_keyring, verify_moment,
+        root, successors, materials, validated_policies, validated_keyring,
+        verify_moment,
     )
 
 
@@ -47409,12 +47353,15 @@ def verify_final_fork_decision_aggregate_chain(
 # :func:`verify_final_aggregate_chain`: the six materials (the five
 # invariant policies plus the per-stage decision site policy history
 # carried inside each item), keyring and moment are shared by every
-# chain and validated in full before any chain runs; each item is then
-# isolated, failures keep the single-chain root/chain/credential
-# taxonomy, and verified chains sharing one root digest are checked for
-# successor forks.  An anchor seals only a verified, accepted,
-# unforked chain head and binds its root and head digests, height, final
-# stage policy digest, policy version and declaration digest.
+# chain and validated in full before any chain runs, then threaded
+# through :func:`_verify_ffdac_chain_batch` so the batch, the sealing
+# path and the anchor re-verification all run the one chain engine over
+# the same validated materials; each item is then isolated, failures
+# keep the single-chain root/chain/credential taxonomy, and verified
+# chains sharing one root digest are checked for successor forks.  An
+# anchor seals only a verified, accepted, unforked chain head and binds
+# its root and head digests, height, final stage policy digest, policy
+# version and declaration digest.
 
 FINAL_FORK_DECISION_AGGREGATE_CHAINS_VERSION = 1
 
@@ -47439,9 +47386,8 @@ _FFDAC_ANCHOR_PAYLOAD_KEYS = frozenset((
 
 
 def _verify_ffdac_chain_item(
-    item: dict, prune_policy: object, authorization_policy: object,
-    site_policy: object, signer_site_policy: object,
-    adjudication_site_policy: object, keyring: object, verify_moment: int,
+    item: dict, materials: dict, validated_keyring: dict[str, list[dict]],
+    verify_moment: int,
 ) -> dict:
     """Verify one batch chain in isolation and report its outcome.
 
@@ -47452,12 +47398,13 @@ def _verify_ffdac_chain_item(
     """
     item_id = item[ID]
     successors = item[PAC_BATCH_SUCCESSORS]
-    policies = item[PAC_BATCH_POLICIES]
+    validated_policies = _pac_validated_policy_sequence(
+        item[PAC_BATCH_POLICIES]
+    )
     try:
-        verify_final_fork_decision_aggregate_chain(
-            item[PAC_BATCH_ROOT], [], prune_policy, authorization_policy,
-            site_policy, signer_site_policy, adjudication_site_policy,
-            policies[:1], keyring, verify_moment,
+        _verify_ffdac_chain(
+            item[PAC_BATCH_ROOT], [], materials, validated_policies[:1],
+            validated_keyring, verify_moment,
         )
     except AuthenticationError as exc:
         return _fac_chain_item_report(
@@ -47469,10 +47416,9 @@ def _verify_ffdac_chain_item(
             item_id, PAC_CHAINS_INVALID_ROOT, str(exc), None
         )
     try:
-        result = verify_final_fork_decision_aggregate_chain(
-            item[PAC_BATCH_ROOT], successors, prune_policy,
-            authorization_policy, site_policy, signer_site_policy,
-            adjudication_site_policy, policies, keyring, verify_moment,
+        result = _verify_ffdac_chain(
+            item[PAC_BATCH_ROOT], successors, materials, validated_policies,
+            validated_keyring, verify_moment,
         )
     except AuthenticationError as exc:
         return _fac_chain_item_report(
@@ -47487,6 +47433,78 @@ def _verify_ffdac_chain_item(
     return _fac_chain_item_report(
         item_id, PAC_CHAINS_VERIFIED, None, result
     )
+
+
+def _verify_ffdac_chain_batch(
+    validated_items: list[dict],
+    materials: dict,
+    validated_keyring: dict[str, list[dict]],
+    verify_moment: int,
+) -> dict:
+    """Run the batch engine over pre-validated items and materials.
+
+    Every chain is verified independently, in strict input order,
+    through the exact :func:`_verify_ffdac_chain` rules; the verified
+    chains are then grouped by their ``rootDigest`` and only successor
+    trajectories under the same root are compared for forks.
+    """
+    reports: list[dict] = []
+    results: list[dict | None] = []
+    for item in validated_items:
+        report = _verify_ffdac_chain_item(
+            item, materials, validated_keyring, verify_moment
+        )
+        reports.append(report)
+        results.append(report[VERDICT_ITEM_RESULT])
+
+    # Fork detection within one root group: one predecessor digest
+    # pointing at two distinct successor digests, ignoring chains that
+    # did not verify.
+    groups: dict[str, dict[str, set[str]]] = {}
+    for item, result in zip(validated_items, results):
+        if result is None:
+            continue
+        nodes = _pac_chain_edge_nodes(item)
+        edges = groups.setdefault(nodes[0], {})
+        for upstream, downstream in zip(nodes, nodes[1:]):
+            edges.setdefault(upstream, set()).add(downstream)
+    fork_edges: dict[tuple[str, str], list[str]] = {}
+    for root_digest, edges in groups.items():
+        for upstream, digests in edges.items():
+            if len(digests) > 1:
+                fork_edges[(root_digest, upstream)] = sorted(digests)
+    edge_ids: dict[tuple[str, str], set[str]] = {
+        edge: set() for edge in fork_edges
+    }
+    if fork_edges:
+        for item, report, result in zip(validated_items, reports, results):
+            if result is None:
+                continue
+            nodes = _pac_chain_edge_nodes(item)
+            crosses_fork = False
+            for upstream in nodes[:-1]:
+                edge = (nodes[0], upstream)
+                if edge in fork_edges:
+                    edge_ids[edge].add(item[ID])
+                    crosses_fork = True
+            if crosses_fork:
+                report[STATUS] = PAC_CHAINS_CONFLICTED
+                report[CHECKPOINT_ITEM_ERROR] = _FFDAC_CHAIN_ITEM_ERROR
+
+    forks = [
+        {
+            PAC_ROOT_DIGEST: root_digest,
+            PAC_PREDECESSOR_DIGEST: predecessor,
+            PAC_BATCH_SUCCESSORS: fork_edges[(root_digest, predecessor)],
+            _FORK_IDS: sorted(edge_ids[(root_digest, predecessor)]),
+        }
+        for root_digest, predecessor in sorted(fork_edges)
+    ]
+    return {
+        CHAINS_FORKS: forks,
+        ITEMS: reports,
+        VERSION: FINAL_FORK_DECISION_AGGREGATE_CHAINS_VERSION,
+    }
 
 
 def verify_final_fork_decision_aggregate_chains(
@@ -47543,73 +47561,15 @@ def verify_final_fork_decision_aggregate_chains(
     is modified.
     """
     validated_items = _validated_fac_chain_batch(items)
-    _validated_adjudication_policy(prune_policy)
-    _validated_prune_batch_site_policy(authorization_policy)
-    _validated_prune_batch_site_policy(site_policy)
-    _validated_prune_batch_site_policy(signer_site_policy)
-    _validated_prune_batch_site_policy(adjudication_site_policy)
-    _validated_keyring(keyring)
+    materials = _ffdac_validated_shared_materials(
+        prune_policy, authorization_policy, site_policy,
+        signer_site_policy, adjudication_site_policy,
+    )
+    validated_keyring = _validated_keyring(keyring)
     verify_moment = _fe_moment(moment, "moment")
-
-    reports: list[dict] = []
-    results: list[dict | None] = []
-    for item in validated_items:
-        report = _verify_ffdac_chain_item(
-            item, prune_policy, authorization_policy, site_policy,
-            signer_site_policy, adjudication_site_policy, keyring,
-            verify_moment,
-        )
-        reports.append(report)
-        results.append(report[VERDICT_ITEM_RESULT])
-
-    # Fork detection within one root group: one predecessor digest
-    # pointing at two distinct successor digests, ignoring chains that
-    # did not verify.
-    groups: dict[str, dict[str, set[str]]] = {}
-    for item, result in zip(validated_items, results):
-        if result is None:
-            continue
-        nodes = _pac_chain_edge_nodes(item)
-        edges = groups.setdefault(nodes[0], {})
-        for upstream, downstream in zip(nodes, nodes[1:]):
-            edges.setdefault(upstream, set()).add(downstream)
-    fork_edges: dict[tuple[str, str], list[str]] = {}
-    for root_digest, edges in groups.items():
-        for upstream, digests in edges.items():
-            if len(digests) > 1:
-                fork_edges[(root_digest, upstream)] = sorted(digests)
-    edge_ids: dict[tuple[str, str], set[str]] = {
-        edge: set() for edge in fork_edges
-    }
-    if fork_edges:
-        for item, report, result in zip(validated_items, reports, results):
-            if result is None:
-                continue
-            nodes = _pac_chain_edge_nodes(item)
-            crosses_fork = False
-            for upstream in nodes[:-1]:
-                edge = (nodes[0], upstream)
-                if edge in fork_edges:
-                    edge_ids[edge].add(item[ID])
-                    crosses_fork = True
-            if crosses_fork:
-                report[STATUS] = PAC_CHAINS_CONFLICTED
-                report[CHECKPOINT_ITEM_ERROR] = _FFDAC_CHAIN_ITEM_ERROR
-
-    forks = [
-        {
-            PAC_ROOT_DIGEST: root_digest,
-            PAC_PREDECESSOR_DIGEST: predecessor,
-            PAC_BATCH_SUCCESSORS: fork_edges[(root_digest, predecessor)],
-            _FORK_IDS: sorted(edge_ids[(root_digest, predecessor)]),
-        }
-        for root_digest, predecessor in sorted(fork_edges)
-    ]
-    return {
-        CHAINS_FORKS: forks,
-        ITEMS: reports,
-        VERSION: FINAL_FORK_DECISION_AGGREGATE_CHAINS_VERSION,
-    }
+    return _verify_ffdac_chain_batch(
+        validated_items, materials, validated_keyring, verify_moment
+    )
 
 
 # -- Stable head anchors for verified, accepted, unforked chains ---------------
@@ -47737,6 +47697,57 @@ def _ffdac_parse_anchor(raw: object) -> tuple[dict, str]:
     return payload, signature
 
 
+def _ffdac_validated_anchor_target(
+    items: object, target: object
+) -> tuple[list[dict], int]:
+    """Validate the chain batch and resolve the anchor target id."""
+    validated_items = _validated_fac_chain_batch(items)
+    if not isinstance(target, str):
+        raise TypeError("target must be a str")
+    if target == "":
+        raise ValueError("target must be non-empty")
+    for position, item in enumerate(validated_items):
+        if item[ID] == target:
+            return validated_items, position
+    raise ValueError(f"unknown target id {target!r}")
+
+
+def _ffdac_anchor_target_result(
+    report: dict,
+    target_index: int,
+    invalid,
+    not_verified: str,
+    not_accepted: str,
+) -> dict:
+    """The target chain's verified result, or the matching fault.
+
+    A root, chain or credential fault of the target re-raises the
+    underlying error class; a target that did not verify cleanly or
+    whose head is not accepted raises ``invalid`` with the given
+    message (a plain :class:`ValueError` while sealing, an anchor error
+    while re-verifying).
+    """
+    target_report = report[ITEMS][target_index]
+    target_status = target_report[STATUS]
+    if target_status == PAC_CHAINS_INVALID_ROOT:
+        raise InvalidFinalAggregateChainForkDecisionAggregateError(
+            target_report[CHECKPOINT_ITEM_ERROR]
+        )
+    if target_status == PAC_CHAINS_INVALID_CHAIN:
+        # The report message already carries the chain-error prefix.
+        raise InvalidFinalForkDecisionAggregateChainError(
+            target_report[CHECKPOINT_ITEM_ERROR]
+        )
+    if target_status == PAC_CHAINS_UNAUTHENTICATED:
+        raise AuthenticationError(target_report[CHECKPOINT_ITEM_ERROR])
+    if target_status != PAC_CHAINS_VERIFIED:
+        raise invalid(not_verified)
+    result = target_report[VERDICT_ITEM_RESULT]
+    if result[STATUS] != PA_STATUS_ACCEPTED:
+        raise invalid(not_accepted)
+    return result
+
+
 def seal_final_fork_decision_aggregate_head(
     items, target, prune_policy, authorization_policy, site_policy,
     signer_site_policy, adjudication_site_policy, keyring, moment,
@@ -47768,23 +47779,13 @@ def seal_final_fork_decision_aggregate_head(
     credential fault raises :class:`AuthenticationError`.  No file is
     read or written and no input is modified.
     """
-    validated_items = _validated_fac_chain_batch(items)
-    if not isinstance(target, str):
-        raise TypeError("target must be a str")
-    if target == "":
-        raise ValueError("target must be non-empty")
-    target_index = None
-    for position, item in enumerate(validated_items):
-        if item[ID] == target:
-            target_index = position
-            break
-    if target_index is None:
-        raise ValueError(f"unknown target id {target!r}")
-    _validated_adjudication_policy(prune_policy)
-    _validated_prune_batch_site_policy(authorization_policy)
-    _validated_prune_batch_site_policy(site_policy)
-    _validated_prune_batch_site_policy(signer_site_policy)
-    _validated_prune_batch_site_policy(adjudication_site_policy)
+    validated_items, target_index = _ffdac_validated_anchor_target(
+        items, target
+    )
+    materials = _ffdac_validated_shared_materials(
+        prune_policy, authorization_policy, site_policy,
+        signer_site_policy, adjudication_site_policy,
+    )
     validated_keyring = _validated_keyring(keyring)
     seal_moment = _fe_moment(moment, "moment")
     if not isinstance(issuer, str):
@@ -47796,30 +47797,14 @@ def seal_final_fork_decision_aggregate_head(
     if version <= 0:
         raise ValueError("version must be positive")
 
-    report = verify_final_fork_decision_aggregate_chains(
-        items, prune_policy, authorization_policy, site_policy,
-        signer_site_policy, adjudication_site_policy, keyring, seal_moment,
+    report = _verify_ffdac_chain_batch(
+        validated_items, materials, validated_keyring, seal_moment
     )
-    target_report = report[ITEMS][target_index]
-    target_status = target_report[STATUS]
-    if target_status == PAC_CHAINS_INVALID_ROOT:
-        raise InvalidFinalAggregateChainForkDecisionAggregateError(
-            target_report[CHECKPOINT_ITEM_ERROR]
-        )
-    if target_status == PAC_CHAINS_INVALID_CHAIN:
-        # The report message already carries the chain-error prefix.
-        raise InvalidFinalForkDecisionAggregateChainError(
-            target_report[CHECKPOINT_ITEM_ERROR]
-        )
-    if target_status == PAC_CHAINS_UNAUTHENTICATED:
-        raise AuthenticationError(target_report[CHECKPOINT_ITEM_ERROR])
-    if target_status != PAC_CHAINS_VERIFIED:
-        raise ValueError(
-            "an anchor seals only a verified target with no fork"
-        )
-    result = target_report[VERDICT_ITEM_RESULT]
-    if result[STATUS] != PA_STATUS_ACCEPTED:
-        raise ValueError("an anchor seals only an accepted head")
+    result = _ffdac_anchor_target_result(
+        report, target_index, ValueError,
+        "an anchor seals only a verified target with no fork",
+        "an anchor seals only an accepted head",
+    )
     target_item = validated_items[target_index]
     head_packet = (
         target_item[PAC_BATCH_SUCCESSORS][-1]
@@ -47888,23 +47873,13 @@ def verify_final_fork_decision_aggregate_head(
     if not isinstance(anchor, bytes):
         raise TypeError("anchor must be bytes")
     payload, signature = _ffdac_parse_anchor(anchor)
-    validated_items = _validated_fac_chain_batch(items)
-    if not isinstance(target, str):
-        raise TypeError("target must be a str")
-    if target == "":
-        raise ValueError("target must be non-empty")
-    target_index = None
-    for position, item in enumerate(validated_items):
-        if item[ID] == target:
-            target_index = position
-            break
-    if target_index is None:
-        raise ValueError(f"unknown target id {target!r}")
-    _validated_adjudication_policy(prune_policy)
-    _validated_prune_batch_site_policy(authorization_policy)
-    _validated_prune_batch_site_policy(site_policy)
-    _validated_prune_batch_site_policy(signer_site_policy)
-    _validated_prune_batch_site_policy(adjudication_site_policy)
+    validated_items, target_index = _ffdac_validated_anchor_target(
+        items, target
+    )
+    materials = _ffdac_validated_shared_materials(
+        prune_policy, authorization_policy, site_policy,
+        signer_site_policy, adjudication_site_policy,
+    )
     validated_keyring = _validated_keyring(keyring)
     verify_moment = _fe_moment(moment, "moment")
 
@@ -47927,30 +47902,14 @@ def verify_final_fork_decision_aggregate_head(
             "moment"
         )
 
-    report = verify_final_fork_decision_aggregate_chains(
-        items, prune_policy, authorization_policy, site_policy,
-        signer_site_policy, adjudication_site_policy, keyring, verify_moment,
+    report = _verify_ffdac_chain_batch(
+        validated_items, materials, validated_keyring, verify_moment
     )
-    target_report = report[ITEMS][target_index]
-    target_status = target_report[STATUS]
-    if target_status == PAC_CHAINS_INVALID_ROOT:
-        raise InvalidFinalAggregateChainForkDecisionAggregateError(
-            target_report[CHECKPOINT_ITEM_ERROR]
-        )
-    if target_status == PAC_CHAINS_INVALID_CHAIN:
-        # The report message already carries the chain-error prefix.
-        raise InvalidFinalForkDecisionAggregateChainError(
-            target_report[CHECKPOINT_ITEM_ERROR]
-        )
-    if target_status == PAC_CHAINS_UNAUTHENTICATED:
-        raise AuthenticationError(target_report[CHECKPOINT_ITEM_ERROR])
-    if target_status != PAC_CHAINS_VERIFIED:
-        raise _ffdac_anchor_invalid(
-            "the anchored target no longer verifies without a fork"
-        )
-    result = target_report[VERDICT_ITEM_RESULT]
-    if result[STATUS] != PA_STATUS_ACCEPTED:
-        raise _ffdac_anchor_invalid("the anchored head is no longer accepted")
+    result = _ffdac_anchor_target_result(
+        report, target_index, _ffdac_anchor_invalid,
+        "the anchored target no longer verifies without a fork",
+        "the anchored head is no longer accepted",
+    )
     target_item = validated_items[target_index]
     head_policy = _validated_pac_site_policy(
         target_item[PAC_BATCH_POLICIES][-1]
