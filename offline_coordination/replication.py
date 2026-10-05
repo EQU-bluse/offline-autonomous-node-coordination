@@ -736,6 +736,32 @@ structural or binding fault raises
 subclass) and a credential or signature fault raises
 :class:`AuthenticationError`.  The existing prune aggregate,
 supersession chain, anchor and command surfaces are unchanged.
+
+:func:`export_ledger_snapshot` packages a whole version-1 ledger as a
+signed, self-contained snapshot for handing the ledger to a
+replacement device.  The ledger must exist, be valid and have no
+pending recovery intent at ``path + ".txn"`` (which raises
+:class:`PendingRecoveryError`); the result is one canonical compact
+UTF-8 JSON object with no trailing byte carrying exactly ``payload``
+and ``signature``.  The payload binds the ledger bytes as lowercase
+hex, their ``ledgerDigest``, ``lastSeq``, ``stateDigest`` and
+``requestCount`` plus the issuer, key version, signing moment and the
+protocol version 1, and the signature is the usual exact-issuer
+HMAC-SHA256 over the canonical payload.  :func:`verify_ledger_snapshot`
+re-checks a snapshot fully offline -- encoding, key sets, the carried
+ledger under the ledger byte contract, every digest and statistic, the
+signing time and the signature -- and returns the payload's identity,
+time and ledger summary metadata; format and content faults raise
+:class:`InvalidLedgerSnapshotError`.  :func:`restore_ledger_snapshot`
+verifies the same contract, settles any interrupted transaction at the
+target and then reconciles: a missing target installs the snapshot, an
+identical one is ``duplicate``, a strict prefix of the snapshot audit
+with consistent request bindings and boundary state advances to the
+snapshot bytes (``applied``), a snapshot that is an old prefix of the
+target raises :class:`StaleLedgerSnapshotError` and any divergence in
+the shared history raises :class:`LedgerSnapshotForkError`.  Failures
+never modify the target and the result carries ``status``, ``next``
+and ``ledgerDigest``.
 """
 
 from __future__ import annotations
@@ -49152,4 +49178,492 @@ def _verify_ffdacf_decision_core(decision: bytes, materials: dict):
             materials["proof_site_policy_digest"],
         STATUS: status,
         VERSION: FINAL_FORK_DECISION_AGGREGATE_CHAIN_FORK_DECISION_VERSION,
+    }
+
+
+# --- Trusted ledger snapshots for device replacement -------------------------
+
+SNAPSHOT_VERSION = 1
+
+SNAP_PAYLOAD = SB_PAYLOAD
+SNAP_SIGNATURE = SB_SIGNATURE
+SNAP_ISSUER = SB_ISSUER
+SNAP_KEY_VERSION = SB_KEY_VERSION
+SNAP_SIGNED_AT = SB_SIGNED_AT
+SNAP_LEDGER = "ledger"
+SNAP_LEDGER_DIGEST = "ledgerDigest"
+SNAP_LAST_SEQ = "lastSeq"
+SNAP_STATE_DIGEST = "stateDigest"
+SNAP_REQUEST_COUNT = "requestCount"
+
+_SNAPSHOT_TOP_KEYS = frozenset((SNAP_PAYLOAD, SNAP_SIGNATURE))
+_SNAPSHOT_PAYLOAD_KEYS = frozenset((
+    SNAP_ISSUER,
+    SNAP_KEY_VERSION,
+    SNAP_LAST_SEQ,
+    SNAP_LEDGER,
+    SNAP_LEDGER_DIGEST,
+    SNAP_REQUEST_COUNT,
+    SNAP_SIGNED_AT,
+    SNAP_STATE_DIGEST,
+    VERSION,
+))
+# Fixed verify result key order: issuer, keyVersion, signedAt,
+# ledgerDigest, stateDigest, lastSeq, requestCount.
+_SNAPSHOT_INFO_KEYS = (
+    SNAP_ISSUER,
+    SNAP_KEY_VERSION,
+    SNAP_SIGNED_AT,
+    SNAP_LEDGER_DIGEST,
+    SNAP_STATE_DIGEST,
+    SNAP_LAST_SEQ,
+    SNAP_REQUEST_COUNT,
+)
+# Fixed restore result key order: status, next, ledgerDigest.
+_SNAPSHOT_RESULT_KEYS = (STATUS, NEXT, SNAP_LEDGER_DIGEST)
+
+_LEDGER_HEX_RE = re.compile(r"(?:[0-9a-f]{2})*")
+
+
+class PendingRecoveryError(ValueError):
+    """A recovery intent at ``path + ".txn"`` blocks a ledger snapshot."""
+
+
+class InvalidLedgerSnapshotError(ValueError):
+    """Ledger snapshot bytes fail their offline format or content contract."""
+
+
+class StaleLedgerSnapshotError(ValueError):
+    """The snapshot is an old prefix of the target ledger."""
+
+
+class LedgerSnapshotForkError(ValueError):
+    """Snapshot and target ledger diverge in their shared history."""
+
+
+def _snapshot_invalid(message: str) -> InvalidLedgerSnapshotError:
+    return InvalidLedgerSnapshotError(f"invalid ledger snapshot: {message}")
+
+
+def _reject_duplicate_snapshot_keys(pairs: list[tuple]) -> dict:
+    """``object_pairs_hook`` turning duplicate snapshot keys into an error."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _snapshot_invalid(f"duplicate key {key!r} in object")
+        result[key] = value
+    return result
+
+
+def _snapshot_compact(obj: object) -> bytes:
+    """Canonical compact sorted-key UTF-8 JSON of snapshot content."""
+    return json.dumps(
+        obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def export_ledger_snapshot(
+    path: str, keyring: dict, issuer: str, version: int, moment: int
+) -> bytes:
+    """Export a signed, self-contained snapshot of the ledger at ``path``.
+
+    The snapshot hands a replacement device everything needed to install
+    or advance the ledger offline.  The ledger is opened read-only and
+    never modified; it must exist, be valid under the exact
+    :func:`apply_remote` byte contract and have no pending recovery
+    intent at ``path + ".txn"``.  A missing ledger raises
+    :class:`FileNotFoundError`, an existing intent (an interrupted
+    transaction a later :func:`recover_ledger` must settle first) raises
+    :class:`PendingRecoveryError` and a corrupt ledger raises
+    :class:`ValueError`.
+
+    The result is one canonical compact UTF-8 JSON object with every
+    object key recursively sorted lexicographically, non-ASCII preserved
+    and no trailing newline or other trailing byte, carrying exactly
+    ``payload`` and ``signature``.  The payload binds exactly ``ledger``
+    (the ledger bytes as lowercase hex), ``ledgerDigest`` (the lowercase
+    hex SHA-256 of those bytes), ``lastSeq``, ``stateDigest``,
+    ``requestCount``, ``issuer``, ``keyVersion``, ``signedAt`` and the
+    protocol ``version`` (the integer 1).  ``signature`` is the
+    lowercase hex HMAC-SHA256 of the canonical compact payload bytes
+    under the key the keyring binds to the exact issuer and version,
+    usable at ``moment``.
+
+    Type violations raise :class:`TypeError` (a :class:`bool` never
+    poses as an int); an empty ``issuer``, a non-positive ``version`` or
+    a negative ``moment`` raises :class:`ValueError`; keyring structure
+    faults raise :class:`TypeError`/:class:`ValueError`.  Unknown,
+    revoked, not-yet-valid or expired credentials raise
+    :class:`AuthenticationError`.  A read failure other than a missing
+    file propagates unchanged as :class:`OSError`.
+    """
+    if not isinstance(path, str):
+        raise TypeError("path must be a str")
+    if not isinstance(issuer, str):
+        raise TypeError("issuer must be a str")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError("version must be an int")
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if issuer == "":
+        raise ValueError("issuer must be non-empty")
+    if version <= 0:
+        raise ValueError("version must be positive")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+
+    validated_keyring = _validated_keyring(keyring)
+    entry = _usable_checkpoint_key(validated_keyring, issuer, version, moment)
+
+    # An intent means an interrupted transaction owns the path: the
+    # current bytes cannot be trusted until recover_ledger settles it.
+    if os.path.exists(path + ".txn"):
+        raise PendingRecoveryError(
+            f"recovery intent at {path + '.txn'!r} must be settled first"
+        )
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    # A missing file propagates as FileNotFoundError; a corrupt ledger as
+    # ValueError; any other read failure already propagated as OSError.
+    state, requests, entries = _parse_ledger(raw)
+
+    payload = {
+        SNAP_ISSUER: issuer,
+        SNAP_KEY_VERSION: version,
+        SNAP_LAST_SEQ: len(entries),
+        SNAP_LEDGER: raw.hex(),
+        SNAP_LEDGER_DIGEST: _digest(raw),
+        SNAP_REQUEST_COUNT: len(requests),
+        SNAP_SIGNED_AT: moment,
+        SNAP_STATE_DIGEST: _digest(_state_bytes(state)),
+        VERSION: SNAPSHOT_VERSION,
+    }
+    signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _snapshot_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _snapshot_compact(
+        {SNAP_PAYLOAD: payload, SNAP_SIGNATURE: signature}
+    )
+
+
+def _parse_snapshot(
+    raw: object,
+) -> tuple[dict, str, bytes, dict, dict[str, str], list[dict]]:
+    """Validate snapshot bytes into their decoded, checked components.
+
+    Returns ``(payload, signature, ledger_raw, state, requests,
+    entries)``.  A non-bytes argument or a field of the wrong type
+    raises :class:`TypeError` (a :class:`bool` never poses as an int);
+    every encoding, duplicate-key, key-set, range, digest,
+    carried-ledger or canonical-format fault raises
+    :class:`InvalidLedgerSnapshotError`.  No keyring, clock or
+    filesystem is consulted.
+    """
+    if not isinstance(raw, bytes):
+        raise TypeError("ledger snapshot must be bytes")
+    # The snapshot carries no terminator of any kind: no trailing
+    # newline and no other byte past the closing brace.
+    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
+        raise _snapshot_invalid(
+            "must end with the closing brace, no trailing byte"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _snapshot_invalid("is not valid UTF-8") from exc
+    try:
+        # The pairs hook raises directly on duplicate object keys, so a
+        # ValueError raised here means that contract fault, not bad JSON.
+        data = json.loads(
+            text, object_pairs_hook=_reject_duplicate_snapshot_keys
+        )
+    except json.JSONDecodeError as exc:
+        raise _snapshot_invalid("is not valid JSON") from exc
+
+    if not isinstance(data, dict):
+        raise TypeError("ledger snapshot must be a JSON object")
+    if set(data.keys()) != _SNAPSHOT_TOP_KEYS:
+        raise _snapshot_invalid(
+            "top-level object must contain exactly the keys "
+            "'payload' and 'signature'"
+        )
+    signature = data[SNAP_SIGNATURE]
+    if not isinstance(signature, str):
+        raise TypeError("ledger snapshot signature must be a str")
+    if _HEX64.fullmatch(signature) is None:
+        raise _snapshot_invalid(
+            "signature must be 64 lowercase hex characters"
+        )
+    payload = data[SNAP_PAYLOAD]
+    if not isinstance(payload, dict):
+        raise TypeError("ledger snapshot payload must be a dict")
+    if set(payload.keys()) != _SNAPSHOT_PAYLOAD_KEYS:
+        raise _snapshot_invalid(
+            "payload must contain exactly the keys 'issuer', 'keyVersion', "
+            "'lastSeq', 'ledger', 'ledgerDigest', 'requestCount', "
+            "'signedAt', 'stateDigest' and 'version'"
+        )
+
+    issuer = payload[SNAP_ISSUER]
+    if not isinstance(issuer, str):
+        raise TypeError("snapshot issuer must be a str")
+    if issuer == "":
+        raise _snapshot_invalid("issuer must be non-empty")
+    key_version = payload[SNAP_KEY_VERSION]
+    if isinstance(key_version, bool) or not isinstance(key_version, int):
+        raise TypeError("snapshot keyVersion must be an int")
+    if key_version <= 0:
+        raise _snapshot_invalid("keyVersion must be positive")
+    signed_at = payload[SNAP_SIGNED_AT]
+    if isinstance(signed_at, bool) or not isinstance(signed_at, int):
+        raise TypeError("snapshot signedAt must be an int")
+    if signed_at < 0:
+        raise _snapshot_invalid("signedAt must be non-negative")
+    protocol = payload[VERSION]
+    if isinstance(protocol, bool) or not isinstance(protocol, int):
+        raise TypeError("snapshot version must be an int")
+    if protocol != SNAPSHOT_VERSION:
+        raise _snapshot_invalid("version must be the integer 1")
+    last_seq = payload[SNAP_LAST_SEQ]
+    if isinstance(last_seq, bool) or not isinstance(last_seq, int):
+        raise TypeError("snapshot lastSeq must be an int")
+    if last_seq < 0:
+        raise _snapshot_invalid("lastSeq must be non-negative")
+    request_count = payload[SNAP_REQUEST_COUNT]
+    if isinstance(request_count, bool) or not isinstance(request_count, int):
+        raise TypeError("snapshot requestCount must be an int")
+    if request_count < 0:
+        raise _snapshot_invalid("requestCount must be non-negative")
+    ledger_hex = payload[SNAP_LEDGER]
+    if not isinstance(ledger_hex, str):
+        raise TypeError("snapshot ledger must be a str")
+    if _LEDGER_HEX_RE.fullmatch(ledger_hex) is None:
+        raise _snapshot_invalid("ledger must be lowercase hex byte pairs")
+    ledger_raw = bytes.fromhex(ledger_hex)
+    for digest_key in (SNAP_LEDGER_DIGEST, SNAP_STATE_DIGEST):
+        if not _is_digest(payload[digest_key]):
+            raise _snapshot_invalid(
+                f"{digest_key} must be 64 lowercase hex characters"
+            )
+
+    # The carried ledger must validate under the exact apply_remote byte
+    # contract; its own error is reported as a snapshot fault.
+    try:
+        state, requests, entries = _parse_ledger(ledger_raw)
+    except ValueError as exc:
+        raise _snapshot_invalid(f"carried ledger is invalid: {exc}") from exc
+    if payload[SNAP_LEDGER_DIGEST] != _digest(ledger_raw):
+        raise _snapshot_invalid(
+            "ledgerDigest does not match the carried ledger bytes"
+        )
+    if last_seq != len(entries):
+        raise _snapshot_invalid(
+            "lastSeq does not match the carried ledger audit"
+        )
+    if payload[SNAP_STATE_DIGEST] != _digest(_state_bytes(state)):
+        raise _snapshot_invalid(
+            "stateDigest does not match the carried ledger state"
+        )
+    if request_count != len(requests):
+        raise _snapshot_invalid(
+            "requestCount does not match the carried ledger requests"
+        )
+
+    # The bytes must be the single canonical compact sorted-key form.
+    if _snapshot_compact(data) != raw:
+        raise _snapshot_invalid(
+            "encoding is not the canonical compact form"
+        )
+    return payload, signature, ledger_raw, state, requests, entries
+
+
+def _verify_snapshot(
+    snapshot: object, keyring: object, moment: object
+) -> tuple[dict, bytes, dict, dict[str, str], list[dict]]:
+    """Authenticate a snapshot fully offline.
+
+    Shared core of :func:`verify_ledger_snapshot` and
+    :func:`restore_ledger_snapshot`; returns ``(payload, ledger_raw,
+    state, requests, entries)`` from the validated, authenticated
+    snapshot.  No filesystem path is ever consulted.
+    """
+    validated_keyring = _validated_keyring(keyring)
+    if isinstance(moment, bool) or not isinstance(moment, int):
+        raise TypeError("moment must be an int")
+    if moment < 0:
+        raise ValueError("moment must be non-negative")
+
+    payload, signature, ledger_raw, state, requests, entries = (
+        _parse_snapshot(snapshot)
+    )
+    issuer = payload[SNAP_ISSUER]
+    key_version = payload[SNAP_KEY_VERSION]
+    signed_at = payload[SNAP_SIGNED_AT]
+
+    if signed_at > moment:
+        raise _snapshot_invalid(
+            "signedAt is later than the verification moment"
+        )
+    # The exact issuer/version key must be usable at both instants:
+    # either check may reject a credential that was valid only before or
+    # only after the transfer.
+    _usable_checkpoint_key(validated_keyring, issuer, key_version, signed_at)
+    entry = _usable_checkpoint_key(
+        validated_keyring, issuer, key_version, moment
+    )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _snapshot_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError("ledger snapshot signature does not match")
+    return payload, ledger_raw, state, requests, entries
+
+
+def verify_ledger_snapshot(snapshot: bytes, keyring: dict, moment: int) -> dict:
+    """Verify a ledger snapshot without consulting any ledger or file.
+
+    ``snapshot`` must be :class:`bytes` produced by
+    :func:`export_ledger_snapshot`.  Verification is fully offline: the
+    canonical encoding, the exact key sets, the protocol version, the
+    carried ledger under the :func:`apply_remote` byte contract, the
+    ``ledgerDigest``/``stateDigest``/``lastSeq``/``requestCount``
+    bindings, a ``signedAt`` no later than ``moment``, the usability of
+    the exact issuer/version key at both the signing and the
+    verification moments and the HMAC over the canonical payload.
+
+    On success a fresh dict is returned with the key order ``issuer``,
+    ``keyVersion``, ``signedAt``, ``ledgerDigest``, ``stateDigest``,
+    ``lastSeq``, ``requestCount``: the signing identity, the signing
+    time and the ledger summary metadata, exactly as the authenticated
+    payload declares them.  Duplicate keys, a non-canonical encoding,
+    added or removed fields, an unparseable carried ledger, a digest or
+    statistics mismatch and a future ``signedAt`` raise
+    :class:`InvalidLedgerSnapshotError` (a :class:`ValueError`); type
+    faults raise :class:`TypeError`; unknown, revoked, not-yet-valid or
+    expired credentials and a signature mismatch raise
+    :class:`AuthenticationError`.
+    """
+    payload, _, _, _, _ = _verify_snapshot(snapshot, keyring, moment)
+    return {key: payload[key] for key in _SNAPSHOT_INFO_KEYS}
+
+
+def restore_ledger_snapshot(
+    path: str, snapshot: bytes, keyring: dict, moment: int
+) -> dict:
+    """Install or advance the ledger at ``path`` from a trusted snapshot.
+
+    Every input is validated before the target is ever touched: the
+    snapshot passes the exact :func:`verify_ledger_snapshot` contract
+    (structure, carried ledger, digests, statistics, signing time,
+    credentials and signature), then any interrupted transaction at
+    ``path`` is settled through :func:`recover_ledger` before the target
+    ledger is read.
+
+    A missing target installs the snapshot bytes.  A target holding
+    exactly the snapshot bytes is ``duplicate`` and is not rewritten.
+    Otherwise the target may only move forward: its audit must be a
+    complete prefix of the snapshot audit, every request binding it
+    holds must match the snapshot's binding for the same id and its
+    state must equal the snapshot's state at the shared boundary; only
+    then are the snapshot bytes committed and the result ``applied``.
+    A snapshot whose audit is a proper prefix of the target audit raises
+    :class:`StaleLedgerSnapshotError`; a same-seq audit entry
+    disagreement, a conflicting request binding or a divergent
+    shared-boundary state raises :class:`LedgerSnapshotForkError`.
+    Every failure leaves the target byte-for-byte unchanged.
+
+    The result is a fresh dict with the fixed key order ``status``,
+    ``next``, ``ledgerDigest``: the outcome, the last audit seq of the
+    resulting ledger and the digest of its bytes.  The write is the
+    usual durable transaction (see :func:`apply_remote`): an
+    :class:`OSError` at any stage propagates unchanged with the file
+    system restored to its pre-call state and enough recovery material
+    left for a retry.  A corrupt existing target raises
+    :class:`ValueError` and is left untouched.
+    """
+    if not isinstance(path, str):
+        raise TypeError("path must be a str")
+    payload, ledger_raw, snap_state, snap_requests, snap_entries = (
+        _verify_snapshot(snapshot, keyring, moment)
+    )
+
+    # Settle any interrupted earlier transaction before the target is
+    # read, exactly like a commit through apply_remote does.
+    recover_ledger(path)
+    try:
+        with open(path, "rb") as handle:
+            target_raw = handle.read()
+    except FileNotFoundError:
+        target_raw = None
+
+    snap_digest = _digest(ledger_raw)
+    if target_raw is None:
+        _atomic_write(path, ledger_raw)
+        return {
+            STATUS: STATUS_APPLIED,
+            NEXT: len(snap_entries),
+            SNAP_LEDGER_DIGEST: snap_digest,
+        }
+    if target_raw == ledger_raw:
+        return {
+            STATUS: STATUS_DUPLICATE,
+            NEXT: len(snap_entries),
+            SNAP_LEDGER_DIGEST: snap_digest,
+        }
+
+    tgt_state, tgt_requests, tgt_entries = _parse_ledger(target_raw)
+    tgt_len = len(tgt_entries)
+    snap_len = len(snap_entries)
+
+    # The shared audit prefix must agree entry by complete entry.
+    for position in range(min(tgt_len, snap_len)):
+        if tgt_entries[position] != snap_entries[position]:
+            raise LedgerSnapshotForkError(
+                f"audit entry seq {position + 1} disagrees with the "
+                "target ledger"
+            )
+    # Every request binding the target already holds must bind the same
+    # digest in the snapshot.  (Ids only the target holds mean the
+    # target is strictly ahead and are settled by the staleness check.)
+    for bound_id, bound_digest in tgt_requests.items():
+        if bound_id in snap_requests and snap_requests[bound_id] != bound_digest:
+            raise LedgerSnapshotForkError(
+                f"request id {bound_id!r} is bound to a different digest"
+            )
+    if tgt_len > snap_len:
+        raise StaleLedgerSnapshotError(
+            "snapshot audit is a proper prefix of the target audit"
+        )
+    # The target state must equal the snapshot's state at the shared
+    # boundary: the after of the last shared entry, the before of the
+    # first entry when the target audit is empty, or the snapshot state
+    # itself when both audits are empty.
+    if tgt_len >= 1:
+        snap_boundary = snap_entries[tgt_len - 1][AFTER]
+    elif snap_entries:
+        snap_boundary = snap_entries[0][BEFORE]
+    else:
+        snap_boundary = _digest(_state_bytes(snap_state))
+    if _digest(_state_bytes(tgt_state)) != snap_boundary:
+        raise LedgerSnapshotForkError(
+            "target state does not match the snapshot state at the "
+            "shared boundary"
+        )
+    if tgt_len == snap_len:
+        # Unreachable while both ledgers validate: equal audits,
+        # compatible bindings and equal boundary states force identical
+        # canonical bytes, which the duplicate check above caught.
+        raise LedgerSnapshotForkError(
+            "ledgers disagree without a comparable divergence"
+        )
+
+    _atomic_write(path, ledger_raw)
+    return {
+        STATUS: STATUS_APPLIED,
+        NEXT: snap_len,
+        SNAP_LEDGER_DIGEST: snap_digest,
     }
