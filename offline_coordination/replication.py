@@ -46697,18 +46697,24 @@ def _ffdac_parse_successor(raw: object) -> tuple[dict, str, list[dict]]:
 # Issuance (:func:`supersede_final_fork_decision_aggregate`), single-chain
 # verification
 # (:func:`verify_final_fork_decision_aggregate_chain`), batch verification
-# (:func:`verify_final_fork_decision_aggregate_chains`) and the stable head
+# (:func:`verify_final_fork_decision_aggregate_chains`), the stable head
 # anchors (:func:`seal_final_fork_decision_aggregate_head` /
-# :func:`verify_final_fork_decision_aggregate_head`) all validate the same
+# :func:`verify_final_fork_decision_aggregate_head`) and the fork proof
+# layer above them (proof signing and verification, threshold
+# adjudication and decision verification) all validate the same
 # materials against the same packets.  The helpers below are that one
 # semantics: the five invariant policies shared by the whole batch, plus
-# the keyring and moment, are validated once here; the per-stage decision
-# site policy history stays per chain.  The old/new decision policy transition, the five
+# the keyring and moment, are validated once here into a single
+# materials bundle; the per-stage decision site policy history stays per
+# chain.  The old/new decision policy transition, the five
 # invariant policy digests, the root/predecessor/height links, the append
 # prefix, the stage recomputation at the effective and the verification (or
 # issuance) moment, the verdict state machine and dual-policy sealer
-# authorization are each expressed exactly once, and the batch layer and
-# the anchors run on top of those same outcomes.
+# authorization are each expressed exactly once; payload digest bindings
+# are asserted through one table-driven check and every packet is signed
+# and authenticated through one HMAC helper, so the batch layer, the
+# anchors and the fork proof layer all run on top of those same
+# outcomes.
 
 def _ffdac_validated_materials(
     prune_policy: object,
@@ -46775,6 +46781,65 @@ def _ffdac_bind_runtime(
     return materials
 
 
+def _ffdac_sign_packet(
+    materials: dict, issuer: str, version: int, moments: tuple,
+    payload: dict,
+) -> bytes:
+    """Sign one payload with the exact issuer/version key.
+
+    The key must be usable at every moment in ``moments``; the packet is
+    the canonical compact ``{"payload", "signature"}`` encoding.
+    """
+    entry = None
+    for moment in moments:
+        entry = _usable_checkpoint_key(
+            materials["keyring"], issuer, version, moment
+        )
+    signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+
+
+def _ffdac_assert_packet_signature(
+    materials: dict, payload: dict, signature: str, moments: tuple,
+    message: str,
+) -> None:
+    """Require the payload HMAC under its exact issuer/version key.
+
+    The key must be usable at every moment in ``moments``; a mismatch
+    raises :class:`AuthenticationError` with the path's own ``message``.
+    """
+    entry = None
+    for moment in moments:
+        entry = _usable_checkpoint_key(
+            materials["keyring"], payload[VD_ISSUER], payload[KEY_VERSION],
+            moment,
+        )
+    expected_signature = hmac.new(
+        bytes.fromhex(entry[SECRET]),
+        _prune_compact(payload),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise AuthenticationError(message)
+
+
+def _ffdac_assert_bound_digests(
+    payload: dict, materials: dict, invalid: Callable, checks: tuple,
+) -> None:
+    """Require each bound payload digest to equal the materials digest.
+
+    ``checks`` is an ordered tuple of ``(field, bundle_key, message)``;
+    the first mismatch raises ``invalid(message)``.
+    """
+    for field, bundle_key, message in checks:
+        if payload[field] != materials[bundle_key]:
+            raise invalid(message)
+
+
 def _ffdac_assert_invariants(
     payload: dict | None, materials: dict, previous: dict | None,
 ) -> None:
@@ -46820,6 +46885,28 @@ def _ffdac_assert_invariants(
             raise _ffdac_invalid(invariant_message)
 
 
+_FFDAC_ROOT_BINDING_CHECKS = (
+    (_FACFDA_PRUNE_POLICY_DIGEST, "prune_policy_digest",
+     "prune policy digest does not match the prune policy"),
+    (_FACFDA_AUTHORIZATION_POLICY_DIGEST, "authorization_policy_digest",
+     "authorization policy digest does not match the authorization "
+     "policy"),
+    (_FACFDA_SITE_POLICY_DIGEST, "site_policy_digest",
+     "site policy digest does not match the fork-proof signer site "
+     "policy"),
+    (_FACFDA_SIGNER_SITE_POLICY_DIGEST, "signer_site_policy_digest",
+     "signer site policy digest does not match the adjudication signer "
+     "site policy"),
+    (_FACFDA_ADJUDICATION_SITE_POLICY_DIGEST,
+     "adjudication_site_policy_digest",
+     "adjudication site policy digest does not match the issuing site "
+     "policy"),
+    (_FACFDA_DECISION_SITE_POLICY_DIGEST, "_decision_policy_digest",
+     "decision site policy digest does not match the decision site "
+     "policy"),
+)
+
+
 def _ffdac_assert_root_bindings(
     payload: dict, materials: dict, decision_policy_digest: str,
 ) -> None:
@@ -46831,32 +46918,11 @@ def _ffdac_assert_root_bindings(
     :class:`InvalidFinalAggregateChainForkDecisionAggregateError` via the
     shared root error constructor.
     """
-    checks = (
-        (_FACFDA_PRUNE_POLICY_DIGEST, "prune_policy_digest",
-         "prune policy digest does not match the prune policy"),
-        (_FACFDA_AUTHORIZATION_POLICY_DIGEST,
-         "authorization_policy_digest",
-         "authorization policy digest does not match the authorization "
-         "policy"),
-        (_FACFDA_SITE_POLICY_DIGEST, "site_policy_digest",
-         "site policy digest does not match the fork-proof signer site "
-         "policy"),
-        (_FACFDA_SIGNER_SITE_POLICY_DIGEST, "signer_site_policy_digest",
-         "signer site policy digest does not match the adjudication "
-         "signer site policy"),
-        (_FACFDA_ADJUDICATION_SITE_POLICY_DIGEST,
-         "adjudication_site_policy_digest",
-         "adjudication site policy digest does not match the issuing "
-         "site policy"),
-        (_FACFDA_DECISION_SITE_POLICY_DIGEST, "_decision_policy_digest",
-         "decision site policy digest does not match the decision "
-         "site policy"),
-    )
     bound_materials = dict(materials)
     bound_materials["_decision_policy_digest"] = decision_policy_digest
-    for field, bundle_key, message in checks:
-        if payload[field] != bound_materials[bundle_key]:
-            raise _facfda_invalid(message)
+    _ffdac_assert_bound_digests(
+        payload, bound_materials, _facfda_invalid, _FFDAC_ROOT_BINDING_CHECKS
+    )
 
 
 def _ffdac_assert_policy_transition(
@@ -47178,13 +47244,6 @@ def supersede_final_fork_decision_aggregate(
         "decision credentials are not all usable at the issuance moment",
     )
 
-    signing_entry = _usable_checkpoint_key(
-        materials["keyring"], issuer, version, effective
-    )
-    _usable_checkpoint_key(
-        materials["keyring"], issuer, version, sign_moment
-    )
-
     payload = {
         _FFDAC_ROOT_DIGEST: root_view[_FFDAC_ROOT_DIGEST],
         _FFDAC_PREDECESSOR_DIGEST: hashlib.sha256(predecessor).hexdigest(),
@@ -47213,12 +47272,9 @@ def supersede_final_fork_decision_aggregate(
         KEY_VERSION: version,
         VERSION: FINAL_FORK_DECISION_AGGREGATE_CHAIN_VERSION,
     }
-    signature = hmac.new(
-        bytes.fromhex(signing_entry[SECRET]),
-        _prune_compact(payload),
-        hashlib.sha256,
-    ).hexdigest()
-    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+    return _ffdac_sign_packet(
+        materials, issuer, version, (effective, sign_moment), payload
+    )
 
 
 # -- Offline chain verification ------------------------------------------------
@@ -47239,20 +47295,11 @@ def _verify_ffdac_chain_root(
         materials["adjudication_site_policy"][ADJ_THRESHOLD],
         decision_site_policy[ADJ_THRESHOLD],
     )
-    entry = _usable_checkpoint_key(
-        materials["keyring"], payload[VD_ISSUER], payload[KEY_VERSION],
-        materials["moment"],
+    _ffdac_assert_packet_signature(
+        materials, payload, signature, (materials["moment"],),
+        "final aggregate chain fork decision aggregate signature "
+        "does not match",
     )
-    expected_signature = hmac.new(
-        bytes.fromhex(entry[SECRET]),
-        _prune_compact(payload),
-        hashlib.sha256,
-    ).hexdigest()
-    if not hmac.compare_digest(expected_signature, signature):
-        raise AuthenticationError(
-            "final aggregate chain fork decision aggregate signature "
-            "does not match"
-        )
     return payload
 
 
@@ -47322,23 +47369,10 @@ def _verify_ffdac_hop(
         "decision credentials are not all usable at the verification moment",
     )
 
-    _usable_checkpoint_key(
-        materials["keyring"], payload[VD_ISSUER], payload[KEY_VERSION],
-        effective,
+    _ffdac_assert_packet_signature(
+        materials, payload, signature, (effective, verify_moment),
+        "final fork decision aggregate successor signature does not match",
     )
-    entry = _usable_checkpoint_key(
-        materials["keyring"], payload[VD_ISSUER], payload[KEY_VERSION],
-        verify_moment,
-    )
-    expected_signature = hmac.new(
-        bytes.fromhex(entry[SECRET]),
-        _prune_compact(payload),
-        hashlib.sha256,
-    ).hexdigest()
-    if not hmac.compare_digest(expected_signature, signature):
-        raise AuthenticationError(
-            "final fork decision aggregate successor signature does not match"
-        )
 
     return {
         "packet": successor,
@@ -47883,9 +47917,6 @@ def seal_final_fork_decision_aggregate_head(
     )
     if result[FAC_HEAD_DIGEST] != hashlib.sha256(head_packet).hexdigest():
         raise ValueError("the sealed head digest does not match its packet")
-    signing_entry = _usable_checkpoint_key(
-        materials["keyring"], issuer, version, seal_moment
-    )
     payload = {
         _FFDAC_ROOT_DIGEST: result[_FFDAC_ROOT_DIGEST],
         FAC_HEAD_DIGEST: result[FAC_HEAD_DIGEST],
@@ -47898,12 +47929,9 @@ def seal_final_fork_decision_aggregate_head(
         KEY_VERSION: version,
         VERSION: FINAL_FORK_DECISION_AGGREGATE_CHAIN_VERSION,
     }
-    signature = hmac.new(
-        bytes.fromhex(signing_entry[SECRET]),
-        _prune_compact(payload),
-        hashlib.sha256,
-    ).hexdigest()
-    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+    return _ffdac_sign_packet(
+        materials, issuer, version, (seal_moment,), payload
+    )
 
 
 def verify_final_fork_decision_aggregate_head(
@@ -47950,19 +47978,10 @@ def verify_final_fork_decision_aggregate_head(
     _ffdac_bind_runtime(materials, keyring, moment)
     verify_moment = materials["moment"]
 
-    entry = _usable_checkpoint_key(
-        materials["keyring"], payload[VD_ISSUER], payload[KEY_VERSION],
-        verify_moment,
+    _ffdac_assert_packet_signature(
+        materials, payload, signature, (verify_moment,),
+        "final fork decision aggregate anchor signature does not match",
     )
-    expected_signature = hmac.new(
-        bytes.fromhex(entry[SECRET]),
-        _prune_compact(payload),
-        hashlib.sha256,
-    ).hexdigest()
-    if not hmac.compare_digest(expected_signature, signature):
-        raise AuthenticationError(
-            "final fork decision aggregate anchor signature does not match"
-        )
     if payload[_FFDAC_ANCHOR_SEALED_AT] > verify_moment:
         raise _ffdac_anchor_invalid(
             "the anchor sealing moment is later than the verification "
@@ -48117,6 +48136,67 @@ def _reject_duplicate_ffdacf_decision_keys(pairs: list[tuple]) -> dict:
             raise _ffdacf_decision_invalid(f"duplicate key {key!r} in object")
         result[key] = value
     return result
+
+
+def _ffdacf_bind_proof_site_policy(
+    materials: dict, proof_site_policy: object,
+) -> dict:
+    """Validate the proof site policy into the materials bundle."""
+    validated = _validated_prune_batch_site_policy(proof_site_policy)
+    materials["proof_site_policy"] = validated
+    materials["proof_site_policy_digest"] = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated)
+    ).hexdigest()
+    return materials
+
+
+_FFDACF_PROOF_BINDING_CHECKS = (
+    (CF_PROOF_PRUNE_POLICY, "prune_policy_digest",
+     "prune policy digest does not match the prune policy"),
+    (_ACF_PROOF_AUTHORIZATION_POLICY, "authorization_policy_digest",
+     "authorization policy digest does not match the authorization "
+     "policy"),
+    (_ADCF_PROOF_SITE_POLICY, "site_policy_digest",
+     "site policy digest does not match the signer site policy"),
+    (_FACF_PROOF_SIGNER_SITE_POLICY, "signer_site_policy_digest",
+     "signer site policy digest does not match the adjudication signer "
+     "site policy"),
+    (_FFDACF_PROOF_ADJUDICATION_SITE_POLICY,
+     "adjudication_site_policy_digest",
+     "adjudication site policy digest does not match the issuing "
+     "adjudication site policy"),
+)
+
+_FFDACF_DECISION_BINDING_CHECKS = (
+    (PAFD_PRUNE_POLICY_DIGEST, "prune_policy_digest",
+     "prune policy digest does not match the prune policy"),
+    (_ACF_DECISION_AUTHORIZATION_POLICY_DIGEST,
+     "authorization_policy_digest",
+     "authorization policy digest does not match the authorization "
+     "policy"),
+    (_ADCF_SITE_POLICY_DIGEST, "site_policy_digest",
+     "site policy digest does not match the fork-proof signer site "
+     "policy"),
+    (_FACF_SIGNER_SITE_POLICY_DIGEST, "signer_site_policy_digest",
+     "signer site policy digest does not match the adjudication signer "
+     "site policy"),
+    (_FFDACF_ADJUDICATION_SITE_POLICY_DIGEST,
+     "adjudication_site_policy_digest",
+     "adjudication site policy digest does not match the issuing "
+     "adjudication site policy"),
+    (_FFDACF_PROOF_SITE_POLICY_DIGEST, "proof_site_policy_digest",
+     "proof site policy digest does not match the proof site policy"),
+)
+
+
+def _ffdacf_first_binding_mismatch(
+    payload: dict, materials: dict,
+) -> str | None:
+    """The first proof binding field whose digest mismatches, if any."""
+    for field, bundle_key, _message in _FFDACF_PROOF_BINDING_CHECKS:
+        if payload[field] != materials[bundle_key]:
+            return field
+    return None
 
 
 def _parse_ffdacf_fork_proof(raw: object) -> tuple[dict, str, list[dict]]:
@@ -48282,19 +48362,12 @@ def sign_final_fork_decision_aggregate_chain_fork_proof(
     credentials raise :class:`AuthenticationError`.
     """
     validated_items = _validated_fac_chain_batch(items)
-    validated_prune_policy = _validated_adjudication_policy(prune_policy)
-    validated_authorization_policy = _validated_prune_batch_site_policy(
-        authorization_policy
+    materials = _ffdac_validated_materials(
+        prune_policy, authorization_policy, site_policy,
+        signer_site_policy, adjudication_site_policy,
     )
-    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
-    validated_signer_site_policy = _validated_prune_batch_site_policy(
-        signer_site_policy
-    )
-    validated_adjudication_site_policy = _validated_prune_batch_site_policy(
-        adjudication_site_policy
-    )
-    validated_keyring = _validated_keyring(keyring)
-    sign_moment = _fe_moment(moment, "moment")
+    _ffdac_bind_runtime(materials, keyring, moment)
+    sign_moment = materials["moment"]
     if not isinstance(issuer, str):
         raise TypeError("issuer must be a str")
     if issuer == "":
@@ -48304,56 +48377,28 @@ def sign_final_fork_decision_aggregate_chain_fork_proof(
     if version <= 0:
         raise ValueError("version must be positive")
 
-    report = verify_final_fork_decision_aggregate_chains(
-        validated_items, prune_policy, authorization_policy, site_policy,
-        signer_site_policy, adjudication_site_policy, keyring, sign_moment,
-    )
-    entry = _usable_checkpoint_key(
-        validated_keyring, issuer, version, sign_moment
-    )
+    report = _ffdac_batch_report(validated_items, materials)
     payload = {
         FORK_PROOF_CHAINS: _pac_chain_materials(validated_items),
         VD_ISSUER: issuer,
         KEY_VERSION: version,
         CP_MOMENT: sign_moment,
-        CF_PROOF_PRUNE_POLICY: hashlib.sha256(
-            _verdict_policy_bytes(validated_prune_policy)
-        ).hexdigest(),
+        CF_PROOF_PRUNE_POLICY: materials["prune_policy_digest"],
         FORK_PROOF_REPORT: copy.deepcopy(report),
-        _ACF_PROOF_AUTHORIZATION_POLICY: hashlib.sha256(
-            _prune_batch_site_policy_bytes(validated_authorization_policy)
-        ).hexdigest(),
-        _ADCF_PROOF_SITE_POLICY: hashlib.sha256(
-            _prune_batch_site_policy_bytes(validated_site_policy)
-        ).hexdigest(),
-        _FACF_PROOF_SIGNER_SITE_POLICY: hashlib.sha256(
-            _prune_batch_site_policy_bytes(validated_signer_site_policy)
-        ).hexdigest(),
-        _FFDACF_PROOF_ADJUDICATION_SITE_POLICY: hashlib.sha256(
-            _prune_batch_site_policy_bytes(
-                validated_adjudication_site_policy
-            )
-        ).hexdigest(),
+        _ACF_PROOF_AUTHORIZATION_POLICY:
+            materials["authorization_policy_digest"],
+        _ADCF_PROOF_SITE_POLICY: materials["site_policy_digest"],
+        _FACF_PROOF_SIGNER_SITE_POLICY: materials["signer_site_policy_digest"],
+        _FFDACF_PROOF_ADJUDICATION_SITE_POLICY:
+            materials["adjudication_site_policy_digest"],
         VERSION: FINAL_FORK_DECISION_AGGREGATE_CHAIN_FORK_PROOF_VERSION,
     }
-    signature = hmac.new(
-        bytes.fromhex(entry[SECRET]),
-        _prune_compact(payload),
-        hashlib.sha256,
-    ).hexdigest()
-    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+    return _ffdac_sign_packet(
+        materials, issuer, version, (sign_moment,), payload
+    )
 
 
-def _verify_ffdacf_fork_proof_core(
-    raw: bytes,
-    validated_prune_policy: dict,
-    validated_authorization_policy: dict,
-    validated_site_policy: dict,
-    validated_signer_site_policy: dict,
-    validated_adjudication_site_policy: dict,
-    validated_keyring: dict[str, list[dict]],
-    verify_moment: int,
-) -> dict:
+def _verify_ffdacf_fork_proof_core(raw: bytes, materials: dict) -> dict:
     """Verify one final fork decision aggregate chain fork proof in
     isolation.
 
@@ -48362,77 +48407,33 @@ def _verify_ffdacf_fork_proof_core(
     freshly built solely from authenticated proof material.
     """
     payload, signature, chains = _parse_ffdacf_fork_proof(raw)
-    expected_prune_digest = hashlib.sha256(
-        _verdict_policy_bytes(validated_prune_policy)
-    ).hexdigest()
-    if payload[CF_PROOF_PRUNE_POLICY] != expected_prune_digest:
-        raise _ffdacf_proof_invalid(
-            "prune policy digest does not match the prune policy"
-        )
-    expected_authorization_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_authorization_policy)
-    ).hexdigest()
-    if payload[_ACF_PROOF_AUTHORIZATION_POLICY] != \
-            expected_authorization_digest:
-        raise _ffdacf_proof_invalid(
-            "authorization policy digest does not match the authorization "
-            "policy"
-        )
-    expected_site_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_site_policy)
-    ).hexdigest()
-    if payload[_ADCF_PROOF_SITE_POLICY] != expected_site_digest:
-        raise _ffdacf_proof_invalid(
-            "site policy digest does not match the signer site policy"
-        )
-    expected_signer_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_signer_site_policy)
-    ).hexdigest()
-    if payload[_FACF_PROOF_SIGNER_SITE_POLICY] != expected_signer_digest:
-        raise _ffdacf_proof_invalid(
-            "signer site policy digest does not match the adjudication "
-            "signer site policy"
-        )
-    expected_adjudication_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_adjudication_site_policy)
-    ).hexdigest()
-    if payload[_FFDACF_PROOF_ADJUDICATION_SITE_POLICY] != \
-            expected_adjudication_digest:
-        raise _ffdacf_proof_invalid(
-            "adjudication site policy digest does not match the issuing "
-            "adjudication site policy"
-        )
-    if payload[CP_MOMENT] > verify_moment:
+    _ffdac_assert_bound_digests(
+        payload, materials, _ffdacf_proof_invalid,
+        _FFDACF_PROOF_BINDING_CHECKS,
+    )
+    if payload[CP_MOMENT] > materials["moment"]:
         raise _ffdacf_proof_invalid(
             "moment must not be later than the verification moment"
         )
-
-    key_entry = _usable_checkpoint_key(
-        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION],
-        verify_moment,
+    _ffdac_assert_packet_signature(
+        materials, payload, signature, (materials["moment"],),
+        "final fork decision aggregate chain fork proof signature "
+        "does not match",
     )
-    expected_signature = hmac.new(
-        bytes.fromhex(key_entry[SECRET]),
-        _prune_compact(payload),
-        hashlib.sha256,
-    ).hexdigest()
-    if not hmac.compare_digest(expected_signature, signature):
-        raise AuthenticationError(
-            "final fork decision aggregate chain fork proof signature "
-            "does not match"
-        )
 
     return {
         FORK_PROOF_CHAINS: copy.deepcopy(chains),
         VD_ISSUER: payload[VD_ISSUER],
         KEY_VERSION: payload[KEY_VERSION],
         CP_MOMENT: payload[CP_MOMENT],
-        PAFD_PRUNE_POLICY_DIGEST: expected_prune_digest,
-        _ACF_AUTHORIZATION_POLICY_DIGEST: expected_authorization_digest,
-        _ADCF_SITE_POLICY_DIGEST: expected_site_digest,
-        _FACF_SIGNER_SITE_POLICY_DIGEST: expected_signer_digest,
+        PAFD_PRUNE_POLICY_DIGEST: materials["prune_policy_digest"],
+        _ACF_AUTHORIZATION_POLICY_DIGEST:
+            materials["authorization_policy_digest"],
+        _ADCF_SITE_POLICY_DIGEST: materials["site_policy_digest"],
+        _FACF_SIGNER_SITE_POLICY_DIGEST:
+            materials["signer_site_policy_digest"],
         _FFDACF_ADJUDICATION_SITE_POLICY_DIGEST:
-            expected_adjudication_digest,
+            materials["adjudication_site_policy_digest"],
         FORK_PROOF_DIGEST: hashlib.sha256(raw).hexdigest(),
         FORK_PROOF_REPORT: copy.deepcopy(payload[FORK_PROOF_REPORT]),
         VERSION: FINAL_FORK_DECISION_AGGREGATE_CHAIN_FORK_PROOF_VERSION,
@@ -48455,16 +48456,7 @@ def _ffdacf_proofs_item_report(
     }
 
 
-def _verify_ffdacf_fork_proof_item(
-    item: dict,
-    validated_prune_policy: dict,
-    validated_authorization_policy: dict,
-    validated_site_policy: dict,
-    validated_signer_site_policy: dict,
-    validated_adjudication_site_policy: dict,
-    validated_keyring: dict[str, list[dict]],
-    moment: int,
-) -> dict:
+def _verify_ffdacf_fork_proof_item(item: dict, materials: dict) -> dict:
     """Verify one final fork decision aggregate chain fork proof in
     isolation.
 
@@ -48476,14 +48468,7 @@ def _verify_ffdacf_fork_proof_item(
     item_id = item[ID]
     try:
         result = _verify_ffdacf_fork_proof_core(
-            item[FORK_PROOF_ITEM_PROOF],
-            validated_prune_policy,
-            validated_authorization_policy,
-            validated_site_policy,
-            validated_signer_site_policy,
-            validated_adjudication_site_policy,
-            validated_keyring,
-            moment,
+            item[FORK_PROOF_ITEM_PROOF], materials
         )
     except AuthenticationError as exc:
         return _ffdacf_proofs_item_report(
@@ -48543,27 +48528,14 @@ def verify_final_fork_decision_aggregate_chain_fork_proofs(
     written and no input is modified.
     """
     validated_items = _validated_pac_fork_proof_items(items)
-    validated_prune_policy = _validated_adjudication_policy(prune_policy)
-    validated_authorization_policy = _validated_prune_batch_site_policy(
-        authorization_policy
+    materials = _ffdac_validated_materials(
+        prune_policy, authorization_policy, site_policy,
+        signer_site_policy, adjudication_site_policy,
     )
-    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
-    validated_signer_site_policy = _validated_prune_batch_site_policy(
-        signer_site_policy
-    )
-    validated_adjudication_site_policy = _validated_prune_batch_site_policy(
-        adjudication_site_policy
-    )
-    validated_keyring = _validated_keyring(keyring)
-    verify_moment = _fe_moment(moment, "moment")
+    _ffdac_bind_runtime(materials, keyring, moment)
     return {
         ITEMS: [
-            _verify_ffdacf_fork_proof_item(
-                item, validated_prune_policy, validated_authorization_policy,
-                validated_site_policy, validated_signer_site_policy,
-                validated_adjudication_site_policy, validated_keyring,
-                verify_moment,
-            )
+            _verify_ffdacf_fork_proof_item(item, materials)
             for item in validated_items
         ],
         VERSION: _FFDACF_PROOFS_VERSION,
@@ -48572,17 +48544,7 @@ def verify_final_fork_decision_aggregate_chain_fork_proofs(
 
 # -- Multi-site threshold adjudication over the fork proofs -----------------
 
-def _adjudicate_ffdacf_one(
-    item: dict,
-    prune_policy_digest: str,
-    authorization_policy_digest: str,
-    site_policy_digest: str,
-    signer_site_policy_digest: str,
-    adjudication_site_policy_digest: str,
-    proof_site_policy: dict,
-    keyring: dict[str, list[dict]],
-    moment: int,
-) -> dict:
+def _adjudicate_ffdacf_one(item: dict, materials: dict) -> dict:
     """Verify, authorize and authenticate one final fork decision
     aggregate chain proof.
 
@@ -48626,28 +48588,20 @@ def _adjudicate_ffdacf_one(
     # claimed identity untrustworthy, so the row carries none.
     # Authorization itself is governed by the separate proof site
     # policy.
-    if payload[CF_PROOF_PRUNE_POLICY] != prune_policy_digest:
+    if _ffdacf_first_binding_mismatch(payload, materials) is not None:
         return structural_invalid()
-    if payload[_ACF_PROOF_AUTHORIZATION_POLICY] != authorization_policy_digest:
-        return structural_invalid()
-    if payload[_ADCF_PROOF_SITE_POLICY] != site_policy_digest:
-        return structural_invalid()
-    if payload[_FACF_PROOF_SIGNER_SITE_POLICY] != signer_site_policy_digest:
-        return structural_invalid()
-    if payload[_FFDACF_PROOF_ADJUDICATION_SITE_POLICY] != \
-            adjudication_site_policy_digest:
-        return structural_invalid()
+    moment = materials["moment"]
     if payload[CP_MOMENT] > moment:
         return structural_invalid()
 
-    allowed_versions = proof_site_policy[ADJ_SITES].get(site)
+    allowed_versions = materials["proof_site_policy"][ADJ_SITES].get(site)
     if allowed_versions is None:
         return reject(REASON_UNAUTHORIZED_SITE)
     if key_version not in allowed_versions:
         return reject(REASON_UNAUTHORIZED_VERSION)
 
     key_entry = None
-    for candidate in keyring.get(site, ()):
+    for candidate in materials["keyring"].get(site, ()):
         if candidate[VERSION] == key_version:
             key_entry = candidate
             break
@@ -48757,25 +48711,13 @@ def adjudicate_final_fork_decision_aggregate_chain_forks(
     raise :class:`AuthenticationError`.
     """
     validated_items = _validated_pac_fork_proof_items(items)
-    validated_prune_policy = _validated_adjudication_policy(prune_policy)
-    validated_authorization_policy = _validated_prune_batch_site_policy(
-        authorization_policy
+    materials = _ffdac_validated_materials(
+        prune_policy, authorization_policy, site_policy,
+        signer_site_policy, adjudication_site_policy,
     )
-    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
-    validated_signer_site_policy = _validated_prune_batch_site_policy(
-        signer_site_policy
-    )
-    validated_adjudication_site_policy = _validated_prune_batch_site_policy(
-        adjudication_site_policy
-    )
-    validated_proof_site_policy = _validated_prune_batch_site_policy(
-        proof_site_policy
-    )
-    validated_keyring = _validated_keyring(keyring)
-    if isinstance(moment, bool) or not isinstance(moment, int):
-        raise TypeError("moment must be an int")
-    if moment < 0:
-        raise ValueError("moment must be non-negative")
+    _ffdacf_bind_proof_site_policy(materials, proof_site_policy)
+    _ffdac_bind_runtime(materials, keyring, moment)
+    adjudication_moment = materials["moment"]
     if not isinstance(issuer, str):
         raise TypeError("issuer must be a str")
     if issuer == "":
@@ -48785,29 +48727,8 @@ def adjudicate_final_fork_decision_aggregate_chain_forks(
     if version <= 0:
         raise ValueError("version must be positive")
 
-    prune_policy_digest = hashlib.sha256(
-        _verdict_policy_bytes(validated_prune_policy)
-    ).hexdigest()
-    authorization_policy_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_authorization_policy)
-    ).hexdigest()
-    site_policy_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_site_policy)
-    ).hexdigest()
-    signer_site_policy_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_signer_site_policy)
-    ).hexdigest()
-    adjudication_site_policy_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_adjudication_site_policy)
-    ).hexdigest()
-
     rows = [
-        _adjudicate_ffdacf_one(
-            item, prune_policy_digest, authorization_policy_digest,
-            site_policy_digest, signer_site_policy_digest,
-            adjudication_site_policy_digest, validated_proof_site_policy,
-            validated_keyring, moment,
-        )
+        _adjudicate_ffdacf_one(item, materials)
         for item in validated_items
     ]
 
@@ -48819,7 +48740,7 @@ def adjudicate_final_fork_decision_aggregate_chain_forks(
         common = None
     elif len(declarations) == 1:
         common = _sorted_pac_fork_edge_objects(next(iter(declarations)))
-        if len(votes) >= validated_proof_site_policy[ADJ_THRESHOLD]:
+        if len(votes) >= materials["proof_site_policy"][ADJ_THRESHOLD]:
             status = _CF_STATUS_ACCEPTED
         else:
             status = _CF_STATUS_INSUFFICIENT
@@ -48840,33 +48761,28 @@ def adjudicate_final_fork_decision_aggregate_chain_forks(
     # though the digest multiset is unchanged.
     proof_digests = [row[_CF_PROOF_DIGEST] for row in rows]
 
-    signing_entry = _usable_checkpoint_key(
-        validated_keyring, issuer, version, moment
-    )
     payload = {
         _CF_DECISION_COMMON: common,
         VD_ISSUER: issuer,
         ITEMS: [copy.deepcopy(row) for row in rows],
         KEY_VERSION: version,
-        PAFD_PRUNE_POLICY_DIGEST: prune_policy_digest,
+        PAFD_PRUNE_POLICY_DIGEST: materials["prune_policy_digest"],
         _CF_DECISION_PROOFS: proof_digests,
-        _ACF_DECISION_AUTHORIZATION_POLICY_DIGEST: authorization_policy_digest,
-        _ADCF_SITE_POLICY_DIGEST: site_policy_digest,
-        _FACF_SIGNER_SITE_POLICY_DIGEST: signer_site_policy_digest,
+        _ACF_DECISION_AUTHORIZATION_POLICY_DIGEST:
+            materials["authorization_policy_digest"],
+        _ADCF_SITE_POLICY_DIGEST: materials["site_policy_digest"],
+        _FACF_SIGNER_SITE_POLICY_DIGEST:
+            materials["signer_site_policy_digest"],
         _FFDACF_ADJUDICATION_SITE_POLICY_DIGEST:
-            adjudication_site_policy_digest,
-        _FFDACF_PROOF_SITE_POLICY_DIGEST: hashlib.sha256(
-            _prune_batch_site_policy_bytes(validated_proof_site_policy)
-        ).hexdigest(),
+            materials["adjudication_site_policy_digest"],
+        _FFDACF_PROOF_SITE_POLICY_DIGEST:
+            materials["proof_site_policy_digest"],
         STATUS: status,
         VERSION: FINAL_FORK_DECISION_AGGREGATE_CHAIN_FORK_DECISION_VERSION,
     }
-    signature = hmac.new(
-        bytes.fromhex(signing_entry[SECRET]),
-        _prune_compact(payload),
-        hashlib.sha256,
-    ).hexdigest()
-    return _prune_compact({TICKET_PAYLOAD: payload, SIGNATURE: signature})
+    return _ffdac_sign_packet(
+        materials, issuer, version, (adjudication_moment,), payload
+    )
 
 
 def _parse_ffdacf_decision(raw: object) -> tuple[dict, str]:
@@ -49174,46 +49090,16 @@ def verify_final_fork_decision_aggregate_chain_fork_decision(
     """
     if not isinstance(decision, bytes):
         raise TypeError("decision must be bytes")
-    validated_prune_policy = _validated_adjudication_policy(prune_policy)
-    validated_authorization_policy = _validated_prune_batch_site_policy(
-        authorization_policy
+    materials = _ffdac_validated_materials(
+        prune_policy, authorization_policy, site_policy,
+        signer_site_policy, adjudication_site_policy,
     )
-    validated_site_policy = _validated_prune_batch_site_policy(site_policy)
-    validated_signer_site_policy = _validated_prune_batch_site_policy(
-        signer_site_policy
-    )
-    validated_adjudication_site_policy = _validated_prune_batch_site_policy(
-        adjudication_site_policy
-    )
-    validated_proof_site_policy = _validated_prune_batch_site_policy(
-        proof_site_policy
-    )
-    validated_keyring = _validated_keyring(keyring)
-    verify_moment = _fe_moment(moment, "moment")
-    return _verify_ffdacf_decision_core(
-        decision,
-        validated_prune_policy,
-        validated_authorization_policy,
-        validated_site_policy,
-        validated_signer_site_policy,
-        validated_adjudication_site_policy,
-        validated_proof_site_policy,
-        validated_keyring,
-        verify_moment,
-    )
+    _ffdacf_bind_proof_site_policy(materials, proof_site_policy)
+    _ffdac_bind_runtime(materials, keyring, moment)
+    return _verify_ffdacf_decision_core(decision, materials)
 
 
-def _verify_ffdacf_decision_core(
-    decision,
-    validated_prune_policy,
-    validated_authorization_policy,
-    validated_site_policy,
-    validated_signer_site_policy,
-    validated_adjudication_site_policy,
-    validated_proof_site_policy,
-    validated_keyring,
-    verify_moment,
-):
+def _verify_ffdacf_decision_core(decision, materials):
     """Verify one final fork decision aggregate chain fork decision from
     materials.
 
@@ -49224,77 +49110,24 @@ def _verify_ffdacf_decision_core(
     decision material.
     """
     payload, signature = _parse_ffdacf_decision(decision)
-    expected_prune_digest = hashlib.sha256(
-        _verdict_policy_bytes(validated_prune_policy)
-    ).hexdigest()
-    if payload[PAFD_PRUNE_POLICY_DIGEST] != expected_prune_digest:
-        raise _ffdacf_decision_invalid(
-            "prune policy digest does not match the prune policy"
-        )
-    expected_authorization_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_authorization_policy)
-    ).hexdigest()
-    if payload[_ACF_DECISION_AUTHORIZATION_POLICY_DIGEST] != \
-            expected_authorization_digest:
-        raise _ffdacf_decision_invalid(
-            "authorization policy digest does not match the authorization "
-            "policy"
-        )
-    expected_site_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_site_policy)
-    ).hexdigest()
-    if payload[_ADCF_SITE_POLICY_DIGEST] != expected_site_digest:
-        raise _ffdacf_decision_invalid(
-            "site policy digest does not match the fork-proof signer site "
-            "policy"
-        )
-    expected_signer_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_signer_site_policy)
-    ).hexdigest()
-    if payload[_FACF_SIGNER_SITE_POLICY_DIGEST] != expected_signer_digest:
-        raise _ffdacf_decision_invalid(
-            "signer site policy digest does not match the adjudication "
-            "signer site policy"
-        )
-    expected_adjudication_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_adjudication_site_policy)
-    ).hexdigest()
-    if payload[_FFDACF_ADJUDICATION_SITE_POLICY_DIGEST] != \
-            expected_adjudication_digest:
-        raise _ffdacf_decision_invalid(
-            "adjudication site policy digest does not match the issuing "
-            "adjudication site policy"
-        )
-    expected_proof_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_proof_site_policy)
-    ).hexdigest()
-    if payload[_FFDACF_PROOF_SITE_POLICY_DIGEST] != expected_proof_digest:
-        raise _ffdacf_decision_invalid(
-            "proof site policy digest does not match the proof site policy"
-        )
+    _ffdac_assert_bound_digests(
+        payload, materials, _ffdacf_decision_invalid,
+        _FFDACF_DECISION_BINDING_CHECKS,
+    )
 
     # The proof digest vector is bound term by term to the canonical
     # (stably sorted) rows, so a reordering of the summaries that is then
     # re-signed is rejected even though the digest multiset is unchanged.
     status = _reconcile_pafd(
-        payload, validated_proof_site_policy[ADJ_THRESHOLD],
+        payload, materials["proof_site_policy"][ADJ_THRESHOLD],
         invalid=_ffdacf_decision_invalid, positional_proofs=True,
     )
 
-    entry = _usable_checkpoint_key(
-        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION],
-        verify_moment,
+    _ffdac_assert_packet_signature(
+        materials, payload, signature, (materials["moment"],),
+        "final fork decision aggregate chain fork decision signature "
+        "does not match",
     )
-    expected_signature = hmac.new(
-        bytes.fromhex(entry[SECRET]),
-        _prune_compact(payload),
-        hashlib.sha256,
-    ).hexdigest()
-    if not hmac.compare_digest(expected_signature, signature):
-        raise AuthenticationError(
-            "final fork decision aggregate chain fork decision signature "
-            "does not match"
-        )
 
     return {
         PAFD_COMMON: copy.deepcopy(payload[PAFD_COMMON]),
@@ -49302,14 +49135,17 @@ def _verify_ffdacf_decision_core(
         VD_ISSUER: payload[VD_ISSUER],
         ITEMS: copy.deepcopy(payload[ITEMS]),
         KEY_VERSION: payload[KEY_VERSION],
-        PAFD_PRUNE_POLICY_DIGEST: expected_prune_digest,
+        PAFD_PRUNE_POLICY_DIGEST: materials["prune_policy_digest"],
         PAFD_PROOFS: list(payload[PAFD_PROOFS]),
-        _ACF_AUTHORIZATION_POLICY_DIGEST: expected_authorization_digest,
-        _ADCF_SITE_POLICY_DIGEST: expected_site_digest,
-        _FACF_SIGNER_SITE_POLICY_DIGEST: expected_signer_digest,
+        _ACF_AUTHORIZATION_POLICY_DIGEST:
+            materials["authorization_policy_digest"],
+        _ADCF_SITE_POLICY_DIGEST: materials["site_policy_digest"],
+        _FACF_SIGNER_SITE_POLICY_DIGEST:
+            materials["signer_site_policy_digest"],
         _FFDACF_ADJUDICATION_SITE_POLICY_DIGEST:
-            expected_adjudication_digest,
-        _FFDACF_PROOF_SITE_POLICY_DIGEST: expected_proof_digest,
+            materials["adjudication_site_policy_digest"],
+        _FFDACF_PROOF_SITE_POLICY_DIGEST:
+            materials["proof_site_policy_digest"],
         STATUS: status,
         VERSION: FINAL_FORK_DECISION_AGGREGATE_CHAIN_FORK_DECISION_VERSION,
     }
