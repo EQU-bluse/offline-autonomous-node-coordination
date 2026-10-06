@@ -120,10 +120,23 @@ def _dominates(winner: dict[str, int], loser: dict[str, int]) -> bool:
     )
 
 
-def _record_sort_key(record: list[Any]) -> tuple[Any, ...]:
+def _record_order_key(record: list[Any], nodes: list[str]) -> tuple[Any, ...]:
+    """Total-order key for concurrent records over a fixed node list.
+
+    The leading element is the record clock as a vector over ``nodes``
+    (ascending node names, missing components counting as 0), compared
+    lexicographically: the record with the larger count at the first
+    differing component wins.  Because a causally dominating clock is
+    greater at the first differing component, this order always agrees
+    with dominance, so picking the maximum is associative, commutative
+    and idempotent.  Fully equal clock vectors fall back, in order, to
+    ``writer``, ``deleted`` and ``value`` (larger wins), and finally to
+    the sorted clock items so that records whose clocks differ only in
+    zero-count components still order deterministically.
+    """
     value, deleted, clock, writer = record
     return (
-        clock[writer],
+        tuple(clock.get(node, 0) for node in nodes),
         writer,
         deleted,
         value,
@@ -141,8 +154,15 @@ def _resolve_record(left: list[Any], right: list[Any]) -> list[Any]:
         return left
     if _dominates(right_clock, left_clock):
         return right
-    # Concurrent updates: compare by the prescribed Python tuple order.
-    return left if _record_sort_key(left) >= _record_sort_key(right) else right
+    # Concurrent updates: compare both clocks component by component over
+    # the ascending union of their node names; components absent from a
+    # clock count as 0.  Nodes absent from both clocks would contribute 0
+    # to both sides, so the pairwise union decides exactly as any wider
+    # node set would, and the winner is independent of merge grouping.
+    nodes = sorted(set(left_clock) | set(right_clock))
+    if _record_order_key(left, nodes) >= _record_order_key(right, nodes):
+        return left
+    return right
 
 
 def _remote_need(
@@ -185,8 +205,10 @@ def preview_changes(local: dict[str, Any], remote: dict[str, Any]) -> dict[str, 
       local record is absent or the remote record dominates it,
       ``"duplicate"``/``"equal"`` for equal records, ``"stale"``/``"local"``
       when the local record dominates, and ``"conflict"`` with the
-      :func:`merge_states` tie-break winner (``"remote"`` or ``"local"``) for
-      concurrent records.
+      :func:`merge_states` tie-break winner (``"remote"`` or ``"local"``)
+      for concurrent records — the same total order over the ascending
+      union of node names, so the previewed winner is exactly the record
+      a merge would keep.
 
     Type violations raise :class:`TypeError`; all other constraint violations
     raise :class:`ValueError`.
@@ -211,8 +233,12 @@ def preview_changes(local: dict[str, Any], remote: dict[str, Any]) -> dict[str, 
         elif _dominates(local_record[2], remote_record[2]):
             decision, winner = "stale", "local"
         else:
-            # Concurrent updates: the same tuple arbitration as merge_states.
-            if _record_sort_key(remote_record) >= _record_sort_key(local_record):
+            # Concurrent updates: the same total-order arbitration as
+            # merge_states, so the previewed winner matches the merge.
+            nodes = sorted(set(remote_record[2]) | set(local_record[2]))
+            if _record_order_key(remote_record, nodes) >= _record_order_key(
+                local_record, nodes
+            ):
                 winner = "remote"
             else:
                 winner = "local"
@@ -235,9 +261,15 @@ def merge_states(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     * Identical records are kept.
     * If one record's clock has every component >= the other's with at least
       one strictly greater, that record wins.
-    * Otherwise the record with the larger
-      ``(clock[writer], writer, deleted, value, tuple(sorted(clock.items())))``
-      Python tuple wins.
+    * Otherwise the clocks are concurrent and a total order decides:
+      compare both clocks component by component over the ascending union
+      of all node names (missing components count as 0) and the record
+      with the larger count at the first differing component wins; only
+      when the full clock vectors are equal do ``writer``, then
+      ``deleted``, then ``value`` decide (larger wins), with the sorted
+      clock items as the final tie-break.  This order agrees with causal
+      dominance wherever clocks are comparable, so merging is
+      commutative, associative and idempotent.
 
     Type violations raise :class:`TypeError`; all other constraint violations
     raise :class:`ValueError`.
