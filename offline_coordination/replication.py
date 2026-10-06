@@ -49707,6 +49707,15 @@ def _verify_ffdacf_decision_core(decision: bytes, materials: dict):
 # proof digest vector and the overall status) as one site's vote, and seals
 # the threshold outcome with seven policy digest bindings.  The offline
 # aggregate review recomputes every binding from the aggregate bytes alone.
+#
+# The three entry points share one internal boundary rather than parallel
+# copies of the same rules: :func:`_ffdacfd_validated_shared` validates the
+# six shared policies once, :func:`_ffdacfda_policy_digests` derives the
+# seven payload digest bindings from that one bundle for both sealing and
+# verification, :func:`_ffdac_assert_payload_signature` is the single
+# signer-identity and HMAC rule, :func:`_tally_pfda_rows` together with
+# :func:`_ffdacfda_row_order_key` is the one site-vote merge and ordering,
+# and :func:`_ffdac_parse_envelope` parses the canonical signed envelope.
 
 FINAL_FORK_DECISION_AGGREGATE_CHAIN_FORK_DECISIONS_VERSION = 1
 FINAL_FORK_DECISION_AGGREGATE_CHAIN_FORK_DECISION_AGGREGATE_VERSION = 1
@@ -49719,15 +49728,22 @@ _FFDACFDA_PACKET = _FACFDA_PACKET
 _FFDACFDA_PROOF_SITE_POLICY_DIGEST = _FFDACF_PROOF_SITE_POLICY_DIGEST
 _FFDACFDA_DECISION_SITE_POLICY_DIGEST = _FACFDA_DECISION_SITE_POLICY_DIGEST
 
-_FFDACFDA_DIGEST_FIELDS = (
-    _FACFDA_PRUNE_POLICY_DIGEST,
-    _FACFDA_AUTHORIZATION_POLICY_DIGEST,
-    _FACFDA_SITE_POLICY_DIGEST,
-    _FACFDA_SIGNER_SITE_POLICY_DIGEST,
-    _FACFDA_ADJUDICATION_SITE_POLICY_DIGEST,
-    _FFDACFDA_PROOF_SITE_POLICY_DIGEST,
-    _FFDACFDA_DECISION_SITE_POLICY_DIGEST,
+# The six digest fields bound straight from the shared materials bundle,
+# in payload order; the seventh (the decision site policy digest) is bound
+# from the per-call policy by :func:`_ffdacfda_policy_digests`.
+_FFDACFDA_MATERIALS_DIGEST_KEYS = (
+    (_FACFDA_PRUNE_POLICY_DIGEST, "prune_policy_digest"),
+    (_FACFDA_AUTHORIZATION_POLICY_DIGEST, "authorization_policy_digest"),
+    (_FACFDA_SITE_POLICY_DIGEST, "site_policy_digest"),
+    (_FACFDA_SIGNER_SITE_POLICY_DIGEST, "signer_site_policy_digest"),
+    (_FACFDA_ADJUDICATION_SITE_POLICY_DIGEST,
+     "adjudication_site_policy_digest"),
+    (_FFDACFDA_PROOF_SITE_POLICY_DIGEST, "proof_site_policy_digest"),
 )
+
+_FFDACFDA_DIGEST_FIELDS = tuple(
+    field for field, _bundle_key in _FFDACFDA_MATERIALS_DIGEST_KEYS
+) + (_FFDACFDA_DECISION_SITE_POLICY_DIGEST,)
 
 _FFDACFDA_PAYLOAD_KEYS = frozenset((
     _FACFDA_INPUTS,
@@ -49793,17 +49809,55 @@ def _reject_duplicate_ffdacfda_keys(pairs: list[tuple]) -> dict:
     return result
 
 
-def _ffdacfd_decisions_item_report(
-    item_id: str, status: str, error: str | None, result: dict | None
+def _ffdacfd_validated_shared(
+    prune_policy: object,
+    authorization_policy: object,
+    site_policy: object,
+    signer_site_policy: object,
+    adjudication_site_policy: object,
+    proof_site_policy: object,
 ) -> dict:
-    """One final fork decision aggregate chain fork decision report,
-    fixed key order."""
-    return {
-        CHECKPOINT_ITEM_ERROR: error,
-        ID: item_id,
-        VERDICT_ITEM_RESULT: result,
-        STATUS: status,
+    """Validate the six shared policies once and bind their digests.
+
+    The five invariant policies go through
+    :func:`_ffdac_validated_materials` and the proof site policy is bound
+    by :func:`_ffdacf_bind_proof_policy`, in that order; the decision
+    batch, the decision site policy and the keyring/moment are validated
+    by each entry point at its own historical position.  Type faults
+    raise :class:`TypeError` (a :class:`bool` never poses as an int);
+    every other fault raises :class:`ValueError`.
+    """
+    materials = _ffdac_validated_materials(
+        prune_policy, authorization_policy, site_policy,
+        signer_site_policy, adjudication_site_policy,
+    )
+    _ffdacf_bind_proof_policy(
+        materials, _validated_prune_batch_site_policy(proof_site_policy)
+    )
+    return materials
+
+
+def _ffdacfda_policy_digests(
+    materials: dict, validated_decision_site_policy: dict
+) -> dict:
+    """The seven payload digest bindings derived from one bundle.
+
+    Sealing and verification both bind exactly these field/digest pairs,
+    so a policy rotation can never drift between the two directions.
+    """
+    digests = {
+        field: materials[bundle_key]
+        for field, bundle_key in _FFDACFDA_MATERIALS_DIGEST_KEYS
     }
+    digests[_FFDACFDA_DECISION_SITE_POLICY_DIGEST] = hashlib.sha256(
+        _prune_batch_site_policy_bytes(validated_decision_site_policy)
+    ).hexdigest()
+    return digests
+
+
+def _ffdacfda_row_order_key(row: dict) -> tuple:
+    """The stable issuer-then-id row order of a decision aggregate."""
+    return (row[VD_ISSUER] is not None, row[VD_ISSUER] or "", row[ID])
 
 
 def _verify_ffdacfd_decision_item(item: dict, materials: dict) -> dict:
@@ -49821,7 +49875,7 @@ def _verify_ffdacfd_decision_item(item: dict, materials: dict) -> dict:
             item[_FFDACFDA_PACKET], materials
         )
     except AuthenticationError as exc:
-        return _ffdacfd_decisions_item_report(
+        return _cfd_decisions_item_report(
             item_id, _FFDACFD_UNAUTHENTICATED, str(exc), None
         )
     except (InvalidFinalForkDecisionAggregateChainForkDecisionError,
@@ -49829,10 +49883,10 @@ def _verify_ffdacfd_decision_item(item: dict, materials: dict) -> dict:
         # A TypeError here can only come from a wrong JSON field type
         # *inside* the decision bytes; the public argument types were
         # all validated before the batch ran.
-        return _ffdacfd_decisions_item_report(
+        return _cfd_decisions_item_report(
             item_id, _FFDACFD_INVALID, str(exc), None
         )
-    return _ffdacfd_decisions_item_report(
+    return _cfd_decisions_item_report(
         item_id, _FFDACFD_VERIFIED, None, result
     )
 
@@ -49881,14 +49935,10 @@ def verify_final_fork_decision_aggregate_chain_fork_decisions(
     written and no input is modified.
     """
     validated_items = _validated_cfd_decision_items(items)
-    materials = _ffdac_validated_materials(
+    materials = _ffdacfd_validated_shared(
         prune_policy, authorization_policy, site_policy,
-        signer_site_policy, adjudication_site_policy,
+        signer_site_policy, adjudication_site_policy, proof_site_policy,
     )
-    validated_proof_site_policy = _validated_prune_batch_site_policy(
-        proof_site_policy
-    )
-    _ffdacf_bind_proof_policy(materials, validated_proof_site_policy)
     _ffdac_bind_runtime(materials, keyring, moment)
     return {
         ITEMS: [
@@ -49903,10 +49953,7 @@ def verify_final_fork_decision_aggregate_chain_fork_decisions(
 def _aggregate_ffdacfda_one(
     item: dict,
     materials: dict,
-    fork_threshold: int,
     decision_site_policy: dict,
-    keyring: dict[str, list[dict]],
-    moment: int,
 ) -> dict:
     """Re-verify, authenticate and authorize one decision in isolation.
 
@@ -49943,32 +49990,24 @@ def _aggregate_ffdacfda_one(
             _ffdacf_decision_invalid,
         )
         _reconcile_pafd(
-            payload, fork_threshold,
+            payload, materials["proof_site_policy"][ADJ_THRESHOLD],
             invalid=_ffdacf_decision_invalid, positional_proofs=True,
         )
     except InvalidFinalForkDecisionAggregateChainForkDecisionError:
         return invalid_row()
 
-    def unauthenticated_row() -> dict:
+    try:
+        _ffdac_assert_payload_signature(
+            materials["keyring"], site, key_version, materials["moment"],
+            payload, signature,
+            "final fork decision aggregate chain fork decision signature "
+            "does not match",
+        )
+    except AuthenticationError:
         return _pfda_aggregate_row(
             item_id, decision_digest, site, key_version, None,
             PA_CONCLUSION_INVALID, PA_REASON_UNAUTHENTICATED,
         )
-
-    key_entry = None
-    for candidate in keyring.get(site, ()):
-        if candidate[VERSION] == key_version:
-            key_entry = candidate
-            break
-    if key_entry is None or key_entry[REVOKED]:
-        return unauthenticated_row()
-    if moment < key_entry[NOT_BEFORE] or moment > key_entry[NOT_AFTER]:
-        return unauthenticated_row()
-
-    if not hmac.compare_digest(
-        _ffdac_payload_signature(key_entry, payload), signature
-    ):
-        return unauthenticated_row()
 
     # The exact-issuer HMAC established the site/version identity, so an
     # authorized-policy miss may carry that identity.
@@ -50067,40 +50106,19 @@ def aggregate_final_fork_decision_aggregate_chain_fork_decisions(
     aggregate credentials raise :class:`AuthenticationError`.
     """
     validated_items = _validated_cfd_decision_items(items)
-    materials = _ffdac_validated_materials(
+    materials = _ffdacfd_validated_shared(
         prune_policy, authorization_policy, site_policy,
-        signer_site_policy, adjudication_site_policy,
+        signer_site_policy, adjudication_site_policy, proof_site_policy,
     )
-    validated_proof_site_policy = _validated_prune_batch_site_policy(
-        proof_site_policy
-    )
-    _ffdacf_bind_proof_policy(materials, validated_proof_site_policy)
     validated_decision_site_policy = _validated_prune_batch_site_policy(
         decision_site_policy
     )
     _ffdac_bind_runtime(materials, keyring, moment)
-    aggregate_moment = materials["moment"]
-    validated_keyring = materials["keyring"]
-    if not isinstance(issuer, str):
-        raise TypeError("issuer must be a str")
-    if issuer == "":
-        raise ValueError("issuer must be non-empty")
-    if isinstance(version, bool) or not isinstance(version, int):
-        raise TypeError("version must be an int")
-    if version <= 0:
-        raise ValueError("version must be positive")
+    issuer, version = _ffdac_validated_signer(issuer, version)
 
-    decision_site_policy_digest = hashlib.sha256(
-        _prune_batch_site_policy_bytes(validated_decision_site_policy)
-    ).hexdigest()
     rows = [
         _aggregate_ffdacfda_one(
-            item,
-            materials,
-            validated_proof_site_policy[ADJ_THRESHOLD],
-            validated_decision_site_policy,
-            validated_keyring,
-            aggregate_moment,
+            item, materials, validated_decision_site_policy
         )
         for item in validated_items
     ]
@@ -50108,33 +50126,17 @@ def aggregate_final_fork_decision_aggregate_chain_fork_decisions(
     status, common_declaration = _tally_pfda_rows(
         rows, validated_decision_site_policy[ADJ_THRESHOLD]
     )
-    rows.sort(
-        key=lambda row: (
-            row[VD_ISSUER] is not None,
-            row[VD_ISSUER] or "",
-            row[ID],
-        )
-    )
+    rows.sort(key=_ffdacfda_row_order_key)
 
     signing_entry = _usable_checkpoint_key(
-        validated_keyring, issuer, version, aggregate_moment
+        materials["keyring"], issuer, version, materials["moment"]
     )
     payload = {
         _FACFDA_INPUTS: input_digests,
         VD_ISSUER: issuer,
         ITEMS: rows,
         KEY_VERSION: version,
-        _FACFDA_PRUNE_POLICY_DIGEST: materials["prune_policy_digest"],
-        _FACFDA_AUTHORIZATION_POLICY_DIGEST:
-            materials["authorization_policy_digest"],
-        _FACFDA_SITE_POLICY_DIGEST: materials["site_policy_digest"],
-        _FACFDA_SIGNER_SITE_POLICY_DIGEST:
-            materials["signer_site_policy_digest"],
-        _FACFDA_ADJUDICATION_SITE_POLICY_DIGEST:
-            materials["adjudication_site_policy_digest"],
-        _FFDACFDA_PROOF_SITE_POLICY_DIGEST:
-            materials["proof_site_policy_digest"],
-        _FFDACFDA_DECISION_SITE_POLICY_DIGEST: decision_site_policy_digest,
+        **_ffdacfda_policy_digests(materials, validated_decision_site_policy),
         _FACFDA_DECLARATION: common_declaration,
         STATUS: status,
         VERSION:
@@ -50159,48 +50161,11 @@ def _parse_ffdacfda(raw: object) -> tuple[dict, str]:
     A counted declaration may carry the empty common fork edge set (a
     fork-free decision).
     """
-    if not isinstance(raw, bytes):
-        raise TypeError("aggregate packet must be bytes")
-    if not raw or raw[-1:] in (b"\n", b"\r", b" ", b"\t"):
-        raise _ffdacfda_invalid(
-            "aggregate packet must end with the closing brace, no "
-            "trailing byte"
-        )
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise _ffdacfda_invalid(
-            "aggregate packet is not valid UTF-8"
-        ) from exc
-    try:
-        data = json.loads(
-            text, object_pairs_hook=_reject_duplicate_ffdacfda_keys
-        )
-    except json.JSONDecodeError as exc:
-        raise _ffdacfda_invalid(
-            "aggregate packet is not valid JSON"
-        ) from exc
-
-    if not isinstance(data, dict):
-        raise TypeError("aggregate packet must be a JSON object")
-    if set(data.keys()) != _PFDA_TOP_KEYS:
-        raise _ffdacfda_invalid(
-            "aggregate packet must contain exactly the keys 'payload' and "
-            "'signature'"
-        )
-    signature = data[SIGNATURE]
-    if not isinstance(signature, str):
-        raise TypeError("aggregate packet signature must be a str")
-    if not _prune_is_digest(signature):
-        raise _ffdacfda_invalid(
-            "aggregate packet signature must be 64 lowercase hex characters"
-        )
-
-    payload = data[TICKET_PAYLOAD]
-    if not isinstance(payload, dict):
-        raise TypeError("aggregate packet payload must be an object")
-    if set(payload.keys()) != _FFDACFDA_PAYLOAD_KEYS:
-        raise _ffdacfda_invalid(
+    _data, payload, signature = _ffdac_parse_envelope(
+        raw, noun="aggregate packet", invalid=_ffdacfda_invalid,
+        reject_duplicate=_reject_duplicate_ffdacfda_keys,
+        payload_keys=_FFDACFDA_PAYLOAD_KEYS,
+        payload_keys_error=(
             "aggregate packet payload must contain exactly the keys "
             "'inputs', 'issuer', 'items', 'keyVersion', "
             "'prunePolicyDigest', 'authorizationPolicyDigest', "
@@ -50208,7 +50173,8 @@ def _parse_ffdacfda(raw: object) -> tuple[dict, str]:
             "'adjudicationSitePolicyDigest', 'proofSitePolicyDigest', "
             "'decisionSitePolicyDigest', 'declaration', 'status' and "
             "'version'"
-        )
+        ),
+    )
 
     issuer = payload[VD_ISSUER]
     if not isinstance(issuer, str):
@@ -50482,14 +50448,7 @@ def _reconcile_ffdacfda_aggregate(
     rows = payload[ITEMS]
     inputs = payload[_FACFDA_INPUTS]
 
-    expected_order = sorted(
-        rows,
-        key=lambda row: (
-            row[VD_ISSUER] is not None,
-            row[VD_ISSUER] or "",
-            row[ID],
-        ),
-    )
+    expected_order = sorted(rows, key=_ffdacfda_row_order_key)
     if [row[ID] for row in expected_order] != [row[ID] for row in rows]:
         raise _ffdacfda_invalid("items must be sorted by issuer then id")
     if sorted(row[CP_DIGEST] for row in rows) != sorted(inputs):
@@ -50605,58 +50564,37 @@ def verify_final_fork_decision_aggregate_chain_fork_decision_aggregate(
     """
     if not isinstance(aggregate, bytes):
         raise TypeError("aggregate packet must be bytes")
-    materials = _ffdac_validated_materials(
+    materials = _ffdacfd_validated_shared(
         prune_policy, authorization_policy, site_policy,
-        signer_site_policy, adjudication_site_policy,
+        signer_site_policy, adjudication_site_policy, proof_site_policy,
     )
-    validated_proof_site_policy = _validated_prune_batch_site_policy(
-        proof_site_policy
-    )
-    _ffdacf_bind_proof_policy(materials, validated_proof_site_policy)
     validated_decision_site_policy = _validated_prune_batch_site_policy(
         decision_site_policy
     )
-    validated_keyring = _validated_keyring(keyring)
-    verify_moment = _fe_moment(moment, "moment")
+    _ffdac_bind_runtime(materials, keyring, moment)
 
     payload, signature = _parse_ffdacfda(aggregate)
-    expected_digests = {
-        _FACFDA_PRUNE_POLICY_DIGEST: materials["prune_policy_digest"],
-        _FACFDA_AUTHORIZATION_POLICY_DIGEST:
-            materials["authorization_policy_digest"],
-        _FACFDA_SITE_POLICY_DIGEST: materials["site_policy_digest"],
-        _FACFDA_SIGNER_SITE_POLICY_DIGEST:
-            materials["signer_site_policy_digest"],
-        _FACFDA_ADJUDICATION_SITE_POLICY_DIGEST:
-            materials["adjudication_site_policy_digest"],
-        _FFDACFDA_PROOF_SITE_POLICY_DIGEST:
-            materials["proof_site_policy_digest"],
-        _FFDACFDA_DECISION_SITE_POLICY_DIGEST: hashlib.sha256(
-            _prune_batch_site_policy_bytes(validated_decision_site_policy)
-        ).hexdigest(),
-    }
-    for field, expected_digest in expected_digests.items():
-        if payload[field] != expected_digest:
+    expected_digests = _ffdacfda_policy_digests(
+        materials, validated_decision_site_policy
+    )
+    for field in _FFDACFDA_DIGEST_FIELDS:
+        if payload[field] != expected_digests[field]:
             raise _ffdacfda_invalid(
                 f"{field} does not match its expected policy"
             )
 
     _reconcile_ffdacfda_aggregate(
         payload,
-        validated_proof_site_policy[ADJ_THRESHOLD],
+        materials["proof_site_policy"][ADJ_THRESHOLD],
         validated_decision_site_policy[ADJ_THRESHOLD],
     )
 
-    entry = _usable_checkpoint_key(
-        validated_keyring, payload[VD_ISSUER], payload[KEY_VERSION],
-        verify_moment,
+    _ffdac_assert_payload_signature(
+        materials["keyring"], payload[VD_ISSUER], payload[KEY_VERSION],
+        materials["moment"], payload, signature,
+        "final fork decision aggregate chain fork decision aggregate "
+        "signature does not match",
     )
-    expected_signature = _ffdac_payload_signature(entry, payload)
-    if not hmac.compare_digest(expected_signature, signature):
-        raise AuthenticationError(
-            "final fork decision aggregate chain fork decision aggregate "
-            "signature does not match"
-        )
 
     authenticated = copy.deepcopy(payload)
     return {
