@@ -73,24 +73,27 @@ class MergeRecordsTest(unittest.TestCase):
         )
         self.assertEqual(merged["records"]["k"], more)
 
-    def test_concurrent_clocks_compare_writer_component_first(self) -> None:
-        # Concurrent: {a:1} vs {b:1}. clock[writer]: 1 vs 1 -> writer names.
+    def test_concurrent_clocks_compare_components_in_node_order(self) -> None:
+        # Concurrent: {a:1} vs {b:1}. Ascending node union is [a, b], so
+        # the a component decides: 1 > 0 and the record written by a wins.
         rec_a = record("x", False, {"a": 1}, "a")
         rec_b = record("x", False, {"b": 1}, "b")
         merged = merge_states(
             state({"a": 1, "b": 1}, {"k": rec_a}),
             state({"a": 1, "b": 1}, {"k": rec_b}),
         )
-        self.assertEqual(merged["records"]["k"], rec_b)  # "b" > "a"
+        self.assertEqual(merged["records"]["k"], rec_a)
 
-    def test_concurrent_writer_component_count_decides(self) -> None:
+    def test_concurrent_first_differing_component_decides(self) -> None:
+        # Concurrent: a favors high, b favors low. The ascending node
+        # union is [a, b], so the a component decides first: 2 > 1.
         low = record("x", False, {"a": 1, "b": 5}, "a")
-        high = record("x", False, {"a": 9, "b": 2}, "a")
+        high = record("x", False, {"a": 2, "b": 2}, "a")
         merged = merge_states(
-            state({"a": 9, "b": 5}, {"k": low}),
-            state({"a": 9, "b": 5}, {"k": high}),
+            state({"a": 2, "b": 5}, {"k": low}),
+            state({"a": 2, "b": 5}, {"k": high}),
         )
-        self.assertEqual(merged["records"]["k"], high)  # clock['a'] 9 > 1
+        self.assertEqual(merged["records"]["k"], high)
 
     def test_concurrent_deleted_flag_decides(self) -> None:
         alive = record("", False, {"a": 1, "b": 1}, "a")
@@ -110,12 +113,11 @@ class MergeRecordsTest(unittest.TestCase):
         )
         self.assertEqual(merged["records"]["k"], high)
 
-    def test_concurrent_full_clock_tuple_decides(self) -> None:
-        # Same writer count, writer, deleted, value; clocks still differ and
-        # neither dominates, so the sorted clock tuple breaks the tie.
+    def test_concurrent_later_component_decides_when_earlier_ties(self) -> None:
+        # Same writer, deleted, value; the clocks are concurrent and tie
+        # on a, so the b component decides: 2 > 1.
         left_rec = record("v", False, {"a": 1, "b": 2, "c": 1}, "a")
         right_rec = record("v", False, {"a": 1, "b": 1, "c": 2}, "a")
-        # tuples: (...,("b",2),("c",1)) vs (...,("b",1),("c",2)) -> left
         merged = merge_states(
             state({"a": 1, "b": 2, "c": 2}, {"k": left_rec}),
             state({"a": 1, "b": 2, "c": 2}, {"k": right_rec}),

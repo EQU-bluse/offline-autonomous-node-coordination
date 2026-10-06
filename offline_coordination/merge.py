@@ -120,15 +120,36 @@ def _dominates(winner: dict[str, int], loser: dict[str, int]) -> bool:
     )
 
 
-def _record_sort_key(record: list[Any]) -> tuple[Any, ...]:
-    value, deleted, clock, writer = record
-    return (
-        clock[writer],
-        writer,
-        deleted,
-        value,
-        tuple(sorted(clock.items())),
-    )
+def _record_beats(left: list[Any], right: list[Any]) -> bool:
+    """True iff ``left`` wins the deterministic arbitration over ``right``.
+
+    The clocks are compared component by component over the ascending
+    union of their node names, missing components counting as 0; the
+    first differing component decides, and the larger count wins.  This
+    is a total order on clocks — a dominating clock always compares
+    greater, and concurrent clocks are ordered consistently no matter
+    which other records take part in a merge — so grouping merges
+    differently cannot change the final winner.  Only when the full
+    clocks are equal do writer, then deleted, then value break the tie,
+    the larger winning each comparison.  Distinct records that still
+    tie differ only in zero-count clock components; their sorted items
+    then order the representations so the survivor never depends on the
+    argument order.
+    """
+    left_clock = left[2]
+    right_clock = right[2]
+    for node in sorted(set(left_clock) | set(right_clock)):
+        left_count = left_clock.get(node, 0)
+        right_count = right_clock.get(node, 0)
+        if left_count != right_count:
+            return left_count > right_count
+    if left[3] != right[3]:
+        return left[3] > right[3]
+    if left[1] != right[1]:
+        return left[1] > right[1]
+    if left[0] != right[0]:
+        return left[0] > right[0]
+    return sorted(left_clock.items()) > sorted(right_clock.items())
 
 
 def _resolve_record(left: list[Any], right: list[Any]) -> list[Any]:
@@ -141,8 +162,8 @@ def _resolve_record(left: list[Any], right: list[Any]) -> list[Any]:
         return left
     if _dominates(right_clock, left_clock):
         return right
-    # Concurrent updates: compare by the prescribed Python tuple order.
-    return left if _record_sort_key(left) >= _record_sort_key(right) else right
+    # Concurrent updates: the total-order arbitration of _record_beats.
+    return left if _record_beats(left, right) else right
 
 
 def _remote_need(
@@ -211,11 +232,9 @@ def preview_changes(local: dict[str, Any], remote: dict[str, Any]) -> dict[str, 
         elif _dominates(local_record[2], remote_record[2]):
             decision, winner = "stale", "local"
         else:
-            # Concurrent updates: the same tuple arbitration as merge_states.
-            if _record_sort_key(remote_record) >= _record_sort_key(local_record):
-                winner = "remote"
-            else:
-                winner = "local"
+            # Concurrent updates: the same total-order arbitration as
+            # merge_states.
+            winner = "remote" if _record_beats(remote_record, local_record) else "local"
             decision = "conflict"
 
         items.append(
@@ -235,9 +254,12 @@ def merge_states(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
     * Identical records are kept.
     * If one record's clock has every component >= the other's with at least
       one strictly greater, that record wins.
-    * Otherwise the record with the larger
-      ``(clock[writer], writer, deleted, value, tuple(sorted(clock.items())))``
-      Python tuple wins.
+    * Otherwise the clocks are compared component by component over the
+      ascending union of their node names (missing components count as 0);
+      the first differing component decides and the larger count wins.  This
+      is a total order consistent with dominance, so the winner does not
+      depend on how merges are grouped.  Fully equal clocks fall back to
+      writer, then deleted, then value, the larger winning each comparison.
 
     Type violations raise :class:`TypeError`; all other constraint violations
     raise :class:`ValueError`.
