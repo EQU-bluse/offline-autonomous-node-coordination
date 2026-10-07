@@ -67,8 +67,12 @@ credentials raise :class:`AuthenticationError`.  A corrupt log raises
 
 :func:`import_signed_batch` is the receiving side.  It takes the target
 audit path, the packet bytes, a ``keyring`` and the verification
-``moment`` and authenticates and validates the packet *before* the
-target file is ever read.  It checks the contiguous seqs, the internal
+``moment``, plus an optional receiver-side byte budget ``max_bytes``
+(default 67108864): a packet strictly longer than the budget is
+rejected with :class:`ValueError` before anything is parsed, any key is
+looked up or the target file is touched.  Otherwise it authenticates
+and validates the packet *before* the target file is ever read.  It
+checks the contiguous seqs, the internal
 prev/hash chain, that ``signedAt`` is no later than the verification
 moment, that the exact issuer/version key is usable at both the signing
 and the verification moments, and the HMAC over the canonical payload.
@@ -1446,8 +1450,16 @@ def import_signed_batch(
     batch: bytes,
     keyring: dict,
     moment: int,
+    max_bytes: int = 67108864,
 ) -> dict:
     """Authenticate a signed batch and reconcile it with the local log.
+
+    ``max_bytes`` is the receiver-side byte budget: a packet strictly
+    longer than ``max_bytes`` bytes is rejected with :class:`ValueError`
+    before the JSON is parsed, any key is looked up or the target file
+    is touched, so a long-offline node can cap what it accepts from
+    removable media or a low-trust peer.  It defaults to 67108864 (64
+    MiB); a packet exactly at the limit is processed normally.
 
     Every structural, temporal and cryptographic check runs before the
     target file is read: the packet must be canonical
@@ -1471,11 +1483,13 @@ def import_signed_batch(
     ``next`` and ``complete`` echo the authenticated packet while
     ``need`` and ``fork`` are ``None`` unless their status uses them.
 
-    Type faults raise :class:`TypeError`; structural, encoding or chain
-    faults raise :class:`InvalidSignedBatchError`; unknown, revoked,
-    not-yet-valid or expired credentials, a future ``signedAt`` and a
-    signature mismatch raise :class:`AuthenticationError`.  A corrupt
-    local log raises :class:`~offline_coordination.audit.
+    Type faults raise :class:`TypeError` (a :class:`bool` never poses as
+    an int); a non-positive ``max_bytes`` or a packet longer than
+    ``max_bytes`` raises :class:`ValueError`; structural, encoding or
+    chain faults raise :class:`InvalidSignedBatchError`; unknown,
+    revoked, not-yet-valid or expired credentials, a future ``signedAt``
+    and a signature mismatch raise :class:`AuthenticationError`.  A
+    corrupt local log raises :class:`~offline_coordination.audit.
     CorruptAuditError`.  Gaps and forks never write, an append failure
     restores the exact pre-call bytes and propagates the
     :class:`OSError`, and the input object is left unchanged.
@@ -1484,6 +1498,12 @@ def import_signed_batch(
         raise TypeError("path must be a str")
     if not isinstance(batch, bytes):
         raise TypeError("batch must be bytes")
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+        raise TypeError("max_bytes must be an int")
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+    if len(batch) > max_bytes:
+        raise ValueError("signed batch exceeds max_bytes")
     validated_keyring = _validated_keyring(keyring)
     if isinstance(moment, bool) or not isinstance(moment, int):
         raise TypeError("moment must be an int")

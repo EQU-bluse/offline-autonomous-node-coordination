@@ -793,5 +793,166 @@ class ImportSignedBatchSafetyTest(unittest.TestCase):
         self.assertEqual(open(self.target, "rb").read(), first)
 
 
+class ImportSignedBatchMaxBytesTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = tempfile.mkdtemp()
+        self.source = os.path.join(self.dir, "source.jsonl")
+        self.target = os.path.join(self.dir, "target.jsonl")
+        for i in range(3):
+            append(self.source, event(detail=f"event {i}"))
+        self.ring = keyring(key_entry())
+        self.packet = export_signed_batch(
+            self.source, 0, 10_000_000, SESSION, self.ring, ISSUER, 1, NOW,
+        )
+
+    def import_(self, packet=None, **kwargs):
+        return import_signed_batch(
+            self.target,
+            self.packet if packet is None else packet,
+            self.ring, 200, **kwargs,
+        )
+
+    def test_default_max_bytes_is_67108864(self) -> None:
+        self.assertEqual(import_signed_batch.__defaults__, (67108864,))
+
+    def test_original_four_argument_call_still_applies(self) -> None:
+        result = import_signed_batch(self.target, self.packet, self.ring, 200)
+        self.assertEqual(tuple(result.keys()), RESULT_KEYS)
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["next"], 3)
+        self.assertEqual(
+            [r["seq"] for r in audit.read(self.target)], [1, 2, 3]
+        )
+
+    def test_packet_at_exact_limit_is_accepted(self) -> None:
+        result = self.import_(max_bytes=len(self.packet))
+        self.assertEqual(tuple(result.keys()), RESULT_KEYS)
+        self.assertEqual(result["status"], "applied")
+
+    def test_packet_one_byte_over_limit_rejected_with_fixed_message(
+        self,
+    ) -> None:
+        with self.assertRaises(ValueError) as caught:
+            self.import_(max_bytes=len(self.packet) - 1)
+        self.assertEqual(
+            str(caught.exception), "signed batch exceeds max_bytes"
+        )
+        self.assertFalse(os.path.exists(self.target))
+
+    def test_max_bytes_type_faults_are_type_errors(self) -> None:
+        for bad in (True, False, 1.0, "1000", None):
+            with self.assertRaises(TypeError):
+                self.import_(max_bytes=bad)
+
+    def test_max_bytes_non_positive_is_value_error(self) -> None:
+        for bad in (0, -1, -67108864):
+            with self.assertRaises(ValueError):
+                self.import_(max_bytes=bad)
+
+    def test_over_limit_wins_over_malformed_content(self) -> None:
+        garbage = b"\xff\xfe not json" + b"x" * len(self.packet)
+        with self.assertRaises(ValueError) as caught:
+            self.import_(packet=garbage, max_bytes=len(garbage) - 1)
+        self.assertEqual(
+            str(caught.exception), "signed batch exceeds max_bytes"
+        )
+
+    def test_over_limit_wins_over_bad_signature(self) -> None:
+        packet = decode(self.packet)
+        packet["signature"] = "0" * 64
+        raw = canonical(packet)
+        with self.assertRaises(ValueError) as caught:
+            self.import_(packet=raw, max_bytes=len(raw) - 1)
+        self.assertEqual(
+            str(caught.exception), "signed batch exceeds max_bytes"
+        )
+
+    def test_over_limit_wins_over_keyring_faults(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            import_signed_batch(
+                self.target, self.packet, {"bad": []}, 200,
+                len(self.packet) - 1,
+            )
+        self.assertEqual(
+            str(caught.exception), "signed batch exceeds max_bytes"
+        )
+
+    def test_over_limit_wins_when_target_path_missing(self) -> None:
+        missing = os.path.join(self.dir, "no-such-dir", "target.jsonl")
+        with self.assertRaises(ValueError) as caught:
+            import_signed_batch(
+                missing, self.packet, self.ring, 200, len(self.packet) - 1
+            )
+        self.assertEqual(
+            str(caught.exception), "signed batch exceeds max_bytes"
+        )
+        self.assertFalse(os.path.exists(missing))
+
+    def test_over_limit_performs_no_parse_key_lookup_or_file_access(
+        self,
+    ) -> None:
+        with mock.patch(
+            "offline_coordination.replication._parse_signed_batch"
+        ) as parse, mock.patch(
+            "offline_coordination.replication._usable_checkpoint_key"
+        ) as keys, mock.patch(
+            "offline_coordination.audit.read"
+        ) as read:
+            with self.assertRaises(ValueError):
+                self.import_(max_bytes=len(self.packet) - 1)
+        parse.assert_not_called()
+        keys.assert_not_called()
+        read.assert_not_called()
+        self.assertFalse(os.path.exists(self.target))
+
+    def test_over_limit_leaves_input_bytes_unchanged(self) -> None:
+        packet = bytes(self.packet)
+        original = bytes(packet)
+        with self.assertRaises(ValueError):
+            self.import_(packet=packet, max_bytes=len(packet) - 1)
+        self.assertEqual(packet, original)
+
+    def test_results_identical_with_default_and_explicit_budget(self) -> None:
+        budget = len(self.packet)
+        other = os.path.join(self.dir, "other.jsonl")
+
+        # applied
+        default = import_signed_batch(self.target, self.packet, self.ring, 200)
+        explicit = import_signed_batch(other, self.packet, self.ring, 200, budget)
+        self.assertEqual(default, explicit)
+        self.assertEqual(default["status"], "applied")
+
+        # duplicate
+        default = import_signed_batch(self.target, self.packet, self.ring, 200)
+        explicit = import_signed_batch(other, self.packet, self.ring, 200, budget)
+        self.assertEqual(default, explicit)
+        self.assertEqual(default["status"], "duplicate")
+
+        # missing
+        gap = export_signed_batch(
+            self.source, 2, 10_000_000, SESSION, self.ring, ISSUER, 1, NOW,
+        )
+        default = import_signed_batch(
+            os.path.join(self.dir, "m1.jsonl"), gap, self.ring, 200
+        )
+        explicit = import_signed_batch(
+            os.path.join(self.dir, "m2.jsonl"), gap, self.ring, 200, len(gap)
+        )
+        self.assertEqual(default, explicit)
+        self.assertEqual(default["status"], "missing")
+
+        # fork
+        fork_default = os.path.join(self.dir, "f1.jsonl")
+        fork_explicit = os.path.join(self.dir, "f2.jsonl")
+        for path in (fork_default, fork_explicit):
+            append(path, event(detail="totally different event"))
+        default = import_signed_batch(fork_default, self.packet, self.ring, 200)
+        explicit = import_signed_batch(
+            fork_explicit, self.packet, self.ring, 200, budget
+        )
+        self.assertEqual(default, explicit)
+        self.assertEqual(default["status"], "fork")
+
+
 if __name__ == "__main__":
     unittest.main()
