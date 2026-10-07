@@ -49270,11 +49270,14 @@ def _verify_ffdacf_decision_core(decision: bytes, materials: dict):
 # Lazy re-exports of the extracted boundaries
 # ===========================================================================
 #
-# The two newest layers were extracted into the private sibling modules
+# The newest layers were extracted into the private sibling modules
 # ``offline_coordination._ffdac_chain_batch`` (chain batch verification and
-# stable head anchors) and
+# stable head anchors),
 # ``offline_coordination._ffdac_decision_aggregation`` (fork decision batch
-# verification and cross-site aggregation).  Those modules import this one;
+# verification and cross-site aggregation) and
+# ``offline_coordination._ffdacfda_chain`` (successor sealing and
+# full-chain verification over the cross-site decision aggregates).  Those
+# modules import this one;
 # this module never imports them at module level, so the package has no
 # import cycle.  The public names below keep their historical
 # ``offline_coordination.replication`` path, call signatures and class
@@ -49299,6 +49302,14 @@ _EXTRACTED_PUBLIC_NAMES = {
         "_ffdac_decision_aggregation",
     "FINAL_FORK_DECISION_AGGREGATE_CHAIN_FORK_DECISION_AGGREGATE_VERSION":
         "_ffdac_decision_aggregation",
+    "supersede_final_fork_decision_aggregate_chain_fork_decision_aggregate":
+        "_ffdacfda_chain",
+    "verify_final_fork_decision_aggregate_chain_fork_decision_aggregate_chain":
+        "_ffdacfda_chain",
+    "InvalidFinalForkDecisionAggregateChainForkDecisionAggregateChainError":
+        "_ffdacfda_chain",
+    "FINAL_FORK_DECISION_AGGREGATE_CHAIN_FORK_DECISION_AGGREGATE_CHAIN_VERSION":
+        "_ffdacfda_chain",
 }
 
 
