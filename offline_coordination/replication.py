@@ -49299,6 +49299,14 @@ _EXTRACTED_PUBLIC_NAMES = {
         "_ffdac_decision_aggregation",
     "FINAL_FORK_DECISION_AGGREGATE_CHAIN_FORK_DECISION_AGGREGATE_VERSION":
         "_ffdac_decision_aggregation",
+    "supersede_final_fork_decision_aggregate_chain_fork_decision_aggregate":
+        "_ffdacfda_aggregate_chain",
+    "verify_final_fork_decision_aggregate_chain_fork_decision_aggregate_chain":
+        "_ffdacfda_aggregate_chain",
+    "InvalidFinalForkDecisionAggregateChainForkDecisionAggregateChainError":
+        "_ffdacfda_aggregate_chain",
+    "FINAL_FORK_DECISION_AGGREGATE_CHAIN_FORK_DECISION_AGGREGATE_CHAIN_VERSION":
+        "_ffdacfda_aggregate_chain",
 }
 
 
