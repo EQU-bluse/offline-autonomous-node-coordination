@@ -67,8 +67,13 @@ credentials raise :class:`AuthenticationError`.  A corrupt log raises
 
 :func:`import_signed_batch` is the receiving side.  It takes the target
 audit path, the packet bytes, a ``keyring`` and the verification
-``moment`` and authenticates and validates the packet *before* the
-target file is ever read.  It checks the contiguous seqs, the internal
+``moment`` (plus an optional positive ``max_bytes`` receive budget,
+defaulting to 64 MiB) and authenticates and validates the packet
+*before* the target file is ever read.  A packet strictly longer than
+``max_bytes`` is rejected with :class:`ValueError` ("signed batch
+exceeds max_bytes") before its bytes are parsed, its signature checked
+or any file touched; a packet exactly as long as the budget is
+admitted.  It checks the contiguous seqs, the internal
 prev/hash chain, that ``signedAt`` is no later than the verification
 moment, that the exact issuer/version key is usable at both the signing
 and the verification moments, and the HMAC over the canonical payload.
@@ -1441,11 +1446,15 @@ def _signed_batch_result(
     }
 
 
+DEFAULT_IMPORTED_SIGNED_BATCH_MAX_BYTES = 64 * 1024 * 1024
+
+
 def import_signed_batch(
     path: str,
     batch: bytes,
     keyring: dict,
     moment: int,
+    max_bytes: int = DEFAULT_IMPORTED_SIGNED_BATCH_MAX_BYTES,
 ) -> dict:
     """Authenticate a signed batch and reconcile it with the local log.
 
@@ -1456,6 +1465,19 @@ def import_signed_batch(
     and the exact issuer/version key must be usable at both the signing
     and the verification moments, with the HMAC matching in constant
     time.
+
+    ``max_bytes`` is a hard receive budget measured against the raw
+    packet length; it defaults to
+    ``DEFAULT_IMPORTED_SIGNED_BATCH_MAX_BYTES`` (64 MiB) so four-
+    argument callers keep working.  It must be a positive :class:`int`
+    (a :class:`bool` never poses as an int) -- otherwise :class:`TypeError`
+    or :class:`ValueError` -- and when ``len(batch)`` is strictly greater
+    than it the call fails *before* the bytes are parsed, before the
+    keyring is queried and before any local file is read or written,
+    raising :class:`ValueError` with the fixed message
+    "signed batch exceeds max_bytes".  A packet exactly as long as the
+    budget is admitted; the budget never enters the signed payload and
+    in-budget packets produce exactly the same results as without it.
 
     After authentication the local log is read and compared with the
     carried records.  When the local last seq is below ``after`` the
@@ -1484,6 +1506,17 @@ def import_signed_batch(
         raise TypeError("path must be a str")
     if not isinstance(batch, bytes):
         raise TypeError("batch must be bytes")
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+        raise TypeError("max_bytes must be an int")
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+    # The receive budget is enforced on the raw length before any JSON
+    # parsing, key lookup or file access, so an overlong packet always
+    # reports this failure even when it is also malformed, unsigned,
+    # addressed at a missing path, etc.
+    if len(batch) > max_bytes:
+        raise ValueError("signed batch exceeds max_bytes")
+
     validated_keyring = _validated_keyring(keyring)
     if isinstance(moment, bool) or not isinstance(moment, int):
         raise TypeError("moment must be an int")
