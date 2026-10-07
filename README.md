@@ -10,6 +10,8 @@ python -m offline_coordination status --ledger LEDGER [LEDGER ...] [--max-bytes 
 python -m offline_coordination recovery check LEDGER [LEDGER ...]
 python -m offline_coordination recovery run LEDGER [LEDGER ...] --keyring KEYRING --ticket TICKET --moment MOMENT --audit AUDIT
 python -m offline_coordination recovery audit AUDIT [--after N] [--limit N]
+python -m offline_coordination replication export AUDIT OUTPUT --after N --max-bytes N --session SESSION --keyring KEYRING --issuer ISSUER --key-version N --moment N
+python -m offline_coordination replication import AUDIT PACKAGE --keyring KEYRING --moment N [--max-bytes N]
 python -m unittest discover -s tests -v
 ```
 
@@ -35,6 +37,16 @@ The module entry points `recovery check` and `recovery run` wrap these: they pri
 The top-level report carries `connectivity`, `health`, `items`, `maxBytes`, `nodeId`, `pendingChanges`, `revision`, `totalBytes` and `version`: connectivity stays `offline`, the node id `local-node` and the version the integer 1. `revision` is the greatest stable ledger `lastSeq`, `pendingChanges` counts the `pending` items and `totalBytes` sums the ledger byte sizes (missing ledgers count as zero). The health is `healthy` only when every item is healthy, `degraded` when only `pending`/`oversize` items are present, and `unhealthy` once any item is `blocked`, `corrupt` or `failed`.
 
 The `status` command is unchanged without arguments. With `--ledger LEDGER [LEDGER ...]` and an optional `--max-bytes N` it prints one line of compact UTF-8 JSON with recursively sorted keys (the `inspect_node` report), exits 0 when the node is healthy, 1 when it is degraded or unhealthy, and 2 on argument errors.
+
+## Offline signed-batch replication
+
+The `replication export` and `replication import` commands bring the existing `export_signed_batch` / `import_signed_batch` protocol to removable media without writing Python. Both commands only read materials, present results and call those interfaces: the packet's canonical bytes, signature, chain checks, key selection, conflict rules and every Python interface semantics are unchanged, and no input material (audit, package or keyring) is modified.
+
+`replication export AUDIT OUTPUT --after N --max-bytes N --session SESSION --keyring KEYRING --issuer ISSUER --key-version N --moment N` generates the exact canonical bytes `export_signed_batch` returns, writes them durably to `OUTPUT` and prints one compact, recursively key-sorted UTF-8 JSON line carrying exactly `status` (`"exported"`), `output`, `bytes` and `digest`, where `digest` is the lowercase hex SHA-256 of the actual packet bytes. The keyring is read as a UTF-8 JSON file. An existing `OUTPUT` is never overwritten: the command ends with exit code 2 before anything is generated, and a generation or write failure leaves no partial file behind (the packet is created exclusively, flushed and fsynced, then its directory is fsynced).
+
+`replication import AUDIT PACKAGE --keyring KEYRING --moment N [--max-bytes N]` reads the package and keyring and prints the verbatim `import_signed_batch` result object as one compact sorted-key JSON line; stdout carries nothing else. `--max-bytes` defaults to the interface default of 67108864, and a packet strictly longer than the budget is rejected before it is parsed, before any key is looked up and before the target audit is touched. Exit codes are `0` for `applied` and `duplicate`, `1` for `missing` and `fork` (the result object is still printed), and `2` for material, authentication, structural or parameter errors.
+
+For both commands a missing keyring file, invalid UTF-8, invalid JSON, a parameter type or protocol validation error is reported with a definite message on stderr and exit code 2. Neither command ever prints a secret or the packet body, and the `status` and `recovery` commands, their output and exit codes are unchanged.
 
 ## Authorized recovery and the recovery audit
 
